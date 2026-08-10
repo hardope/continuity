@@ -82,8 +82,36 @@ jobs:
 
       - name: Build
         # Still building continuityctl too (cheap, shares most deps) even
-        # though it isn't released — catches regressions in it via CI.
-        run: cargo build --release -p continuityd -p continuityctl
+        # though it isn't released — catches regressions in it via CI. On
+        # macOS, continuityd itself isn't built here — see "Build
+        # universal continuityd" below.
+        shell: bash
+        run: |
+          if [ "${{ matrix.name }}" = "macos" ]; then
+            cargo build --release -p continuityctl
+          else
+            cargo build --release -p continuityd -p continuityctl
+          fi
+
+      - name: Build universal continuityd (Intel + Apple Silicon)
+        # GitHub's macos-latest runner is Apple Silicon, so a plain
+        # `cargo build` there produces an arm64-only binary — which
+        # doesn't run at all on an Intel Mac ("not supported"). Building
+        # both targets and merging with lipo is the standard fix; this is
+        # the same technique already used for the iOS XCFramework (see
+        # docs/ios-build.md).
+        if: matrix.name == 'macos'
+        shell: bash
+        run: |
+          rustup target add x86_64-apple-darwin aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin -p continuityd
+          cargo build --release --target aarch64-apple-darwin -p continuityd
+          mkdir -p target/release
+          lipo -create \
+            target/x86_64-apple-darwin/release/continuityd \
+            target/aarch64-apple-darwin/release/continuityd \
+            -output target/release/continuityd
+          lipo -info target/release/continuityd
 
       - name: Build macOS .app bundle + .dmg
         # A bare Mach-O executable isn't something Finder recognizes as an
@@ -116,6 +144,16 @@ jobs:
             sips -z $double $double /tmp/icon-src/base.png --out AppIcon.iconset/icon_${size}x${size}@2x.png
           done
           iconutil -c icns AppIcon.iconset -o "$APP/Contents/Resources/AppIcon.icns"
+
+          # Ad-hoc signing (no paid Apple Developer ID, just a local
+          # self-signature) isn't enough to satisfy Gatekeeper's "verified
+          # developer" check, but it IS required for the binary to run at
+          # all on Apple Silicon — completely unsigned code shows "app is
+          # damaged and can't be opened, move to trash" there, a dead end
+          # with no bypass, unlike the normal unsigned-app warning
+          # ("unidentified developer" — right-click Open still works).
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --verbose "$APP"
 
           mkdir dmg-src
           mv "$APP" dmg-src/
