@@ -658,9 +658,14 @@ fn spawn_clipboard_watcher(state: Arc<SharedState>) -> JoinHandle<()> {
             for tx in senders {
                 let _ = tx.send(msg.clone());
             }
-            if peer_count > 0 {
-                state.emit(SyncEvent::ClipboardBroadcast { peer_count });
-            }
+            // Emit even when peer_count is 0 — a shell that surfaces this
+            // (see MainActivity's activity feed) needs to be able to tell
+            // "watcher saw the clipboard change but had no one to send it
+            // to" apart from "watcher never saw a change at all". Those
+            // look identical to a user if this only fires on a successful
+            // send, which was the entire reason "did it even try" was
+            // unanswerable from the Android UI.
+            state.emit(SyncEvent::ClipboardBroadcast { peer_count });
         }
     })
 }

@@ -28,6 +28,13 @@
 # (installers/windows/continuity.iss), not the raw exe — a portable exe
 # has no Start Menu entry, no autostart, and no uninstall, none of which
 # match how a background tray app is expected to behave on Windows.
+#
+# Linux ships both: the raw binary (for non-Debian distros) and a .deb
+# (continuity-linux.deb, via cargo-deb — see core/continuityd/Cargo.toml)
+# for the Debian/Ubuntu majority, since the raw binary needs its runtime
+# shared-lib deps (libxdo3, libayatana-appindicator3-1, ...) installed by
+# hand or it fails with "error while loading shared libraries", which the
+# .deb's auto-computed Depends: field avoids.
 
 name: Release
 
@@ -87,6 +94,31 @@ jobs:
         run: |
           cp target/release/${{ matrix.binary }} ${{ matrix.release_name }}
           chmod +x ${{ matrix.release_name }} || true
+
+      - name: Build Linux .deb package
+        # The raw binary dynamically links libxdo, libayatana-appindicator3,
+        # etc. (see the apt-get step above) — fine in CI where they're
+        # installed, but a user running the raw binary on their own machine
+        # hits "error while loading shared libraries" unless they happen to
+        # already have the same packages. A .deb's Depends: field fixes
+        # this by making apt/dpkg pull them in automatically. cargo-deb's
+        # default ("$auto", see core/continuityd/Cargo.toml) computes that
+        # list itself by running ldd against the built binary — no need to
+        # hand-maintain a package list here that would drift from the one
+        # above.
+        if: matrix.name == 'linux'
+        shell: bash
+        run: |
+          cargo install cargo-deb --locked
+          cargo deb -p continuityd --no-build
+          cp target/debian/*.deb continuity-linux.deb
+
+      - name: Upload Linux .deb
+        if: matrix.name == 'linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: continuity-linux.deb
+          path: continuity-linux.deb
 
       - name: Build Windows installer
         # A raw .exe has no Start Menu entry, no autostart registration,

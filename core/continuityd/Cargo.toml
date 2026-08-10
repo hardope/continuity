@@ -3,10 +3,29 @@ name = "continuityd"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Clipboard, file, and (eventually) keyboard continuity over LAN"
 
 [[bin]]
 name = "continuityd"
 path = "src/main.rs"
+
+# Consumed by `cargo deb` (see the "linux" leg of .github/workflows/release.yml)
+# to build a .deb instead of shipping a bare binary that needs its shared-lib
+# runtime dependencies (libxdo3, libayatana-appindicator3-1, etc.) installed
+# by hand. `depends` is left at its default ("$auto") deliberately — cargo-deb
+# runs `ldd` against the built binary and resolves each .so it links to the
+# Debian package that provides it, which is exactly the set of packages a
+# user would otherwise have to guess at from a "cannot open shared object
+# file" error.
+[package.metadata.deb]
+maintainer = "hardope"
+copyright = "2026, hardope"
+extended-description = "Cross-platform clipboard, file, and (eventually) keyboard continuity across macOS, Windows, Linux, Android, and iOS over the local network — no cloud relay, no account."
+section = "utils"
+priority = "optional"
+assets = [
+    ["target/release/continuityd", "usr/bin/", "755"],
+]
 
 [dependencies]
 continuity-daemon.workspace = true
