@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Continuity
+Comment=Clipboard, file, and (eventually) keyboard continuity over LAN
+Exec=continuityd
+Icon=continuity
+Terminal=false
+Categories=Utility;Network;

@@ -79,9 +79,14 @@ jobs:
           # what's actually needed. libxdo-dev is for muda (tray-icon's
           # menu library) — it links against libxdo for keyboard-accelerator
           # handling even though we don't set any menu accelerators yet.
+          # dpkg-dev provides dpkg-shlibdeps, which cargo-deb's "$auto"
+          # depends resolution (core/continuityd/Cargo.toml) needs to
+          # compute the .deb's Depends: field — without it, cargo-deb
+          # silently produces a .deb with no dependency information at
+          # all, defeating the reason it exists.
           sudo apt-get install -y \
             libgtk-3-dev libayatana-appindicator3-dev \
-            libdbus-1-dev libxdo-dev pkg-config
+            libdbus-1-dev libxdo-dev pkg-config dpkg-dev
 
       - name: Build
         # Still building continuityctl too (cheap, shares most deps) even

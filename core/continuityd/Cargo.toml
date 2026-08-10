@@ -25,6 +25,8 @@ section = "utils"
 priority = "optional"
 assets = [
     ["target/release/continuityd", "usr/bin/", "755"],
+    ["../../installers/linux/continuity.desktop", "usr/share/applications/", "644"],
+    ["../../assets/logo.svg", "usr/share/icons/hicolor/scalable/apps/continuity.svg", "644"],
 ]
 
 [dependencies]
