@@ -1,0 +1,7 @@
+<resources>
+    <!-- Just the window/splash theme — a platform built-in so the app
+         doesn't need appcompat/material-components as a dependency for a
+         pure-Compose UI. Actual theming (colors, typography) is Compose's
+         MaterialTheme in Theme.kt. -->
+    <style name="Theme.Continuity" parent="android:Theme.Material.Light.NoActionBar" />
+</resources>

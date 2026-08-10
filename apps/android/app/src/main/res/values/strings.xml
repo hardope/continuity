@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">Continuity</string>
+    <string name="notification_channel_status">Continuity sync status</string>
+    <string name="notification_channel_events">Continuity events</string>
+    <string name="foreground_notification_title">Continuity is running</string>
+    <string name="foreground_notification_text">Syncing clipboard and files with paired devices</string>
+</resources>

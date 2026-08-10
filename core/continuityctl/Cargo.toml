@@ -1,0 +1,21 @@
+[package]
+name = "continuityctl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "continuityctl"
+path = "src/main.rs"
+
+[dependencies]
+continuity-net.workspace = true
+continuity-crypto.workspace = true
+continuity-proto.workspace = true
+continuity-daemon.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap = { version = "4", features = ["derive"] }
+directories = "5"

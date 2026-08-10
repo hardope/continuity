@@ -1,0 +1,4 @@
+module continuity_ffiFFI {
+    header "continuity_ffiFFI.h"
+    export *
+}

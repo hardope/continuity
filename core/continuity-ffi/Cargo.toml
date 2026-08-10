@@ -1,0 +1,31 @@
+[package]
+name = "continuity-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["staticlib", "cdylib", "lib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
+
+[dependencies]
+# Mobile shells supply their own clipboard bridge (ClipboardManager /
+# UIPasteboard) via the ClipboardProvider callback interface below, so the
+# desktop-only arboard backend (continuity-daemon's default feature) is
+# neither needed nor buildable for Android/iOS targets. Workspace-shorthand
+# deps can't override default-features (cargo ignores it with a warning),
+# so this points at the path directly instead.
+continuity-daemon = { path = "../continuity-daemon", default-features = false }
+continuity-proto.workspace = true
+continuity-crypto.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uniffi = { version = "0.28", features = ["cli"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+paranoid-android = "0.2"

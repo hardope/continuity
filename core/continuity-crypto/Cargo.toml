@@ -1,0 +1,42 @@
+[package]
+name = "continuity-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"] }
+rand = "0.8"
+rcgen = { version = "0.13", features = ["pem"] }
+sha2 = "0.10"
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+directories = "5"
+rustls-pki-types = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# keyring has *no* default features — without a platform backend enabled it
+# silently falls back to a no-op store that reports every read as "not
+# found" and swallows every write, so nothing ever actually persists (see
+# the identity module's history for how much debugging that cost).
+keyring = { version = "3", features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+
+# Secret Service needs a D-Bus session (GNOME Keyring / KDE Wallet) — the
+# closest thing Linux has to a universal OS keychain, but it means this
+# won't work on a headless/server box with no desktop session. Fine
+# tradeoff for a desktop continuity app. Needs libdbus's headers to build
+# (`apt install libdbus-1-dev pkg-config` on Debian/Ubuntu) — cross-checked
+# via `cargo check --target x86_64-unknown-linux-gnu` from macOS, which gets
+# as far as confirming the feature/dependency selection is correct before
+# failing on that system header (expected when cross-compiling without a
+# full Linux sysroot; a native Linux build — including CI — has them).
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
+
+[dev-dependencies]
+tempfile = "3"

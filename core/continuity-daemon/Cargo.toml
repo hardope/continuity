@@ -1,0 +1,21 @@
+[package]
+name = "continuity-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["arboard-clipboard"]
+arboard-clipboard = ["dep:arboard"]
+
+[dependencies]
+continuity-net.workspace = true
+continuity-crypto.workspace = true
+continuity-proto.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+rand = "0.8"
+hostname = "0.4"
+arboard = { version = "3", optional = true }

@@ -1,0 +1,193 @@
+# Builds every platform on its own native GitHub-hosted runner and attaches
+# the results to a GitHub Release when a `v*` tag is pushed. Also runnable
+# by hand (workflow_dispatch) without creating a release, so a PR can be
+# checked on every platform before tagging.
+#
+# Why this matters beyond "automate the build": this dev machine (macOS,
+# no sudo, no full Xcode) could locally verify macOS and Android, but not
+# Windows or Linux (missing system headers/toolchains for cross-compiling
+# TLS's C dependencies — see docs/protocol.md and continuity-crypto's
+# Cargo.toml). CI sidesteps that by building on each platform's own real
+# runner. (There's no ios job — see the comment above the release job.)
+#
+# The Android artifact here is unsigned (debug APK) — real distribution
+# needs Play Store signing secrets this repo doesn't have configured.
+# Still valuable as continuous "does it even build" verification.
+#
+# Release assets are the raw per-platform binaries, not zips — there's
+# exactly one file per platform (continuityd; continuityctl is a dev/test
+# tool and deliberately not shipped here), so zipping was pure friction
+# with no upside. Each binary gets explicitly chmod +x'd before upload —
+# GitHub's artifact upload/download round-trip has a history of not
+# reliably preserving the executable bit, and a binary that loses it
+# looks broken to a normal user (macOS Finder falls back to opening it
+# as a text file on double-click instead of running it, with nothing in
+# the UI suggesting *why*).
+#
+# Windows is the exception: its asset is an Inno Setup installer
+# (installers/windows/continuity.iss), not the raw exe — a portable exe
+# has no Start Menu entry, no autostart, and no uninstall, none of which
+# match how a background tray app is expected to behave on Windows.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            name: macos
+            binary: continuityd
+            release_name: continuityd-macos
+          - os: windows-latest
+            name: windows
+            binary: continuityd.exe
+            release_name: continuity-windows-setup.exe
+          - os: ubuntu-latest
+            name: linux
+            binary: continuityd
+            release_name: continuityd-linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux system dependencies (tray-icon, secret-service, rustls)
+        if: matrix.name == 'linux'
+        run: |
+          sudo apt-get update
+          # libappindicator3-dev doesn't exist on Ubuntu 24.04 (ubuntu-latest)
+          # anymore — libayatana-appindicator3-dev is its replacement and
+          # what's actually needed. libxdo-dev is for muda (tray-icon's
+          # menu library) — it links against libxdo for keyboard-accelerator
+          # handling even though we don't set any menu accelerators yet.
+          sudo apt-get install -y \
+            libgtk-3-dev libayatana-appindicator3-dev \
+            libdbus-1-dev libxdo-dev pkg-config
+
+      - name: Build
+        # Still building continuityctl too (cheap, shares most deps) even
+        # though it isn't released — catches regressions in it via CI.
+        run: cargo build --release -p continuityd -p continuityctl
+
+      - name: Stage release binary
+        if: matrix.name != 'windows'
+        shell: bash
+        run: |
+          cp target/release/${{ matrix.binary }} ${{ matrix.release_name }}
+          chmod +x ${{ matrix.release_name }} || true
+
+      - name: Build Windows installer
+        # A raw .exe has no Start Menu entry, no autostart registration,
+        # and no clean uninstall — wrap it with Inno Setup so it installs
+        # like a normal Windows app instead of being a file you have to
+        # keep around and relaunch by hand. windows-latest ships
+        # Chocolatey preinstalled, so this doesn't need a separate
+        # runner setup.
+        if: matrix.name == 'windows'
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          Copy-Item target\release\continuityd.exe installers\windows\continuityd.exe
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installers\windows\continuity.iss
+          Copy-Item installers\windows\continuity-windows-setup.exe .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.release_name }}
+          path: ${{ matrix.release_name }}
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android,armv7-linux-androideabi
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install NDK
+        run: sdkmanager --install "ndk;27.0.12077973"
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk
+
+      - name: Cross-compile continuity-ffi
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/27.0.12077973
+        run: |
+          cd core/continuity-ffi
+          cargo ndk -t arm64-v8a -t x86_64 -o ../../apps/android/app/src/main/jniLibs build --release
+
+      - name: Build APK
+        working-directory: apps/android
+        run: |
+          echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Stage release APK
+        run: cp apps/android/app/build/outputs/apk/debug/app-debug.apk continuity-android.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: continuity-android.apk
+          path: continuity-android.apk
+
+  # No ios job — it doesn't build cleanly yet (an embedded-extension
+  # code-signing validation failure survived two rounds of real fixes:
+  # a missing XCFramework simulator architecture and a Homebrew
+  # tap-trust check on the runner, both fixed, but a third distinct
+  # failure remained) and no device or simulator has ever actually run
+  # this app. See docs/ios-build.md for the manual build path and
+  # what's left to chase down; re-add a job here once it's sorted out.
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [desktop, android]
+    runs-on: ubuntu-latest
+    # The default GITHUB_TOKEN is read-only unless a job explicitly asks
+    # for more — softprops/action-gh-release needs contents: write to
+    # actually create the release, or it 403s with "Resource not
+    # accessible by integration".
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          # Each artifact is already exactly one file (see the desktop/
+          # android jobs' "Stage release ..." steps) — merge them into one
+          # flat directory instead of one subdirectory per artifact name,
+          # so the release gets raw files, not a zip per platform.
+          merge-multiple: true
+
+      - name: Re-assert executable bit
+        # Belt-and-suspenders on top of the desktop job's chmod — GitHub's
+        # artifact upload/download round-trip doesn't always preserve it
+        # reliably, and a binary that loses it just looks broken with no
+        # explanation (see the top-of-file note).
+        run: chmod +x artifacts/continuityd-macos artifacts/continuityd-linux 2>/dev/null || true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true

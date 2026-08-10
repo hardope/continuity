@@ -1,0 +1,71 @@
+# XcodeGen spec (https://github.com/yonaskolb/XcodeGen) — generates a real
+# .xcodeproj from this file so the Xcode project itself doesn't need to be
+# hand-assembled through the UI once Xcode is installed:
+#
+#   brew install xcodegen
+#   cd apps/ios && xcodegen generate
+#
+# Before that will build, core/continuity-ffi needs to be cross-compiled
+# to an XCFramework (see docs/ios-build.md) and dropped at
+# apps/ios/ContinuityFFI.xcframework — XcodeGen references the path but
+# doesn't build it.
+
+name: Continuity
+options:
+  bundleIdPrefix: app.continuity
+
+settings:
+  base:
+    SWIFT_VERSION: 5.0
+    IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+
+targets:
+  Continuity:
+    type: application
+    platform: iOS
+    sources:
+      - path: Continuity
+      - path: ../../bindings/swift/continuity_ffi.swift
+        optional: true
+    dependencies:
+      - target: ContinuityShare
+      - framework: ContinuityFFI.xcframework
+        embed: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.continuity.ios
+        INFOPLIST_KEY_NSLocalNetworkUsageDescription: >-
+          Continuity discovers and connects to your other paired devices on
+          the same Wi-Fi network to sync clipboard and files.
+        # Apple requires every Bonjour/mDNS service type an app browses or
+        # advertises to be declared here as of iOS 14 — local network
+        # discovery silently fails otherwise.
+        INFOPLIST_KEY_NSBonjourServices: "_continuity._tcp"
+    entitlements:
+      path: Continuity/Continuity.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.app.continuity.shared
+
+  ContinuityShare:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: ContinuityShare
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.continuity.ios.share
+    entitlements:
+      path: ContinuityShare/ContinuityShare.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.app.continuity.shared
+    info:
+      path: ContinuityShare/Info.plist
+      properties:
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.share-services
+          NSExtensionPrincipalClass: ShareViewController
+          NSExtensionAttributes:
+            NSExtensionActivationRule:
+              NSExtensionActivationSupportsFileWithMaxCount: 1

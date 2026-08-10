@@ -1,0 +1,22 @@
+[package]
+name = "continuity-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+continuity-proto.workspace = true
+continuity-crypto.workspace = true
+tokio.workspace = true
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = "1"
+mdns-sd = "0.13"
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+bytes = "1"
+x509-parser = "0.16"

@@ -1,0 +1,32 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="120dp"
+    android:height="120dp"
+    android:viewportWidth="120"
+    android:viewportHeight="120">
+    <!-- Same shape/proportions as assets/logo.svg, translated to
+         VectorDrawable path data + group rotation (VectorDrawable has no
+         <rect rx> primitive, so the stadium outline is hand-written as an
+         explicit path). Two rings at ~90° to each other, offset so each
+         ring's far end stays clear of the other — keep both files in sync
+         if the mark ever changes. -->
+    <group
+        android:pivotX="38"
+        android:pivotY="50"
+        android:rotation="-25">
+        <path
+            android:pathData="M 18,38 H 58 A 12,12 0 0 1 58,62 H 18 A 12,12 0 0 1 18,38 Z"
+            android:strokeColor="#2F81F7"
+            android:strokeWidth="9"
+            android:fillColor="#00000000" />
+    </group>
+    <group
+        android:pivotX="76"
+        android:pivotY="68"
+        android:rotation="65">
+        <path
+            android:pathData="M 56,56 H 96 A 12,12 0 0 1 96,80 H 56 A 12,12 0 0 1 56,56 Z"
+            android:strokeColor="#2F81F7"
+            android:strokeWidth="9"
+            android:fillColor="#00000000" />
+    </group>
+</vector>
