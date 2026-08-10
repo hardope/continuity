@@ -72,7 +72,7 @@ class ContinuityForegroundService : Service() {
     private fun startEngine() {
         val identityDer = SecureIdentity.loadOrCreateIdentityDer(this)
         val deviceName = SecureIdentity.deviceName(this)
-        val receivedDir = (getExternalFilesDir("Continue") ?: filesDir).also { it.mkdirs() }
+        val receivedDir = (getExternalFilesDir("Continuity") ?: filesDir).also { it.mkdirs() }
 
         // Set before starting the engine, not after — `ContinuityEngine.start`
         // doesn't return until its background thread is fully up, by which
@@ -144,7 +144,7 @@ class ContinuityForegroundService : Service() {
         // app, so there's no one to notify either.
         val text = when (event) {
             is FfiSyncEvent.PairingRequested ->
-                "Pairing request from '${event.peer.name}' — open Continue to confirm"
+                "Pairing request from '${event.peer.name}' — open Continuity to confirm"
             is FfiSyncEvent.PairingDeclined -> "Pairing with '${event.peerName}' was declined"
             is FfiSyncEvent.FileReceiving -> "Receiving '${event.fileName}' from '${event.fromName}'..."
             is FfiSyncEvent.FileReceived -> {
@@ -162,6 +162,8 @@ class ContinuityForegroundService : Service() {
             is FfiSyncEvent.PausedStateChanged,
             is FfiSyncEvent.Listening,
             is FfiSyncEvent.ClipboardBroadcast,
+            is FfiSyncEvent.ReconnectFailed,
+            is FfiSyncEvent.NowPlayingChanged,
             -> return
         }
 

@@ -1,32 +1,61 @@
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
-    android:width="120dp"
-    android:height="120dp"
-    android:viewportWidth="120"
-    android:viewportHeight="120">
-    <!-- Same shape/proportions as assets/logo.svg, translated to
-         VectorDrawable path data + group rotation (VectorDrawable has no
-         <rect rx> primitive, so the stadium outline is hand-written as an
-         explicit path). Two rings at ~90° to each other, offset so each
-         ring's far end stays clear of the other — keep both files in sync
-         if the mark ever changes. -->
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="100dp"
+    android:height="100dp"
+    android:viewportWidth="100"
+    android:viewportHeight="100">
+    <!-- Same mark as assets/logo.svg: two 160° arcs orbiting a shared
+         center (the second is the first rotated 180°), each capped with a
+         dot at its leading edge. A full-circle path traced clockwise from
+         its rightmost point, revealed via trimPathEnd (VectorDrawable has
+         no stroke-dasharray) rather than an explicit arc command, since
+         that's the same 0°-start convention assets/logo.svg's <circle>
+         traces implicitly. Keep both files in sync if the mark changes. -->
+    <path
+        android:pathData="M 22,0 H 78 A 22,22 0 0 1 100,22 V 78 A 22,22 0 0 1 78,100 H 22 A 22,22 0 0 1 0,78 V 22 A 22,22 0 0 1 22,0 Z"
+        android:fillColor="#0A0E1A" />
     <group
-        android:pivotX="38"
+        android:pivotX="50"
         android:pivotY="50"
-        android:rotation="-25">
+        android:rotation="0">
         <path
-            android:pathData="M 18,38 H 58 A 12,12 0 0 1 58,62 H 18 A 12,12 0 0 1 18,38 Z"
-            android:strokeColor="#2F81F7"
+            android:pathData="M 80,50 A 30,30 0 1 1 20,50 A 30,30 0 1 1 80,50"
             android:strokeWidth="9"
-            android:fillColor="#00000000" />
+            android:strokeLineCap="round"
+            android:fillColor="#00000000"
+            android:trimPathStart="0"
+            android:trimPathEnd="0.4444">
+            <aapt:attr name="android:strokeColor">
+                <gradient
+                    android:type="linear"
+                    android:startX="0" android:startY="0" android:endX="100" android:endY="100"
+                    android:startColor="#38BDF8" android:endColor="#2563EB" />
+            </aapt:attr>
+        </path>
     </group>
     <group
-        android:pivotX="76"
-        android:pivotY="68"
-        android:rotation="65">
+        android:pivotX="50"
+        android:pivotY="50"
+        android:rotation="180">
         <path
-            android:pathData="M 56,56 H 96 A 12,12 0 0 1 96,80 H 56 A 12,12 0 0 1 56,56 Z"
-            android:strokeColor="#2F81F7"
+            android:pathData="M 80,50 A 30,30 0 1 1 20,50 A 30,30 0 1 1 80,50"
             android:strokeWidth="9"
-            android:fillColor="#00000000" />
+            android:strokeLineCap="round"
+            android:fillColor="#00000000"
+            android:trimPathStart="0"
+            android:trimPathEnd="0.4444">
+            <aapt:attr name="android:strokeColor">
+                <gradient
+                    android:type="linear"
+                    android:startX="0" android:startY="0" android:endX="100" android:endY="100"
+                    android:startColor="#6D28D9" android:endColor="#A855F7" />
+            </aapt:attr>
+        </path>
     </group>
+    <path
+        android:pathData="M 30.31,60.26 A 8.5,8.5 0 1 1 13.31,60.26 A 8.5,8.5 0 1 1 30.31,60.26 Z"
+        android:fillColor="#38BDF8" />
+    <path
+        android:pathData="M 86.69,39.74 A 8.5,8.5 0 1 1 69.69,39.74 A 8.5,8.5 0 1 1 86.69,39.74 Z"
+        android:fillColor="#A855F7" />
 </vector>

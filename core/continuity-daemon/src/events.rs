@@ -1,4 +1,4 @@
-use continuity_proto::DeviceInfo;
+use continuity_proto::{DeviceInfo, MediaCommand, NowPlayingInfo};
 
 /// Everything a shell (CLI, tray app, mobile UI) might want to react to.
 /// The engine never blocks waiting for a shell to notice one of these —
@@ -30,6 +30,16 @@ pub enum SyncEvent {
     /// so a shell's own UI (tray menu label, toggle) can follow the
     /// engine's actual state instead of tracking it independently.
     PausedStateChanged { paused: bool },
+    /// `EngineCommand::ReconnectPeer` had no cached address to dial — the
+    /// peer has never been seen over mDNS or connected inbound since this
+    /// engine started. Distinct from `Disconnected` since no connection
+    /// was ever attempted.
+    ReconnectFailed { peer_id: String },
+    /// A connected peer's now-playing state changed (or this is the first
+    /// update since connecting) — pushed unprompted by the peer, not a
+    /// response to a command. `info` is the full current snapshot, not a
+    /// diff.
+    NowPlayingChanged { peer_id: String, peer_name: String, info: NowPlayingInfo },
 }
 
 /// Requests a shell makes of the engine. Sent over the channel returned by
@@ -47,4 +57,20 @@ pub enum EngineCommand {
     /// shutting the engine down — existing connections stay open but go
     /// idle. Toggle back with `SetPaused(false)`.
     SetPaused(bool),
+    /// Drops the active connection to one specific peer without touching
+    /// the trust store — unlike `Reset`, they stay paired and can be
+    /// reconnected. The disconnect sticks (neither side will silently
+    /// reconnect) until `ReconnectPeer` is sent for the same id.
+    DisconnectPeer { peer_crypto_id: String },
+    /// Re-dials a peer previously dropped with `DisconnectPeer`, using
+    /// its last-known network address. A no-op (well, emits
+    /// `ReconnectFailed`) if the engine has never seen that peer's
+    /// address — e.g. it hasn't been on the network since this engine
+    /// started.
+    ReconnectPeer { peer_crypto_id: String },
+    /// Fire-and-forget remote-control command to a connected peer's media
+    /// playback — no acknowledgement, and only acted on by a peer whose
+    /// shell wires in a real `MediaController` (macOS only for now; every
+    /// other platform's `NoopMediaController` silently drops it).
+    SendMediaCommand { peer_crypto_id: String, command: MediaCommand },
 }

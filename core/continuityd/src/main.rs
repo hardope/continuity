@@ -14,13 +14,27 @@
 //! send `EngineCommand`s straight into the engine's command channel
 //! (`UnboundedSender::send` is synchronous, so no proxy needed that way).
 
+#[cfg(target_os = "macos")]
+mod media_mac;
+
 use continuity_crypto::{Identity, TrustStore};
 use continuity_daemon::{ArboardClipboard, EngineCommand, EngineConfig, SyncEvent};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
-use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, TrayIconBuilder, TrayIconEvent};
+
+/// Who a click on a dynamically-built "Send File" submenu entry should
+/// send to — rebuilt every time the connected-device set changes, so the
+/// menu always reflects who's actually connected instead of only ever
+/// offering the single most-recently-connected device.
+#[derive(Clone)]
+enum SendTarget {
+    Peer(String),
+    All,
+}
 
 /// Scopes the identity/trust store, like `continuityctl --profile` — real
 /// usage never sets this. `CONTINUITY_PROFILE` rather than an argv flag
@@ -40,19 +54,22 @@ fn main() -> anyhow::Result<()> {
     let device_name = continuity_daemon::default_device_name();
 
     let title_item = MenuItem::new(format!("Continuity — {device_name}"), false, None);
-    let send_item = MenuItem::new("Send File... (no device connected)", false, None);
+    let send_submenu = Submenu::new("Send File", true);
     let pause_item = MenuItem::new("Pause Syncing", true, None);
     let reset_item = MenuItem::new("Reset...", true, None);
     let quit_item = MenuItem::new("Quit", true, None);
-    let send_item_id = send_item.id().clone();
     let pause_item_id = pause_item.id().clone();
     let reset_item_id = reset_item.id().clone();
     let quit_item_id = quit_item.id().clone();
 
+    let connected_peers: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+    let send_target_map: Arc<Mutex<HashMap<MenuId, SendTarget>>> = Arc::new(Mutex::new(HashMap::new()));
+    rebuild_send_menu(&send_submenu, &connected_peers.lock().unwrap(), &send_target_map);
+
     let menu = Menu::new();
     menu.append(&title_item)?;
     menu.append(&PredefinedMenuItem::separator())?;
-    menu.append(&send_item)?;
+    menu.append(&send_submenu)?;
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&pause_item)?;
     menu.append(&reset_item)?;
@@ -66,7 +83,6 @@ fn main() -> anyhow::Result<()> {
         .build()?;
 
     let commands = start_engine_thread(profile(), device_name, proxy)?;
-    let last_connected_peer: Arc<Mutex<Option<(String, String)>>> = Arc::new(Mutex::new(None));
     let is_paused: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
 
     event_loop.run(move |event, _target, control_flow| {
@@ -76,20 +92,19 @@ fn main() -> anyhow::Result<()> {
         *control_flow = ControlFlow::Wait;
 
         if let tao::event::Event::UserEvent(sync_event) = event {
-            handle_sync_event(sync_event, &send_item, &pause_item, &last_connected_peer, &is_paused, &commands);
+            handle_sync_event(
+                sync_event,
+                &send_submenu,
+                &pause_item,
+                &connected_peers,
+                &send_target_map,
+                &is_paused,
+                &commands,
+            );
         }
 
         if let Ok(event) = MenuEvent::receiver().try_recv() {
-            if event.id == send_item_id {
-                if let Some((peer_id, _)) = last_connected_peer.lock().unwrap().clone() {
-                    if let Some(path) = rfd::FileDialog::new().pick_file() {
-                        let _ = commands.send(EngineCommand::SendFile {
-                            peer_crypto_id: peer_id,
-                            path: path.display().to_string(),
-                        });
-                    }
-                }
-            } else if event.id == pause_item_id {
+            if event.id == pause_item_id {
                 let currently_paused = *is_paused.lock().unwrap();
                 let _ = commands.send(EngineCommand::SetPaused(!currently_paused));
             } else if event.id == reset_item_id {
@@ -105,6 +120,24 @@ fn main() -> anyhow::Result<()> {
                 }
             } else if event.id == quit_item_id {
                 *control_flow = ControlFlow::Exit;
+            } else if let Some(target) = send_target_map.lock().unwrap().get(&event.id).cloned() {
+                if let Some(path) = rfd::FileDialog::new().pick_file() {
+                    let path = path.display().to_string();
+                    match target {
+                        SendTarget::Peer(peer_id) => {
+                            let _ = commands.send(EngineCommand::SendFile { peer_crypto_id: peer_id, path });
+                        }
+                        SendTarget::All => {
+                            let peers: Vec<String> = connected_peers.lock().unwrap().keys().cloned().collect();
+                            for peer_id in peers {
+                                let _ = commands.send(EngineCommand::SendFile {
+                                    peer_crypto_id: peer_id,
+                                    path: path.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -117,9 +150,10 @@ fn main() -> anyhow::Result<()> {
 
 fn handle_sync_event(
     event: SyncEvent,
-    send_item: &MenuItem,
+    send_submenu: &Submenu,
     pause_item: &MenuItem,
-    last_connected_peer: &Arc<Mutex<Option<(String, String)>>>,
+    connected_peers: &Arc<Mutex<HashMap<String, String>>>,
+    send_target_map: &Arc<Mutex<HashMap<MenuId, SendTarget>>>,
     is_paused: &Arc<Mutex<bool>>,
     commands: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
 ) {
@@ -140,25 +174,20 @@ fn handle_sync_event(
                 accept: accepted,
             });
         }
-        // Paired/Connected/Disconnected/ClipboardReceived are routine —
-        // they'd fire constantly on an active mesh and a popup for each
-        // one is just noise. Still logged for debugging, just not shown.
+        // Paired/Disconnected/ClipboardReceived are routine — they'd fire
+        // constantly on an active mesh and a popup for each one is just
+        // noise. Still logged for debugging, just not shown.
         SyncEvent::Paired { peer } => tracing::info!("paired with '{}'", peer.name),
         SyncEvent::PairingDeclined { peer_name } => {
             notify(&format!("Pairing with '{peer_name}' was declined"));
         }
         SyncEvent::Connected { peer } => {
-            *last_connected_peer.lock().unwrap() = Some((peer.id.clone(), peer.name.clone()));
-            send_item.set_text(format!("Send File to {}...", peer.name));
-            send_item.set_enabled(true);
+            connected_peers.lock().unwrap().insert(peer.id, peer.name);
+            rebuild_send_menu(send_submenu, &connected_peers.lock().unwrap(), send_target_map);
         }
         SyncEvent::Disconnected { peer_id, peer_name } => {
-            let mut last = last_connected_peer.lock().unwrap();
-            if last.as_ref().map(|(id, _)| id.as_str()) == Some(peer_id.as_str()) {
-                *last = None;
-                send_item.set_text("Send File... (no device connected)");
-                send_item.set_enabled(false);
-            }
+            connected_peers.lock().unwrap().remove(&peer_id);
+            rebuild_send_menu(send_submenu, &connected_peers.lock().unwrap(), send_target_map);
             tracing::info!("'{peer_name}' disconnected");
         }
         SyncEvent::ClipboardReceived { from_name } => {
@@ -177,15 +206,57 @@ fn handle_sync_event(
         }
         SyncEvent::Error(e) => tracing::warn!("{e}"),
         SyncEvent::WasReset => {
-            *last_connected_peer.lock().unwrap() = None;
-            send_item.set_text("Send File... (no device connected)");
-            send_item.set_enabled(false);
+            connected_peers.lock().unwrap().clear();
+            rebuild_send_menu(send_submenu, &connected_peers.lock().unwrap(), send_target_map);
             notify("All paired devices have been forgotten");
         }
         SyncEvent::PausedStateChanged { paused } => {
             *is_paused.lock().unwrap() = paused;
             pause_item.set_text(if paused { "Resume Syncing" } else { "Pause Syncing" });
         }
+        SyncEvent::ReconnectFailed { peer_id } => {
+            tracing::debug!("reconnect to '{peer_id}' failed: no known address");
+        }
+        SyncEvent::NowPlayingChanged { peer_name, info, .. } => {
+            // No UI surface for this on desktop yet (tray-only, no window)
+            // — logged for now. The interesting direction is mobile
+            // displaying *this* device's now-playing info, not the tray
+            // app displaying a peer's.
+            tracing::debug!("'{peer_name}' now playing: {info:?}");
+        }
+    }
+}
+
+/// Rebuilds the "Send File" submenu from scratch to match the current
+/// connected-device set — simpler and less error-prone than trying to
+/// incrementally patch individual entries in and out as devices connect
+/// and disconnect in arbitrary order.
+fn rebuild_send_menu(
+    submenu: &Submenu,
+    connected: &HashMap<String, String>,
+    target_map: &Arc<Mutex<HashMap<MenuId, SendTarget>>>,
+) {
+    while submenu.remove_at(0).is_some() {}
+    let mut map = target_map.lock().unwrap();
+    map.clear();
+
+    if connected.is_empty() {
+        let _ = submenu.append(&MenuItem::new("No device connected", false, None));
+        return;
+    }
+
+    let mut peers: Vec<(&String, &String)> = connected.iter().collect();
+    peers.sort_by(|a, b| a.1.cmp(b.1));
+    for (id, name) in &peers {
+        let item = MenuItem::new(format!("Send to {name}..."), true, None);
+        map.insert(item.id().clone(), SendTarget::Peer((*id).clone()));
+        let _ = submenu.append(&item);
+    }
+    if peers.len() > 1 {
+        let _ = submenu.append(&PredefinedMenuItem::separator());
+        let broadcast = MenuItem::new(format!("Broadcast to All ({} devices)...", peers.len()), true, None);
+        map.insert(broadcast.id().clone(), SendTarget::All);
+        let _ = submenu.append(&broadcast);
     }
 }
 
@@ -297,11 +368,17 @@ fn start_engine_thread(
                 let identity = Identity::load_or_create(&profile)?;
                 tracing::info!("device id: {}", identity.device_id());
                 let trust_store = TrustStore::load_default(&profile)?;
+                #[cfg(target_os = "macos")]
+                let media: Arc<dyn continuity_daemon::MediaController> = Arc::new(media_mac::MacMediaController);
+                #[cfg(not(target_os = "macos"))]
+                let media: Arc<dyn continuity_daemon::MediaController> = Arc::new(continuity_daemon::NoopMediaController);
+
                 let config = EngineConfig {
                     identity,
                     device_name,
                     trust_store,
                     clipboard: Arc::new(ArboardClipboard),
+                    media,
                     received_files_dir: received_files_dir(&profile),
                 };
                 continuity_daemon::start(config).await
@@ -340,66 +417,145 @@ fn received_files_dir(profile: &str) -> PathBuf {
     }
 }
 
-/// Same chain-link mark as `assets/logo.svg` (and the Android
-/// VectorDrawables), computed per-pixel rather than rasterized from an
-/// embedded asset — two rings, each a stadium/capsule outline (constant
-/// distance from a central line segment), at ~90° to each other like a
-/// real chain link. Two things that look obvious in hindsight but took a
-/// couple of iterations to get right: the rings must be at *different*
-/// angles (same-angle parallel rings reads as a slanted figure-8, a
-/// different concept that was considered and passed over), and their
-/// centers need enough separation relative to their size that each ring's
-/// far end clears the other — too close and the two holes merge into an
-/// unrecognizable blob. Keep the geometry in sync if the mark ever
-/// changes: ring centers (28,40) at -25° and (66,58) at 65°, half-length
-/// 20, radius 12, stroke width 9, all in the same nominal 100-unit space
-/// as the SVG/VectorDrawables. 4x supersampling anti-aliases the edges —
+/// Same mark as `assets/logo.svg` (and the Android VectorDrawables),
+/// computed per-pixel rather than rasterized from an embedded asset —
+/// transparent background (a tray icon needs to sit on whatever the OS
+/// menu bar/taskbar looks like, not carry its own backdrop), two 160° arcs
+/// orbiting a shared center with a 20° gap on either side, each capped
+/// with a dot at its leading edge. The second arc is the first rotated
+/// 180°, so together they read as one broken ring. Angles follow the same
+/// convention the SVG's `<circle>` traces implicitly: 0° at the rightmost
+/// point, increasing clockwise (natural here since screen-space y already
+/// points down, so `atan2(dy, dx)` sweeps clockwise without needing to
+/// flip anything). Keep the geometry in sync if the mark ever changes:
+/// center (50,50), radius 30, stroke width 9, dots radius 8.5 at (21.81,
+/// 60.26) and (78.19,39.74), all in the same nominal 100-unit space as
+/// the SVG/VectorDrawables. 4x supersampling anti-aliases the edges —
 /// without it this is visibly jaggy at menu-bar sizes, since the OS
 /// doesn't smooth a raw RGBA buffer the way it smooths a vector drawable.
 fn build_icon() -> Icon {
     let size: u32 = 64;
+    let rgba = render_icon_rgba(size);
+    Icon::from_rgba(rgba, size, size).expect("generated icon buffer is well-formed")
+}
+
+fn render_icon_rgba(size: u32) -> Vec<u8> {
     let supersample: u32 = 4;
     let scale = size as f32 / 100.0;
-    let half_length = 20.0 * scale;
-    let outer_radius = 16.5 * scale; // radius 12, stroke width 9, centered
-    let inner_radius = 7.5 * scale;
-    let rings = [
-        (28.0 * scale, 40.0 * scale, -25.0_f32.to_radians()),
-        (66.0 * scale, 58.0 * scale, 65.0_f32.to_radians()),
+    let cx = 50.0 * scale;
+    let cy = 50.0 * scale;
+    let ring_radius = 30.0 * scale;
+    let stroke_half = 4.5 * scale;
+    let dot_radius = 8.5 * scale;
+    let arc_span_deg = 160.0_f32;
+    let dots = [
+        (21.81 * scale, 60.26 * scale, (0x38, 0xbd, 0xf8)),
+        (78.19 * scale, 39.74 * scale, (0xa8, 0x55, 0xf7)),
+    ];
+    // Diagonal gradient per arc, approximated over the icon's own bounds
+    // rather than each arc's individual bounding box — close enough at
+    // this size, and much simpler than replicating SVG's objectBoundingBox
+    // gradient units exactly.
+    let arcs = [
+        (0.0_f32, (0x38, 0xbd, 0xf8), (0x25, 0x63, 0xeb)), // blue: 0°-160°
+        (180.0_f32, (0x6d, 0x28, 0xd9), (0xa8, 0x55, 0xf7)), // purple: 180°-340°
     ];
 
     let mut rgba = Vec::with_capacity((size * size * 4) as usize);
     for y in 0..size {
         for x in 0..size {
             let mut coverage: u32 = 0;
+            let mut color_sum = (0u32, 0u32, 0u32);
             for sy in 0..supersample {
                 for sx in 0..supersample {
                     let px = x as f32 + (sx as f32 + 0.5) / supersample as f32;
                     let py = y as f32 + (sy as f32 + 0.5) / supersample as f32;
+                    let dx = px - cx;
+                    let dy = py - cy;
+                    let dist_from_ring = ((dx * dx + dy * dy).sqrt() - ring_radius).abs();
+                    let angle = dy.atan2(dx).to_degrees().rem_euclid(360.0);
 
-                    let in_ring = rings.iter().any(|&(cx, cy, rotation)| {
-                        let dx = px - cx;
-                        let dy = py - cy;
-                        // Undo the ring's rotation to get pixel-local
-                        // coordinates, then measure distance to the
-                        // central segment (clamped along its length) —
-                        // the stadium/capsule distance field.
-                        let (sin_r, cos_r) = rotation.sin_cos();
-                        let lx = dx * cos_r + dy * sin_r;
-                        let ly = -dx * sin_r + dy * cos_r;
-                        let clamped_x = lx.clamp(-half_length, half_length);
-                        let dist = ((lx - clamped_x).powi(2) + ly * ly).sqrt();
-                        dist >= inner_radius && dist <= outer_radius
+                    let in_arc = dist_from_ring <= stroke_half
+                        && arcs.iter().any(|&(start, _, _)| {
+                            let rel = (angle - start).rem_euclid(360.0);
+                            rel <= arc_span_deg
+                        });
+                    let in_dot = dots.iter().any(|&(dcx, dcy, _)| {
+                        let ddx = px - dcx;
+                        let ddy = py - dcy;
+                        (ddx * ddx + ddy * ddy).sqrt() <= dot_radius
                     });
 
-                    if in_ring {
+                    if in_arc || in_dot {
                         coverage += 1;
+                        let t = ((px + py) / (2.0 * size as f32)).clamp(0.0, 1.0);
+                        let (r, g, b) = if in_dot {
+                            dots.iter()
+                                .find(|&&(dcx, dcy, _)| {
+                                    let ddx = px - dcx;
+                                    let ddy = py - dcy;
+                                    (ddx * ddx + ddy * ddy).sqrt() <= dot_radius
+                                })
+                                .map(|&(_, _, c)| c)
+                                .unwrap()
+                        } else {
+                            let (_, start_c, end_c) = arcs
+                                .iter()
+                                .find(|&&(start, _, _)| {
+                                    let rel = (angle - start).rem_euclid(360.0);
+                                    rel <= arc_span_deg
+                                })
+                                .copied()
+                                .unwrap();
+                            lerp_color(start_c, end_c, t)
+                        };
+                        color_sum.0 += r as u32;
+                        color_sum.1 += g as u32;
+                        color_sum.2 += b as u32;
                     }
                 }
             }
-            let alpha = (255 * coverage / (supersample * supersample)) as u8;
-            rgba.extend_from_slice(&[0x2f, 0x81, 0xf7, alpha]);
+            let total = supersample * supersample;
+            let alpha = (255 * coverage / total) as u8;
+            let (r, g, b) = if coverage > 0 {
+                ((color_sum.0 / coverage) as u8, (color_sum.1 / coverage) as u8, (color_sum.2 / coverage) as u8)
+            } else {
+                (0, 0, 0)
+            };
+            rgba.extend_from_slice(&[r, g, b, alpha]);
         }
     }
-    Icon::from_rgba(rgba, size, size).expect("generated icon buffer is well-formed")
+    rgba
+}
+
+fn lerp_color(start: (u8, u8, u8), end: (u8, u8, u8), t: f32) -> (u8, u8, u8) {
+    let lerp = |a: u8, b: u8| -> u8 { (a as f32 + (b as f32 - a as f32) * t) as u8 };
+    (lerp(start.0, end.0), lerp(start.1, end.1), lerp(start.2, end.2))
+}
+
+#[cfg(test)]
+mod icon_preview {
+    // Not a real test — a manual visual-verification aid. Run with
+    // `cargo test -p continuityd render_icon_to_ppm -- --ignored --nocapture`
+    // to dump the rendered tray icon to a .ppm (composited onto a mid-gray
+    // background, since PPM has no alpha channel) for eyeballing before
+    // trusting the geometry math. Deliberately `#[ignore]`d so it never
+    // runs as part of a normal test pass.
+    #[test]
+    #[ignore]
+    fn render_icon_to_ppm() {
+        let size = 256u32;
+        let rgba = super::render_icon_rgba(size);
+        let path = std::env::var("ICON_PREVIEW_OUT").unwrap_or_else(|_| "/tmp/continuity_icon_preview.ppm".to_string());
+        let mut out = format!("P6\n{size} {size}\n255\n").into_bytes();
+        for chunk in rgba.chunks(4) {
+            let (r, g, b, a) = (chunk[0] as f32, chunk[1] as f32, chunk[2] as f32, chunk[3] as f32 / 255.0);
+            let bg = 128.0;
+            out.push((r * a + bg * (1.0 - a)) as u8);
+            out.push((g * a + bg * (1.0 - a)) as u8);
+            out.push((b * a + bg * (1.0 - a)) as u8);
+        }
+        std::fs::write(&path, out).unwrap();
+        println!("wrote {path}");
+    }
 }

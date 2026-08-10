@@ -82,6 +82,22 @@ Explicit point-to-point, not broadcast: the sender picks a target device and cal
 
 Verified end-to-end between two `continuityctl` instances (real file, content diffed byte-for-byte after transfer) and wired into `continuityd`'s tray menu ("Send File to `<connected device>`...", via a native file picker).
 
+## Media control
+
+`Message::MediaCommand` (`PlayPause` / `Next` / `Previous`) is fire-and-forget, no acknowledgement — a mobile shell sends it via `EngineCommand::SendMediaCommand { peer_crypto_id, command }`, the receiving engine hands it to whatever `MediaController` its shell wired in at startup (`continuity_daemon::MediaController` trait, mirroring `ClipboardBackend`'s pluggable-per-platform shape).
+
+Only macOS has a real implementation so far (`continuityd`'s `MacMediaController`, `core/continuityd/src/media_mac.rs`): it constructs a synthetic `NSEventTypeSystemDefined` event carrying one of the `NX_KEYTYPE_PLAY`/`NX_KEYTYPE_NEXT`/`NX_KEYTYPE_PREVIOUS` constants from `IOKit/hidsystem/ev_keymap.h` and posts it at the session level — the same trick every macOS media-key-simulation tool has used since `SPMediaKeyTap`, since there's no public documented API for "control whatever's currently playing." The system delivers it to whichever app currently owns Now Playing, the same as a real keyboard's media keys. Verified against a real QuickTime Player playback session (`playing` toggled true→false in response to the synthetic key, confirmed via AppleScript), not just type-checked.
+
+Every other platform wires in `NoopMediaController` for now — Windows (`VK_MEDIA_*` virtual keys or the SMTC API) and Linux (MPRIS over D-Bus) are real, known paths, just not built yet.
+
+### Now-playing metadata
+
+`Message::NowPlayingUpdate { info: NowPlayingInfo }` (title/artist/album/artwork/`is_playing`) is pushed unprompted, not a response to anything — `MediaController::now_playing()` is polled by `spawn_now_playing_watcher` in the engine every 1.5s (same shape as the clipboard watcher: dedupe against the last-seen value, broadcast to every connected peer on change), and a change to `None` (nothing playing / source app quit) still gets broadcast as an empty/default `NowPlayingInfo` rather than silently skipped — otherwise a peer's display would keep showing stale info forever once playback actually stopped.
+
+macOS reads this from `MediaRemote.framework` (also private, same `dlopen`/reverse-engineering situation as the media-key trick) — `MRMediaRemoteGetNowPlayingInfo` on a GCD global concurrent queue (deliberately *not* the main queue: that only executes queued work when something is actively pumping a run loop, which isn't guaranteed in every context this can run from, e.g. it never fired at all when first tested from a bare `cargo test` binary — a global queue has its own worker thread pool and doesn't depend on that), parsing the returned `CFDictionary` by the well-known `kMRMediaRemoteNowPlayingInfo*` string keys. Verified against real playback, not just type-checked: dumped an actual returned dictionary's keys to confirm the naming convention, and watched `is_playing` correctly track true/false against a live QuickTime Player session.
+
+Android renders this as album art (decoded from the raw artwork bytes) plus title/artist next to the transport buttons, shown only for peers reporting `platform == "mac_os"`.
+
 ## Known gaps (tracked, not bugs)
 
 - Desktop keychain persistence only has the macOS backend enabled so far; Windows/Linux builds need their `keyring` feature flags added before those desktop builds are real (they'll compile today but identity won't persist).

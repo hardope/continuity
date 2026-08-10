@@ -121,6 +121,45 @@ pub enum Message {
     /// Keepalive / liveness check on the persistent mesh connection.
     Ping,
     Pong,
+
+    /// Remote-control a transport command on the receiving device's
+    /// currently-playing media — fire-and-forget, no acknowledgement.
+    /// Only macOS acts on this today (see `continuity-daemon::MediaController`);
+    /// other platforms silently ignore it.
+    MediaCommand { command: MediaCommand },
+
+    /// Pushed by a device whenever its own now-playing state changes
+    /// (title/artist/album/artwork/play state) — not a response to
+    /// anything, the sender's own `MediaController::now_playing()`
+    /// watcher polls for changes and broadcasts them unprompted, mirroring
+    /// how `ClipboardUpdate` works.
+    NowPlayingUpdate { info: NowPlayingInfo },
+}
+
+/// A media transport command sent over `Message::MediaCommand`. Deliberately
+/// minimal for now (no volume) — see `continuity-daemon::MediaController`
+/// for where a receiving platform acts on these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaCommand {
+    PlayPause,
+    Next,
+    Previous,
+}
+
+/// Snapshot of a device's now-playing state, sent over
+/// `Message::NowPlayingUpdate`. `artwork` is an empty `Vec` rather than
+/// `None` for "no artwork" — the shared `b64` codec below only handles
+/// `Vec<u8>` directly, and an empty vec is unambiguous here since real
+/// artwork is never zero bytes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NowPlayingInfo {
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    #[serde(with = "b64")]
+    pub artwork: Vec<u8>,
+    pub is_playing: bool,
 }
 
 #[cfg(test)]

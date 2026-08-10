@@ -754,6 +754,23 @@ public protocol ContinuityEngineProtocol : AnyObject {
     func confirmPairing(peerId: String, accept: Bool) 
     
     /**
+     * Drops the connection to one specific peer without forgetting it —
+     * unlike `reset`, it stays paired and `reconnect_peer` can bring it
+     * back. Sticks until then; the peer won't silently reconnect on its
+     * own (from either side) in the meantime.
+     */
+    func disconnectPeer(peerId: String) 
+    
+    /**
+     * Re-dials a peer previously dropped with `disconnect_peer`. Emits
+     * `FfiSyncEvent::ReconnectFailed` (not an error return — this is
+     * fire-and-forget like every other command) if the engine has no
+     * cached address for that peer, e.g. it hasn't been seen on the
+     * network since this engine started.
+     */
+    func reconnectPeer(peerId: String) 
+    
+    /**
      * Clears every paired device and disconnects all active peers — the
      * host app should confirm with the user before calling this, there's
      * no undo.
@@ -761,6 +778,14 @@ public protocol ContinuityEngineProtocol : AnyObject {
     func reset() 
     
     func sendFile(peerId: String, path: String) 
+    
+    /**
+     * Remote-controls a transport command on `peer_id`'s currently-playing
+     * media. Fire-and-forget — only acted on if the receiving peer is
+     * macOS (the only platform with a real `MediaController` today);
+     * every other platform silently ignores it.
+     */
+    func sendMediaCommand(peerId: String, command: FfiMediaCommand) 
     
     /**
      * Temporarily stop syncing (new connections, dialing, clipboard) in
@@ -861,6 +886,33 @@ open func confirmPairing(peerId: String, accept: Bool) {try! rustCall() {
 }
     
     /**
+     * Drops the connection to one specific peer without forgetting it —
+     * unlike `reset`, it stays paired and `reconnect_peer` can bring it
+     * back. Sticks until then; the peer won't silently reconnect on its
+     * own (from either side) in the meantime.
+     */
+open func disconnectPeer(peerId: String) {try! rustCall() {
+    uniffi_continuity_ffi_fn_method_continuityengine_disconnect_peer(self.uniffiClonePointer(),
+        FfiConverterString.lower(peerId),$0
+    )
+}
+}
+    
+    /**
+     * Re-dials a peer previously dropped with `disconnect_peer`. Emits
+     * `FfiSyncEvent::ReconnectFailed` (not an error return — this is
+     * fire-and-forget like every other command) if the engine has no
+     * cached address for that peer, e.g. it hasn't been seen on the
+     * network since this engine started.
+     */
+open func reconnectPeer(peerId: String) {try! rustCall() {
+    uniffi_continuity_ffi_fn_method_continuityengine_reconnect_peer(self.uniffiClonePointer(),
+        FfiConverterString.lower(peerId),$0
+    )
+}
+}
+    
+    /**
      * Clears every paired device and disconnects all active peers — the
      * host app should confirm with the user before calling this, there's
      * no undo.
@@ -875,6 +927,20 @@ open func sendFile(peerId: String, path: String) {try! rustCall() {
     uniffi_continuity_ffi_fn_method_continuityengine_send_file(self.uniffiClonePointer(),
         FfiConverterString.lower(peerId),
         FfiConverterString.lower(path),$0
+    )
+}
+}
+    
+    /**
+     * Remote-controls a transport command on `peer_id`'s currently-playing
+     * media. Fire-and-forget — only acted on if the receiving peer is
+     * macOS (the only platform with a real `MediaController` today);
+     * every other platform silently ignores it.
+     */
+open func sendMediaCommand(peerId: String, command: FfiMediaCommand) {try! rustCall() {
+    uniffi_continuity_ffi_fn_method_continuityengine_send_media_command(self.uniffiClonePointer(),
+        FfiConverterString.lower(peerId),
+        FfiConverterTypeFfiMediaCommand.lower(command),$0
     )
 }
 }
@@ -1206,6 +1272,102 @@ public func FfiConverterTypeFfiDeviceInfo_lower(_ value: FfiDeviceInfo) -> RustB
 }
 
 
+/**
+ * Mirrors `continuity_proto::NowPlayingInfo`. `artwork` is an empty list
+ * rather than the host language's null/empty-string convention for "no
+ * artwork" — decode it as an image (e.g. `BitmapFactory.decodeByteArray`
+ * on Android) only when non-empty.
+ */
+public struct FfiNowPlayingInfo {
+    public var title: String?
+    public var artist: String?
+    public var album: String?
+    public var artwork: Data
+    public var isPlaying: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(title: String?, artist: String?, album: String?, artwork: Data, isPlaying: Bool) {
+        self.title = title
+        self.artist = artist
+        self.album = album
+        self.artwork = artwork
+        self.isPlaying = isPlaying
+    }
+}
+
+
+
+extension FfiNowPlayingInfo: Equatable, Hashable {
+    public static func ==(lhs: FfiNowPlayingInfo, rhs: FfiNowPlayingInfo) -> Bool {
+        if lhs.title != rhs.title {
+            return false
+        }
+        if lhs.artist != rhs.artist {
+            return false
+        }
+        if lhs.album != rhs.album {
+            return false
+        }
+        if lhs.artwork != rhs.artwork {
+            return false
+        }
+        if lhs.isPlaying != rhs.isPlaying {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(title)
+        hasher.combine(artist)
+        hasher.combine(album)
+        hasher.combine(artwork)
+        hasher.combine(isPlaying)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiNowPlayingInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiNowPlayingInfo {
+        return
+            try FfiNowPlayingInfo(
+                title: FfiConverterOptionString.read(from: &buf), 
+                artist: FfiConverterOptionString.read(from: &buf), 
+                album: FfiConverterOptionString.read(from: &buf), 
+                artwork: FfiConverterData.read(from: &buf), 
+                isPlaying: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiNowPlayingInfo, into buf: inout [UInt8]) {
+        FfiConverterOptionString.write(value.title, into: &buf)
+        FfiConverterOptionString.write(value.artist, into: &buf)
+        FfiConverterOptionString.write(value.album, into: &buf)
+        FfiConverterData.write(value.artwork, into: &buf)
+        FfiConverterBool.write(value.isPlaying, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiNowPlayingInfo_lift(_ buf: RustBuffer) throws -> FfiNowPlayingInfo {
+    return try FfiConverterTypeFfiNowPlayingInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiNowPlayingInfo_lower(_ value: FfiNowPlayingInfo) -> RustBuffer {
+    return FfiConverterTypeFfiNowPlayingInfo.lower(value)
+}
+
+
 public enum FfiError {
 
     
@@ -1262,6 +1424,82 @@ extension FfiError: Foundation.LocalizedError {
 
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Mirrors `continuity_proto::MediaCommand` — see
+ * `ContinuityEngine::send_media_command` for where the host language uses
+ * this.
+ */
+
+public enum FfiMediaCommand {
+    
+    case playPause
+    case next
+    case previous
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiMediaCommand: FfiConverterRustBuffer {
+    typealias SwiftType = FfiMediaCommand
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiMediaCommand {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .playPause
+        
+        case 2: return .next
+        
+        case 3: return .previous
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiMediaCommand, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .playPause:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .next:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .previous:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiMediaCommand_lift(_ buf: RustBuffer) throws -> FfiMediaCommand {
+    return try FfiConverterTypeFfiMediaCommand.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiMediaCommand_lower(_ value: FfiMediaCommand) -> RustBuffer {
+    return FfiConverterTypeFfiMediaCommand.lower(value)
+}
+
+
+
+extension FfiMediaCommand: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
 public enum FfiSyncEvent {
     
@@ -1293,6 +1531,10 @@ public enum FfiSyncEvent {
     )
     case wasReset
     case pausedStateChanged(paused: Bool
+    )
+    case reconnectFailed(peerId: String
+    )
+    case nowPlayingChanged(peerId: String, peerName: String, info: FfiNowPlayingInfo
     )
 }
 
@@ -1349,6 +1591,12 @@ public struct FfiConverterTypeFfiSyncEvent: FfiConverterRustBuffer {
         case 14: return .wasReset
         
         case 15: return .pausedStateChanged(paused: try FfiConverterBool.read(from: &buf)
+        )
+        
+        case 16: return .reconnectFailed(peerId: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 17: return .nowPlayingChanged(peerId: try FfiConverterString.read(from: &buf), peerName: try FfiConverterString.read(from: &buf), info: try FfiConverterTypeFfiNowPlayingInfo.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -1441,6 +1689,18 @@ public struct FfiConverterTypeFfiSyncEvent: FfiConverterRustBuffer {
         case let .pausedStateChanged(paused):
             writeInt(&buf, Int32(15))
             FfiConverterBool.write(paused, into: &buf)
+            
+        
+        case let .reconnectFailed(peerId):
+            writeInt(&buf, Int32(16))
+            FfiConverterString.write(peerId, into: &buf)
+            
+        
+        case let .nowPlayingChanged(peerId,peerName,info):
+            writeInt(&buf, Int32(17))
+            FfiConverterString.write(peerId, into: &buf)
+            FfiConverterString.write(peerName, into: &buf)
+            FfiConverterTypeFfiNowPlayingInfo.write(info, into: &buf)
             
         }
     }
@@ -1562,10 +1822,19 @@ private var initializationResult: InitializationResult = {
     if (uniffi_continuity_ffi_checksum_method_continuityengine_confirm_pairing() != 25048) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_continuity_ffi_checksum_method_continuityengine_disconnect_peer() != 59509) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_continuity_ffi_checksum_method_continuityengine_reconnect_peer() != 56890) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_continuity_ffi_checksum_method_continuityengine_reset() != 40739) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_continuity_ffi_checksum_method_continuityengine_send_file() != 32648) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_continuity_ffi_checksum_method_continuityengine_send_media_command() != 1860) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_continuity_ffi_checksum_method_continuityengine_set_paused() != 20054) {

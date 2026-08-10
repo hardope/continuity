@@ -1,5 +1,6 @@
 use crate::clipboard::ClipboardBackend;
 use crate::events::{EngineCommand, SyncEvent};
+use crate::media::MediaController;
 use continuity_crypto::{
     content_hash, generate_self_signed, Identity, IncrementalHash, TlsIdentity, TrustStore,
     TrustedDevice,
@@ -8,8 +9,9 @@ use continuity_net::{
     announce_and_identify, connect, peer_from_service_info, read_message, start_pairing,
     write_message, Connection, Discovery, Listener, ServiceEvent,
 };
-use continuity_proto::{DeviceInfo, Message, Platform, PROTOCOL_VERSION};
+use continuity_proto::{DeviceInfo, Message, NowPlayingInfo, Platform, PROTOCOL_VERSION};
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -29,6 +31,7 @@ pub struct EngineConfig {
     pub device_name: String,
     pub trust_store: TrustStore,
     pub clipboard: Arc<dyn ClipboardBackend>,
+    pub media: Arc<dyn MediaController>,
     pub received_files_dir: PathBuf,
 }
 
@@ -76,11 +79,22 @@ struct SharedState {
     /// at spawn time (both inbound accept and outbound dial), removed in
     /// `handle_connection`'s cleanup. `Reset` aborts everything in here.
     connection_handles: Mutex<HashMap<String, tokio::task::AbortHandle>>,
+    /// Peers the user explicitly disconnected via `EngineCommand::DisconnectPeer`
+    /// — checked by the accept loop (reject their inbound reconnect attempts
+    /// too, not just our own outbound dialing) and the mDNS dial loop, so a
+    /// manual disconnect actually sticks instead of the mesh immediately
+    /// healing itself back to connected. Cleared by `ReconnectPeer`.
+    manually_disconnected: Mutex<HashSet<String>>,
+    /// Last-known address for any peer seen via mDNS resolution or an
+    /// inbound connection, trusted or not — `ReconnectPeer` needs somewhere
+    /// to dial, since the trust store itself only has id/name, no address.
+    known_addresses: Mutex<HashMap<String, SocketAddr>>,
     peer_senders: Mutex<HashMap<String, mpsc::UnboundedSender<Message>>>,
     last_programmatic_hash: Mutex<Option<String>>,
     pending_pairings: Mutex<HashMap<String, oneshot::Sender<bool>>>,
     pending_file_accepts: Mutex<HashMap<String, oneshot::Sender<bool>>>,
     clipboard: Arc<dyn ClipboardBackend>,
+    media: Arc<dyn MediaController>,
     events_tx: mpsc::UnboundedSender<SyncEvent>,
     received_files_dir: PathBuf,
     /// See `EngineCommand::SetPaused`. Checked by the accept loop, the
@@ -118,11 +132,14 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
         trust_store: Mutex::new(config.trust_store),
         connected: Mutex::new(HashSet::new()),
         connection_handles: Mutex::new(HashMap::new()),
+        manually_disconnected: Mutex::new(HashSet::new()),
+        known_addresses: Mutex::new(HashMap::new()),
         peer_senders: Mutex::new(HashMap::new()),
         last_programmatic_hash: Mutex::new(None),
         pending_pairings: Mutex::new(HashMap::new()),
         pending_file_accepts: Mutex::new(HashMap::new()),
         clipboard: config.clipboard,
+        media: config.media,
         events_tx,
         received_files_dir: config.received_files_dir,
         paused: AtomicBool::new(false),
@@ -153,6 +170,11 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                                 continue;
                             }
                         };
+                        state.known_addresses.lock().unwrap().insert(peer_crypto_id.clone(), addr);
+                        if state.manually_disconnected.lock().unwrap().contains(&peer_crypto_id) {
+                            tracing::debug!("rejecting inbound connection from {addr}: manually disconnected");
+                            continue;
+                        }
                         let conn_state = state.clone();
                         let id_for_registry = peer_crypto_id.clone();
                         let join = tokio::spawn(async move {
@@ -186,6 +208,10 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                 if peer.device.id == state.my_device.id {
                     continue;
                 }
+                // Cache the address regardless of whether this side ends up
+                // dialing — `ReconnectPeer` needs it, and the tie-break
+                // below means this side often won't be the one connecting.
+                state.known_addresses.lock().unwrap().insert(peer.device.id.clone(), peer.addr);
                 // Tie-break so only one side dials: without this, both
                 // devices would see each other over mDNS at roughly the
                 // same time and race to open duplicate connections.
@@ -196,6 +222,9 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                     continue;
                 }
                 if state.connected.lock().unwrap().contains(&peer.device.id) {
+                    continue;
+                }
+                if state.manually_disconnected.lock().unwrap().contains(&peer.device.id) {
                     continue;
                 }
 
@@ -260,12 +289,67 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                         state.paused.store(paused, Ordering::Relaxed);
                         state.emit(SyncEvent::PausedStateChanged { paused });
                     }
+                    EngineCommand::DisconnectPeer { peer_crypto_id } => {
+                        let peer_name = state
+                            .trust_store
+                            .lock()
+                            .unwrap()
+                            .get(&peer_crypto_id)
+                            .map(|d| d.name.clone())
+                            .unwrap_or_else(|| peer_crypto_id.clone());
+
+                        state.manually_disconnected.lock().unwrap().insert(peer_crypto_id.clone());
+                        if let Some(handle) = state.connection_handles.lock().unwrap().remove(&peer_crypto_id) {
+                            handle.abort();
+                        }
+                        state.connected.lock().unwrap().remove(&peer_crypto_id);
+                        state.peer_senders.lock().unwrap().remove(&peer_crypto_id);
+
+                        // Aborting the connection task skips its own normal
+                        // exit-path `Disconnected` emit (abort cancels
+                        // immediately, no more of that future's code runs),
+                        // so it has to happen here instead.
+                        state.emit(SyncEvent::Disconnected {
+                            peer_id: peer_crypto_id,
+                            peer_name,
+                        });
+                    }
+                    EngineCommand::ReconnectPeer { peer_crypto_id } => {
+                        state.manually_disconnected.lock().unwrap().remove(&peer_crypto_id);
+                        let Some(addr) = state.known_addresses.lock().unwrap().get(&peer_crypto_id).copied() else {
+                            state.emit(SyncEvent::ReconnectFailed { peer_id: peer_crypto_id });
+                            continue;
+                        };
+                        if state.connected.lock().unwrap().contains(&peer_crypto_id) {
+                            continue;
+                        }
+
+                        let conn_state = state.clone();
+                        let id_for_registry = peer_crypto_id.clone();
+                        let join = tokio::spawn(async move {
+                            match connect(addr, &conn_state.tls_identity).await {
+                                Ok(conn) => {
+                                    if let Err(e) = handle_connection(conn, conn_state, peer_crypto_id).await {
+                                        tracing::debug!("reconnect to {addr} ended: {e}");
+                                    }
+                                }
+                                Err(e) => tracing::debug!("failed to reconnect to {addr}: {e}"),
+                            }
+                        });
+                        state.connection_handles.lock().unwrap().insert(id_for_registry, join.abort_handle());
+                    }
+                    EngineCommand::SendMediaCommand { peer_crypto_id, command } => {
+                        if let Some(tx) = state.peer_senders.lock().unwrap().get(&peer_crypto_id) {
+                            let _ = tx.send(Message::MediaCommand { command });
+                        }
+                    }
                 }
             }
         })
     });
 
     tasks.push(spawn_clipboard_watcher(state.clone()));
+    tasks.push(spawn_now_playing_watcher(state.clone()));
 
     Ok(EngineHandle {
         events: events_rx,
@@ -375,6 +459,19 @@ async fn handle_connection_inner(
                 let _ = tx.send(Message::Pong);
             }
             Ok(Message::Pong) => {}
+            Ok(Message::MediaCommand { command }) => {
+                state.media.handle(command);
+            }
+            Ok(Message::NowPlayingUpdate { info }) => {
+                if state.paused.load(Ordering::Relaxed) {
+                    continue;
+                }
+                state.emit(SyncEvent::NowPlayingChanged {
+                    peer_id: peer.id.clone(),
+                    peer_name: peer.name.clone(),
+                    info,
+                });
+            }
             Ok(Message::ClipboardUpdate {
                 origin_device,
                 content_hash: hash,
@@ -744,6 +841,46 @@ fn spawn_clipboard_watcher(state: Arc<SharedState>) -> JoinHandle<()> {
             // send, which was the entire reason "did it even try" was
             // unanswerable from the Android UI.
             state.emit(SyncEvent::ClipboardBroadcast { peer_count });
+        }
+    })
+}
+
+fn spawn_now_playing_watcher(state: Arc<SharedState>) -> JoinHandle<()> {
+    tokio::task::spawn_blocking(move || {
+        let mut last_seen: Option<NowPlayingInfo> = None;
+        loop {
+            std::thread::sleep(Duration::from_millis(1500));
+
+            if state.paused.load(Ordering::Relaxed) {
+                continue;
+            }
+
+            // Same reasoning as the clipboard watcher's catch_unwind: this
+            // crosses into host-language/private-framework code (macOS's
+            // MediaRemote today), and an unhandled panic there would
+            // otherwise permanently kill this watcher for the rest of the
+            // process's life.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                state.media.now_playing()
+            }));
+            let Ok(info) = result else {
+                continue;
+            };
+
+            if info == last_seen {
+                continue;
+            }
+            last_seen = info.clone();
+
+            // `None` (nothing playing / app quit) still gets broadcast, as
+            // a default/empty snapshot — otherwise a peer's display would
+            // keep showing whatever was playing last, forever, once
+            // playback actually stops.
+            let msg = Message::NowPlayingUpdate { info: info.unwrap_or_default() };
+            let senders: Vec<_> = state.peer_senders.lock().unwrap().values().cloned().collect();
+            for tx in senders {
+                let _ = tx.send(msg.clone());
+            }
         }
     })
 }

@@ -1,22 +1,44 @@
-<svg width="100" height="100" viewBox="-10 -10 120 120" xmlns="http://www.w3.org/2000/svg">
+<svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
   <!--
-    Continuity's mark: two interlocking rings at roughly right angles to
-    each other, like a real chain link — not two parallel rings (reads as
-    a slanted figure-8) and not centered on top of each other (the holes
-    swallow each other into a blob). Each ring's far end stays clear of
-    the other so both holes stay visible. Brand blue #2F81F7 throughout.
+    Continuity's mark: two arcs orbiting a shared center, each capped with
+    a dot at its leading edge — two devices continuously syncing with each
+    other, not a static shape. Each arc spans 160° with a 20° gap on
+    either side; the second arc is the first rotated 180°, so together
+    they read as one broken ring rather than two unrelated pieces.
+    Blue-to-purple gradient, dark rounded-square backdrop for app-icon
+    contexts (the desktop tray icon renders a transparent-background
+    variant instead — see build_icon() below).
     Every platform icon derives from this — keep them in sync if the mark
     ever changes:
-    - apps/android/app/src/main/res/drawable/ic_launcher.xml (same shape,
-      hollow rings, as VectorDrawable path data)
+    - apps/android/app/src/main/res/drawable/ic_launcher.xml (same
+      shape, as VectorDrawable path/gradient data)
     - apps/android/app/src/main/res/drawable/ic_notification.xml (bolder,
-      smaller variant — a stroked ring's hole disappears at 24dp)
-    - core/continuityd/src/main.rs build_icon() (same shape, computed
-      per-pixel in Rust with 4x supersampling for anti-aliasing, rather
-      than rasterized from this file)
+      smaller variant for legibility at 24dp)
+    - core/continuityd/src/main.rs build_icon() (same arc geometry,
+      computed per-pixel in Rust with 4x supersampling, transparent
+      background, for the menu-bar/tray icon)
   -->
-  <g fill="none" stroke="#2F81F7" stroke-width="9">
-    <rect x="-4" y="28" width="64" height="24" rx="12" transform="rotate(-25 28 40)" />
-    <rect x="34" y="46" width="64" height="24" rx="12" transform="rotate(65 66 58)" />
-  </g>
+  <defs>
+    <linearGradient id="blueGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="100%" stop-color="#2563eb"/>
+    </linearGradient>
+    <linearGradient id="purpleGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#6d28d9"/>
+      <stop offset="100%" stop-color="#a855f7"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="0" y="0" width="100" height="100" rx="22" fill="#0a0e1a"/>
+
+  <circle cx="50" cy="50" r="30" fill="none" stroke="url(#blueGrad)"
+          stroke-width="9" stroke-linecap="round"
+          stroke-dasharray="83.78 104.72"/>
+  <circle cx="50" cy="50" r="30" fill="none" stroke="url(#purpleGrad)"
+          stroke-width="9" stroke-linecap="round"
+          stroke-dasharray="83.78 104.72"
+          transform="rotate(180 50 50)"/>
+
+  <circle cx="21.81" cy="60.26" r="8.5" fill="#38bdf8"/>
+  <circle cx="78.19" cy="39.74" r="8.5" fill="#a855f7"/>
 </svg>

@@ -40,6 +40,6 @@ class AndroidClipboardProvider(private val context: Context) : ClipboardProvider
     }
 
     override fun setText(text: String) {
-        clipboardManager.setPrimaryClip(ClipData.newPlainText("Continue", text))
+        clipboardManager.setPrimaryClip(ClipData.newPlainText("Continuity", text))
     }
 }

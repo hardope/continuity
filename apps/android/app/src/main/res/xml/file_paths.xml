@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- Covers both possible received-files locations from
-     ContinuityForegroundService.startEngine(): getExternalFilesDir("Continue")
+     ContinuityForegroundService.startEngine(): getExternalFilesDir("Continuity")
      normally, falling back to the raw internal filesDir root if external
      storage isn't available. -->
 <paths xmlns:android="http://schemas.android.com/apk/res/android">
-    <external-files-path name="received" path="Continue/" />
+    <external-files-path name="received" path="Continuity/" />
     <files-path name="received_fallback" path="." />
 </paths>

@@ -7,12 +7,21 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -24,21 +33,30 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Error
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.FileUpload
 import androidx.compose.material.icons.filled.FolderOpen
+import androidx.compose.material.icons.filled.Groups
 import androidx.compose.material.icons.filled.Inbox
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.LinkOff
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.PauseCircle
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.RestartAlt
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Sensors
+import androidx.compose.material.icons.filled.SkipNext
+import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material.icons.filled.VerifiedUser
 import androidx.compose.material3.AlertDialog
@@ -49,6 +67,7 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -61,13 +80,17 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -82,9 +105,6 @@ import java.io.File
 
 class MainActivity : ComponentActivity() {
 
-    /** Send-to target — mirrors the CLI/tray shells: whichever peer most
-     * recently connected, not a full device picker. */
-    private var lastConnectedPeerId: String? = null
     private var pickFileCallback: ((Uri) -> Unit)? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -95,11 +115,7 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             ContinuityTheme {
-                ContinuityScreen(
-                    onPeerConnected = { lastConnectedPeerId = it },
-                    onPeerDisconnected = { if (it == lastConnectedPeerId) lastConnectedPeerId = null },
-                    onSendFileRequested = { launchFilePicker(it) },
-                )
+                ContinuityScreen(onFilePickerRequested = { launchFilePicker(it) })
             }
         }
     }
@@ -128,23 +144,52 @@ class MainActivity : ComponentActivity() {
 
 private data class ActivityEntry(val icon: ImageVector, val text: String, val tint: Color?)
 
+/** A device this session has seen connect at least once — stays in the
+ * list (marked disconnected) after dropping so it can be reconnected,
+ * rather than disappearing the moment it's no longer active. */
+private data class DeviceStatus(val name: String, val connected: Boolean, val platform: String)
+
+/** Who a "Send File" action targets, chosen via the device picker when
+ * more than one device is connected. */
+private sealed class SendTarget {
+    data class Single(val peerId: String, val name: String) : SendTarget()
+    object All : SendTarget()
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun ContinuityScreen(
-    onPeerConnected: (String) -> Unit,
-    onPeerDisconnected: (String) -> Unit,
-    onSendFileRequested: ((Uri) -> Unit) -> Unit,
-) {
+private fun ContinuityScreen(onFilePickerRequested: ((Uri) -> Unit) -> Unit) {
     val context = LocalContext.current
     var deviceId by remember { mutableStateOf<String?>(null) }
-    var connectedPeer by remember { mutableStateOf<uniffi.continuity_ffi.FfiDeviceInfo?>(null) }
+    val devices = remember { mutableStateMapOf<String, DeviceStatus>() }
+    val nowPlaying = remember { mutableStateMapOf<String, uniffi.continuity_ffi.FfiNowPlayingInfo>() }
     var pendingPairing by remember { mutableStateOf<Pair<uniffi.continuity_ffi.FfiDeviceInfo, String>?>(null) }
     var isPaused by remember { mutableStateOf(false) }
     var showResetConfirm by remember { mutableStateOf(false) }
+    var showDevicePicker by remember { mutableStateOf(false) }
+    var activityExpanded by remember { mutableStateOf(false) }
     val activity = remember { mutableStateListOf<ActivityEntry>() }
 
     val successColor = if (isSystemDark()) SuccessGreenDark else SuccessGreen
     val warningColor = if (isSystemDark()) WarningAmberDark else WarningAmber
+
+    val connectedCount = devices.values.count { it.connected }
+
+    fun startSend(target: SendTarget) {
+        onFilePickerRequested { uri ->
+            val name = queryDisplayName(context, uri) ?: "file"
+            val dest = File(context.cacheDir, name)
+            context.contentResolver.openInputStream(uri)?.use { input ->
+                dest.outputStream().use { output -> input.copyTo(output) }
+            }
+            when (target) {
+                is SendTarget.Single -> EngineHolder.engine?.sendFile(target.peerId, dest.absolutePath)
+                is SendTarget.All -> devices.filter { it.value.connected }.keys.forEach { peerId ->
+                    EngineHolder.engine?.sendFile(peerId, dest.absolutePath)
+                }
+            }
+        }
+    }
 
     LaunchedEffect(Unit) {
         EngineHolder.events.collect { event ->
@@ -154,13 +199,11 @@ private fun ContinuityScreen(
                 is FfiSyncEvent.Paired -> activity.add(0, ActivityEntry(Icons.Default.VerifiedUser, "Paired with '${event.peer.name}'", successColor))
                 is FfiSyncEvent.PairingDeclined -> activity.add(0, ActivityEntry(Icons.Default.LinkOff, "Pairing with '${event.peerName}' declined", warningColor))
                 is FfiSyncEvent.Connected -> {
-                    connectedPeer = event.peer
-                    onPeerConnected(event.peer.id)
+                    devices[event.peer.id] = DeviceStatus(event.peer.name, connected = true, platform = event.peer.platform)
                     activity.add(0, ActivityEntry(Icons.Default.Link, "Connected to '${event.peer.name}'", successColor))
                 }
                 is FfiSyncEvent.Disconnected -> {
-                    if (connectedPeer?.id == event.peerId) connectedPeer = null
-                    onPeerDisconnected(event.peerId)
+                    devices[event.peerId]?.let { devices[event.peerId] = it.copy(connected = false) }
                     activity.add(0, ActivityEntry(Icons.Default.LinkOff, "'${event.peerName}' disconnected", null))
                 }
                 is FfiSyncEvent.ClipboardReceived -> activity.add(0, ActivityEntry(Icons.Default.Sync, "Clipboard synced from '${event.fromName}'", null))
@@ -178,11 +221,19 @@ private fun ContinuityScreen(
                 is FfiSyncEvent.FileTransferFailed -> activity.add(0, ActivityEntry(Icons.Default.Error, "Transfer failed: ${event.reason}", warningColor))
                 is FfiSyncEvent.Error -> activity.add(0, ActivityEntry(Icons.Default.Error, event.message, warningColor))
                 is FfiSyncEvent.WasReset -> {
-                    connectedPeer = null
+                    devices.clear()
+                    nowPlaying.clear()
                     pendingPairing = null
                     activity.add(0, ActivityEntry(Icons.Default.RestartAlt, "All paired devices have been forgotten", warningColor))
                 }
                 is FfiSyncEvent.PausedStateChanged -> isPaused = event.paused
+                is FfiSyncEvent.ReconnectFailed -> {
+                    val name = devices[event.peerId]?.name ?: event.peerId
+                    activity.add(0, ActivityEntry(Icons.Default.Error, "Couldn't reconnect to '$name' — not seen on the network yet", warningColor))
+                }
+                is FfiSyncEvent.NowPlayingChanged -> {
+                    nowPlaying[event.peerId] = event.info
+                }
                 else -> {}
             }
         }
@@ -191,7 +242,7 @@ private fun ContinuityScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Continue", fontWeight = FontWeight.SemiBold) },
+                title = { Text("Continuity", fontWeight = FontWeight.SemiBold) },
                 actions = {
                     var menuExpanded by remember { mutableStateOf(false) }
                     IconButton(onClick = { menuExpanded = true }) {
@@ -235,11 +286,19 @@ private fun ContinuityScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
-                .padding(horizontal = 16.dp),
+                .padding(horizontal = 16.dp)
+                .verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
             Spacer(Modifier.height(4.dp))
-            StatusCard(connectedPeer = connectedPeer, successColor = successColor)
+            DeviceListCard(
+                devices = devices,
+                nowPlaying = nowPlaying,
+                successColor = successColor,
+                onDisconnect = { peerId -> EngineHolder.engine?.disconnectPeer(peerId) },
+                onReconnect = { peerId -> EngineHolder.engine?.reconnectPeer(peerId) },
+                onMediaCommand = { peerId, command -> EngineHolder.engine?.sendMediaCommand(peerId, command) },
+            )
             DeviceIdRow(deviceId = deviceId, onCopy = {
                 val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                 clipboard.setPrimaryClip(ClipData.newPlainText("Device ID", it))
@@ -247,35 +306,58 @@ private fun ContinuityScreen(
 
             FilledTonalButton(
                 onClick = {
-                    onSendFileRequested { uri -> sendPickedFile(context, uri, connectedPeer?.id) }
+                    when (connectedCount) {
+                        0 -> {}
+                        1 -> {
+                            val (peerId, status) = devices.entries.first { it.value.connected }
+                            startSend(SendTarget.Single(peerId, status.name))
+                        }
+                        else -> showDevicePicker = true
+                    }
                 },
-                enabled = connectedPeer != null,
+                enabled = connectedCount > 0,
                 modifier = Modifier.fillMaxWidth(),
             ) {
                 Icon(Icons.Default.FileUpload, contentDescription = null, modifier = Modifier.size(18.dp))
                 Spacer(Modifier.width(8.dp))
-                Text(if (connectedPeer != null) "Send file to ${connectedPeer!!.name}" else "Send file...")
+                Text(
+                    when (connectedCount) {
+                        0 -> "Send file..."
+                        1 -> "Send file to ${devices.values.first { it.connected }.name}"
+                        else -> "Send file to..."
+                    },
+                )
             }
 
-            Text(
-                "Activity",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            HorizontalDivider()
+
+            ActivityToggleRow(
+                expanded = activityExpanded,
+                count = activity.size,
+                onToggle = { activityExpanded = !activityExpanded },
             )
 
-            if (activity.isEmpty()) {
-                Box(Modifier.fillMaxWidth().padding(vertical = 24.dp), contentAlignment = Alignment.Center) {
-                    Text(
-                        "No activity yet",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-            } else {
-                LazyColumn(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                    items(activity) { entry -> ActivityRow(entry) }
+            AnimatedVisibility(
+                visible = activityExpanded,
+                enter = fadeIn() + expandVertically(),
+                exit = fadeOut() + shrinkVertically(),
+            ) {
+                if (activity.isEmpty()) {
+                    Box(Modifier.fillMaxWidth().padding(vertical = 24.dp), contentAlignment = Alignment.Center) {
+                        Text(
+                            "No activity yet",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                } else {
+                    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        activity.forEach { entry -> ActivityRow(entry) }
+                    }
                 }
             }
+
+            Spacer(Modifier.height(8.dp))
         }
     }
 
@@ -343,31 +425,191 @@ private fun ContinuityScreen(
             },
         )
     }
+
+    if (showDevicePicker) {
+        AlertDialog(
+            onDismissRequest = { showDevicePicker = false },
+            icon = { Icon(Icons.Default.FileUpload, contentDescription = null) },
+            title = { Text("Send file to...") },
+            text = {
+                Column {
+                    devices.filter { it.value.connected }.forEach { (peerId, status) ->
+                        TextButton(
+                            onClick = {
+                                showDevicePicker = false
+                                startSend(SendTarget.Single(peerId, status.name))
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Icon(Icons.Default.Link, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(8.dp))
+                            Text(status.name, modifier = Modifier.weight(1f))
+                        }
+                    }
+                    HorizontalDivider(Modifier.padding(vertical = 4.dp))
+                    TextButton(
+                        onClick = {
+                            showDevicePicker = false
+                            startSend(SendTarget.All)
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Icon(Icons.Default.Groups, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text("All connected devices ($connectedCount)", modifier = Modifier.weight(1f))
+                    }
+                }
+            },
+            confirmButton = {},
+            dismissButton = {
+                TextButton(onClick = { showDevicePicker = false }) { Text("Cancel") }
+            },
+        )
+    }
 }
 
 @Composable
-private fun StatusCard(connectedPeer: uniffi.continuity_ffi.FfiDeviceInfo?, successColor: Color) {
+private fun DeviceListCard(
+    devices: Map<String, DeviceStatus>,
+    nowPlaying: Map<String, uniffi.continuity_ffi.FfiNowPlayingInfo>,
+    successColor: Color,
+    onDisconnect: (String) -> Unit,
+    onReconnect: (String) -> Unit,
+    onMediaCommand: (peerId: String, command: uniffi.continuity_ffi.FfiMediaCommand) -> Unit,
+) {
     Card(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
     ) {
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(16.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            if (connectedPeer != null) {
-                Icon(Icons.Default.CheckCircle, contentDescription = null, tint = successColor)
-                Column {
-                    Text("Connected", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Text(connectedPeer.name, style = MaterialTheme.typography.titleMedium)
-                }
-            } else {
+        if (devices.isEmpty()) {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(16.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
                 CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
                 Column {
                     Text("Waiting", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     Text("No device connected", style = MaterialTheme.typography.titleMedium)
                 }
+            }
+        } else {
+            Column(modifier = Modifier.padding(vertical = 4.dp)) {
+                devices.entries.toList().forEachIndexed { index, (peerId, status) ->
+                    if (index > 0) HorizontalDivider(Modifier.padding(horizontal = 16.dp))
+                    Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        ) {
+                            Icon(
+                                if (status.connected) Icons.Default.CheckCircle else Icons.Default.LinkOff,
+                                contentDescription = null,
+                                tint = if (status.connected) successColor else MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(status.name, style = MaterialTheme.typography.titleMedium)
+                                Text(
+                                    if (status.connected) "Connected" else "Disconnected",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                            if (status.connected) {
+                                TextButton(onClick = { onDisconnect(peerId) }) { Text("Disconnect") }
+                            } else {
+                                TextButton(onClick = { onReconnect(peerId) }) {
+                                    Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                                    Spacer(Modifier.width(4.dp))
+                                    Text("Reconnect")
+                                }
+                            }
+                        }
+                        // Media control only works against macOS today (see
+                        // core/continuityd/src/media_mac.rs) — hidden for
+                        // other platforms rather than shown and silently
+                        // doing nothing.
+                        if (status.connected && status.platform == "mac_os") {
+                            NowPlayingRow(info = nowPlaying[peerId])
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                                horizontalArrangement = Arrangement.Center,
+                            ) {
+                                IconButton(onClick = { onMediaCommand(peerId, uniffi.continuity_ffi.FfiMediaCommand.PREVIOUS) }) {
+                                    Icon(Icons.Default.SkipPrevious, contentDescription = "Previous")
+                                }
+                                IconButton(onClick = { onMediaCommand(peerId, uniffi.continuity_ffi.FfiMediaCommand.PLAY_PAUSE) }) {
+                                    Icon(Icons.Default.PlayArrow, contentDescription = "Play/Pause")
+                                }
+                                IconButton(onClick = { onMediaCommand(peerId, uniffi.continuity_ffi.FfiMediaCommand.NEXT) }) {
+                                    Icon(Icons.Default.SkipNext, contentDescription = "Next")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Album art + title/artist for a connected macOS peer's now-playing state.
+/// `info == null` means no update has arrived yet (peer just connected, or
+/// isn't actually playing anything the first watcher poll would catch) —
+/// shows nothing rather than a misleading "nothing playing" in that case.
+@Composable
+private fun NowPlayingRow(info: uniffi.continuity_ffi.FfiNowPlayingInfo?) {
+    if (info == null) return
+
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        val artwork = remember(info.artwork) {
+            if (info.artwork.isNotEmpty()) {
+                BitmapFactory.decodeByteArray(info.artwork, 0, info.artwork.size)?.asImageBitmap()
+            } else {
+                null
+            }
+        }
+        Box(
+            modifier = Modifier.size(40.dp).clip(RoundedCornerShape(6.dp)),
+            contentAlignment = Alignment.Center,
+        ) {
+            if (artwork != null) {
+                Image(
+                    bitmap = artwork,
+                    contentDescription = null,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize(),
+                )
+            } else {
+                Surface(color = MaterialTheme.colorScheme.surface, modifier = Modifier.fillMaxSize()) {
+                    Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxSize()) {
+                        Icon(
+                            Icons.Default.MusicNote,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+        }
+        val title = info.title
+        val artist = info.artist
+        Column(modifier = Modifier.weight(1f)) {
+            if (info.isPlaying && (title != null || artist != null)) {
+                Text(title ?: "Unknown title", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
+                if (artist != null) {
+                    Text(artist, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            } else if (info.isPlaying) {
+                Text("Playing", style = MaterialTheme.typography.bodyMedium)
+            } else {
+                Text("Nothing playing", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
     }
@@ -395,6 +637,31 @@ private fun DeviceIdRow(deviceId: String?, onCopy: (String) -> Unit) {
 }
 
 @Composable
+private fun ActivityToggleRow(expanded: Boolean, count: Int, onToggle: () -> Unit) {
+    val interactionSource = remember { MutableInteractionSource() }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(interactionSource = interactionSource, indication = null, onClick = onToggle)
+            .padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        Text(
+            if (count > 0) "Activity ($count)" else "Activity",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Icon(
+            if (expanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+            contentDescription = if (expanded) "Hide activity" else "Show activity",
+            modifier = Modifier.size(18.dp),
+            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+@Composable
 private fun ActivityRow(entry: ActivityEntry) {
     Row(
         modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
@@ -413,16 +680,6 @@ private fun ActivityRow(entry: ActivityEntry) {
 
 @Composable
 private fun isSystemDark(): Boolean = androidx.compose.foundation.isSystemInDarkTheme()
-
-private fun sendPickedFile(context: Context, uri: Uri, peerId: String?) {
-    if (peerId == null) return
-    val name = queryDisplayName(context, uri) ?: "file"
-    val dest = File(context.cacheDir, name)
-    context.contentResolver.openInputStream(uri)?.use { input ->
-        dest.outputStream().use { output -> input.copyTo(output) }
-    }
-    EngineHolder.engine?.sendFile(peerId, dest.absolutePath)
-}
 
 private fun queryDisplayName(context: Context, uri: Uri): String? {
     context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->

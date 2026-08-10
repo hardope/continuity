@@ -786,6 +786,12 @@ internal open class UniffiVTableCallbackInterfaceEventListener(
 
 
 
+
+
+
+
+
+
 // A JNA Library to expose the extern-C FFI definitions.
 // This is an implementation detail which will be called internally by the public API.
 
@@ -825,9 +831,15 @@ internal interface UniffiLib : Library {
     ): Pointer
     fun uniffi_continuity_ffi_fn_method_continuityengine_confirm_pairing(`ptr`: Pointer,`peerId`: RustBuffer.ByValue,`accept`: Byte,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    fun uniffi_continuity_ffi_fn_method_continuityengine_disconnect_peer(`ptr`: Pointer,`peerId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_continuity_ffi_fn_method_continuityengine_reconnect_peer(`ptr`: Pointer,`peerId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     fun uniffi_continuity_ffi_fn_method_continuityengine_reset(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_continuity_ffi_fn_method_continuityengine_send_file(`ptr`: Pointer,`peerId`: RustBuffer.ByValue,`path`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_continuity_ffi_fn_method_continuityengine_send_media_command(`ptr`: Pointer,`peerId`: RustBuffer.ByValue,`command`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_continuity_ffi_fn_method_continuityengine_set_paused(`ptr`: Pointer,`paused`: Byte,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
@@ -969,9 +981,15 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_continuity_ffi_checksum_method_continuityengine_confirm_pairing(
     ): Short
+    fun uniffi_continuity_ffi_checksum_method_continuityengine_disconnect_peer(
+    ): Short
+    fun uniffi_continuity_ffi_checksum_method_continuityengine_reconnect_peer(
+    ): Short
     fun uniffi_continuity_ffi_checksum_method_continuityengine_reset(
     ): Short
     fun uniffi_continuity_ffi_checksum_method_continuityengine_send_file(
+    ): Short
+    fun uniffi_continuity_ffi_checksum_method_continuityengine_send_media_command(
     ): Short
     fun uniffi_continuity_ffi_checksum_method_continuityengine_set_paused(
     ): Short
@@ -1014,10 +1032,19 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_continuity_ffi_checksum_method_continuityengine_confirm_pairing() != 25048.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_continuity_ffi_checksum_method_continuityengine_disconnect_peer() != 59509.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_continuity_ffi_checksum_method_continuityengine_reconnect_peer() != 56890.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_continuity_ffi_checksum_method_continuityengine_reset() != 40739.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_continuity_ffi_checksum_method_continuityengine_send_file() != 32648.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_continuity_ffi_checksum_method_continuityengine_send_media_command() != 1860.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_continuity_ffi_checksum_method_continuityengine_set_paused() != 20054.toShort()) {
@@ -1751,6 +1778,23 @@ public interface ContinuityEngineInterface {
     fun `confirmPairing`(`peerId`: kotlin.String, `accept`: kotlin.Boolean)
     
     /**
+     * Drops the connection to one specific peer without forgetting it —
+     * unlike `reset`, it stays paired and `reconnect_peer` can bring it
+     * back. Sticks until then; the peer won't silently reconnect on its
+     * own (from either side) in the meantime.
+     */
+    fun `disconnectPeer`(`peerId`: kotlin.String)
+    
+    /**
+     * Re-dials a peer previously dropped with `disconnect_peer`. Emits
+     * `FfiSyncEvent::ReconnectFailed` (not an error return — this is
+     * fire-and-forget like every other command) if the engine has no
+     * cached address for that peer, e.g. it hasn't been seen on the
+     * network since this engine started.
+     */
+    fun `reconnectPeer`(`peerId`: kotlin.String)
+    
+    /**
      * Clears every paired device and disconnects all active peers — the
      * host app should confirm with the user before calling this, there's
      * no undo.
@@ -1758,6 +1802,14 @@ public interface ContinuityEngineInterface {
     fun `reset`()
     
     fun `sendFile`(`peerId`: kotlin.String, `path`: kotlin.String)
+    
+    /**
+     * Remote-controls a transport command on `peer_id`'s currently-playing
+     * media. Fire-and-forget — only acted on if the receiving peer is
+     * macOS (the only platform with a real `MediaController` today);
+     * every other platform silently ignores it.
+     */
+    fun `sendMediaCommand`(`peerId`: kotlin.String, `command`: FfiMediaCommand)
     
     /**
      * Temporarily stop syncing (new connections, dialing, clipboard) in
@@ -1869,6 +1921,41 @@ open class ContinuityEngine: Disposable, AutoCloseable, ContinuityEngineInterfac
 
     
     /**
+     * Drops the connection to one specific peer without forgetting it —
+     * unlike `reset`, it stays paired and `reconnect_peer` can bring it
+     * back. Sticks until then; the peer won't silently reconnect on its
+     * own (from either side) in the meantime.
+     */override fun `disconnectPeer`(`peerId`: kotlin.String)
+        = 
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_continuity_ffi_fn_method_continuityengine_disconnect_peer(
+        it, FfiConverterString.lower(`peerId`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Re-dials a peer previously dropped with `disconnect_peer`. Emits
+     * `FfiSyncEvent::ReconnectFailed` (not an error return — this is
+     * fire-and-forget like every other command) if the engine has no
+     * cached address for that peer, e.g. it hasn't been seen on the
+     * network since this engine started.
+     */override fun `reconnectPeer`(`peerId`: kotlin.String)
+        = 
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_continuity_ffi_fn_method_continuityengine_reconnect_peer(
+        it, FfiConverterString.lower(`peerId`),_status)
+}
+    }
+    
+    
+
+    
+    /**
      * Clears every paired device and disconnects all active peers — the
      * host app should confirm with the user before calling this, there's
      * no undo.
@@ -1889,6 +1976,23 @@ open class ContinuityEngine: Disposable, AutoCloseable, ContinuityEngineInterfac
     uniffiRustCall() { _status ->
     UniffiLib.INSTANCE.uniffi_continuity_ffi_fn_method_continuityengine_send_file(
         it, FfiConverterString.lower(`peerId`),FfiConverterString.lower(`path`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Remote-controls a transport command on `peer_id`'s currently-playing
+     * media. Fire-and-forget — only acted on if the receiving peer is
+     * macOS (the only platform with a real `MediaController` today);
+     * every other platform silently ignores it.
+     */override fun `sendMediaCommand`(`peerId`: kotlin.String, `command`: FfiMediaCommand)
+        = 
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_continuity_ffi_fn_method_continuityengine_send_media_command(
+        it, FfiConverterString.lower(`peerId`),FfiConverterTypeFfiMediaCommand.lower(`command`),_status)
 }
     }
     
@@ -2290,6 +2394,56 @@ public object FfiConverterTypeFfiDeviceInfo: FfiConverterRustBuffer<FfiDeviceInf
 
 
 
+/**
+ * Mirrors `continuity_proto::NowPlayingInfo`. `artwork` is an empty list
+ * rather than the host language's null/empty-string convention for "no
+ * artwork" — decode it as an image (e.g. `BitmapFactory.decodeByteArray`
+ * on Android) only when non-empty.
+ */
+data class FfiNowPlayingInfo (
+    var `title`: kotlin.String?, 
+    var `artist`: kotlin.String?, 
+    var `album`: kotlin.String?, 
+    var `artwork`: kotlin.ByteArray, 
+    var `isPlaying`: kotlin.Boolean
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiNowPlayingInfo: FfiConverterRustBuffer<FfiNowPlayingInfo> {
+    override fun read(buf: ByteBuffer): FfiNowPlayingInfo {
+        return FfiNowPlayingInfo(
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterByteArray.read(buf),
+            FfiConverterBoolean.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: FfiNowPlayingInfo) = (
+            FfiConverterOptionalString.allocationSize(value.`title`) +
+            FfiConverterOptionalString.allocationSize(value.`artist`) +
+            FfiConverterOptionalString.allocationSize(value.`album`) +
+            FfiConverterByteArray.allocationSize(value.`artwork`) +
+            FfiConverterBoolean.allocationSize(value.`isPlaying`)
+    )
+
+    override fun write(value: FfiNowPlayingInfo, buf: ByteBuffer) {
+            FfiConverterOptionalString.write(value.`title`, buf)
+            FfiConverterOptionalString.write(value.`artist`, buf)
+            FfiConverterOptionalString.write(value.`album`, buf)
+            FfiConverterByteArray.write(value.`artwork`, buf)
+            FfiConverterBoolean.write(value.`isPlaying`, buf)
+    }
+}
+
+
+
 
 
 sealed class FfiException: kotlin.Exception() {
@@ -2346,6 +2500,42 @@ public object FfiConverterTypeFfiError : FfiConverterRustBuffer<FfiException> {
     }
 
 }
+
+
+
+/**
+ * Mirrors `continuity_proto::MediaCommand` — see
+ * `ContinuityEngine::send_media_command` for where the host language uses
+ * this.
+ */
+
+enum class FfiMediaCommand {
+    
+    PLAY_PAUSE,
+    NEXT,
+    PREVIOUS;
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiMediaCommand: FfiConverterRustBuffer<FfiMediaCommand> {
+    override fun read(buf: ByteBuffer) = try {
+        FfiMediaCommand.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: FfiMediaCommand) = 4UL
+
+    override fun write(value: FfiMediaCommand, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
 
 
 
@@ -2434,6 +2624,18 @@ sealed class FfiSyncEvent {
         companion object
     }
     
+    data class ReconnectFailed(
+        val `peerId`: kotlin.String) : FfiSyncEvent() {
+        companion object
+    }
+    
+    data class NowPlayingChanged(
+        val `peerId`: kotlin.String, 
+        val `peerName`: kotlin.String, 
+        val `info`: FfiNowPlayingInfo) : FfiSyncEvent() {
+        companion object
+    }
+    
 
     
     companion object
@@ -2497,6 +2699,14 @@ public object FfiConverterTypeFfiSyncEvent : FfiConverterRustBuffer<FfiSyncEvent
             14 -> FfiSyncEvent.WasReset
             15 -> FfiSyncEvent.PausedStateChanged(
                 FfiConverterBoolean.read(buf),
+                )
+            16 -> FfiSyncEvent.ReconnectFailed(
+                FfiConverterString.read(buf),
+                )
+            17 -> FfiSyncEvent.NowPlayingChanged(
+                FfiConverterString.read(buf),
+                FfiConverterString.read(buf),
+                FfiConverterTypeFfiNowPlayingInfo.read(buf),
                 )
             else -> throw RuntimeException("invalid enum value, something is very wrong!!")
         }
@@ -2617,6 +2827,22 @@ public object FfiConverterTypeFfiSyncEvent : FfiConverterRustBuffer<FfiSyncEvent
                 + FfiConverterBoolean.allocationSize(value.`paused`)
             )
         }
+        is FfiSyncEvent.ReconnectFailed -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`peerId`)
+            )
+        }
+        is FfiSyncEvent.NowPlayingChanged -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`peerId`)
+                + FfiConverterString.allocationSize(value.`peerName`)
+                + FfiConverterTypeFfiNowPlayingInfo.allocationSize(value.`info`)
+            )
+        }
     }
 
     override fun write(value: FfiSyncEvent, buf: ByteBuffer) {
@@ -2703,6 +2929,18 @@ public object FfiConverterTypeFfiSyncEvent : FfiConverterRustBuffer<FfiSyncEvent
             is FfiSyncEvent.PausedStateChanged -> {
                 buf.putInt(15)
                 FfiConverterBoolean.write(value.`paused`, buf)
+                Unit
+            }
+            is FfiSyncEvent.ReconnectFailed -> {
+                buf.putInt(16)
+                FfiConverterString.write(value.`peerId`, buf)
+                Unit
+            }
+            is FfiSyncEvent.NowPlayingChanged -> {
+                buf.putInt(17)
+                FfiConverterString.write(value.`peerId`, buf)
+                FfiConverterString.write(value.`peerName`, buf)
+                FfiConverterTypeFfiNowPlayingInfo.write(value.`info`, buf)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }

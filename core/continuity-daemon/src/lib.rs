@@ -8,12 +8,14 @@
 mod clipboard;
 mod engine;
 mod events;
+mod media;
 
 pub use clipboard::ClipboardBackend;
 #[cfg(feature = "arboard-clipboard")]
 pub use clipboard::ArboardClipboard;
 pub use engine::{start, EngineConfig, EngineHandle};
 pub use events::{EngineCommand, SyncEvent};
+pub use media::{MediaController, NoopMediaController};
 
 pub fn default_device_name() -> String {
     hostname::get()

@@ -23,6 +23,7 @@ pub async fn run(profile: &str, name: Option<String>) -> anyhow::Result<()> {
         device_name,
         trust_store,
         clipboard: Arc::new(ArboardClipboard),
+        media: Arc::new(continuity_daemon::NoopMediaController),
         received_files_dir: received_files_dir(profile),
     };
 
@@ -93,6 +94,18 @@ fn handle_event(event: SyncEvent, cli_state: &CliState) {
         SyncEvent::WasReset => println!("reset: all paired devices forgotten"),
         SyncEvent::PausedStateChanged { paused } => {
             println!("{}", if paused { "syncing paused" } else { "syncing resumed" });
+        }
+        SyncEvent::ReconnectFailed { peer_id } => {
+            println!("couldn't reconnect to '{peer_id}': no known address");
+        }
+        SyncEvent::NowPlayingChanged { peer_name, info, .. } => {
+            if info.is_playing {
+                let title = info.title.as_deref().unwrap_or("?");
+                let artist = info.artist.as_deref().unwrap_or("?");
+                println!("'{peer_name}' now playing: {title} — {artist}");
+            } else {
+                println!("'{peer_name}' now playing: (nothing)");
+            }
         }
     }
 }

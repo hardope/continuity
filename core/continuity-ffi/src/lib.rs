@@ -11,7 +11,9 @@
 
 use continuity_crypto::{Identity, TrustStore};
 use continuity_daemon::{ClipboardBackend, EngineCommand, EngineConfig};
-use continuity_proto::{DeviceInfo as CoreDeviceInfo, Platform as CorePlatform};
+use continuity_proto::{
+    DeviceInfo as CoreDeviceInfo, MediaCommand as CoreMediaCommand, Platform as CorePlatform,
+};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -71,6 +73,51 @@ impl From<CoreDeviceInfo> for FfiDeviceInfo {
     }
 }
 
+/// Mirrors `continuity_proto::MediaCommand` — see
+/// `ContinuityEngine::send_media_command` for where the host language uses
+/// this.
+#[derive(uniffi::Enum, Debug, Clone, Copy)]
+pub enum FfiMediaCommand {
+    PlayPause,
+    Next,
+    Previous,
+}
+
+impl From<FfiMediaCommand> for CoreMediaCommand {
+    fn from(c: FfiMediaCommand) -> Self {
+        match c {
+            FfiMediaCommand::PlayPause => CoreMediaCommand::PlayPause,
+            FfiMediaCommand::Next => CoreMediaCommand::Next,
+            FfiMediaCommand::Previous => CoreMediaCommand::Previous,
+        }
+    }
+}
+
+/// Mirrors `continuity_proto::NowPlayingInfo`. `artwork` is an empty list
+/// rather than the host language's null/empty-string convention for "no
+/// artwork" — decode it as an image (e.g. `BitmapFactory.decodeByteArray`
+/// on Android) only when non-empty.
+#[derive(uniffi::Record, Debug, Clone)]
+pub struct FfiNowPlayingInfo {
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub artwork: Vec<u8>,
+    pub is_playing: bool,
+}
+
+impl From<continuity_proto::NowPlayingInfo> for FfiNowPlayingInfo {
+    fn from(i: continuity_proto::NowPlayingInfo) -> Self {
+        Self {
+            title: i.title,
+            artist: i.artist,
+            album: i.album,
+            artwork: i.artwork,
+            is_playing: i.is_playing,
+        }
+    }
+}
+
 #[derive(uniffi::Enum, Debug, Clone)]
 pub enum FfiSyncEvent {
     Listening { port: u16 },
@@ -88,6 +135,8 @@ pub enum FfiSyncEvent {
     Error { message: String },
     WasReset,
     PausedStateChanged { paused: bool },
+    ReconnectFailed { peer_id: String },
+    NowPlayingChanged { peer_id: String, peer_name: String, info: FfiNowPlayingInfo },
 }
 
 impl From<continuity_daemon::SyncEvent> for FfiSyncEvent {
@@ -117,6 +166,10 @@ impl From<continuity_daemon::SyncEvent> for FfiSyncEvent {
             E::Error(message) => FfiSyncEvent::Error { message },
             E::WasReset => FfiSyncEvent::WasReset,
             E::PausedStateChanged { paused } => FfiSyncEvent::PausedStateChanged { paused },
+            E::ReconnectFailed { peer_id } => FfiSyncEvent::ReconnectFailed { peer_id },
+            E::NowPlayingChanged { peer_id, peer_name, info } => {
+                FfiSyncEvent::NowPlayingChanged { peer_id, peer_name, info: info.into() }
+            }
         }
     }
 }
@@ -196,6 +249,10 @@ impl ContinuityEngine {
                     device_name,
                     trust_store,
                     clipboard: Arc::new(ClipboardBridge(clipboard)),
+                    // Mobile only sends media commands (see
+                    // ContinuityEngine::send_media_command below), it
+                    // doesn't need to act on receiving one.
+                    media: Arc::new(continuity_daemon::NoopMediaController),
                     received_files_dir: PathBuf::from(received_files_dir),
                 };
                 continuity_daemon::start(config).await.map_err(|e| e.to_string())
@@ -254,6 +311,34 @@ impl ContinuityEngine {
     /// service. Call again with `false` to resume.
     pub fn set_paused(&self, paused: bool) {
         let _ = self.commands.send(EngineCommand::SetPaused(paused));
+    }
+
+    /// Drops the connection to one specific peer without forgetting it —
+    /// unlike `reset`, it stays paired and `reconnect_peer` can bring it
+    /// back. Sticks until then; the peer won't silently reconnect on its
+    /// own (from either side) in the meantime.
+    pub fn disconnect_peer(&self, peer_id: String) {
+        let _ = self.commands.send(EngineCommand::DisconnectPeer { peer_crypto_id: peer_id });
+    }
+
+    /// Re-dials a peer previously dropped with `disconnect_peer`. Emits
+    /// `FfiSyncEvent::ReconnectFailed` (not an error return — this is
+    /// fire-and-forget like every other command) if the engine has no
+    /// cached address for that peer, e.g. it hasn't been seen on the
+    /// network since this engine started.
+    pub fn reconnect_peer(&self, peer_id: String) {
+        let _ = self.commands.send(EngineCommand::ReconnectPeer { peer_crypto_id: peer_id });
+    }
+
+    /// Remote-controls a transport command on `peer_id`'s currently-playing
+    /// media. Fire-and-forget — only acted on if the receiving peer is
+    /// macOS (the only platform with a real `MediaController` today);
+    /// every other platform silently ignores it.
+    pub fn send_media_command(&self, peer_id: String, command: FfiMediaCommand) {
+        let _ = self.commands.send(EngineCommand::SendMediaCommand {
+            peer_crypto_id: peer_id,
+            command: command.into(),
+        });
     }
 }
 
