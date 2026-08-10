@@ -37,5 +37,19 @@
             android:exported="false"
             android:foregroundServiceType="dataSync" />
 
+        <!-- Lets the "Open" action on a file-received notification hand a
+             content:// Uri to whatever viewer app the user has — sharing a
+             raw file:// Uri via an Intent throws FileUriExposedException
+             on API 24+, this is the required workaround. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
     </application>
 </manifest>

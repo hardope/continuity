@@ -86,6 +86,8 @@ pub enum FfiSyncEvent {
     FileSent { transfer_id: String, file_name: String, to_name: String },
     FileTransferFailed { transfer_id: String, reason: String },
     Error { message: String },
+    WasReset,
+    PausedStateChanged { paused: bool },
 }
 
 impl From<continuity_daemon::SyncEvent> for FfiSyncEvent {
@@ -113,6 +115,8 @@ impl From<continuity_daemon::SyncEvent> for FfiSyncEvent {
                 FfiSyncEvent::FileTransferFailed { transfer_id, reason }
             }
             E::Error(message) => FfiSyncEvent::Error { message },
+            E::WasReset => FfiSyncEvent::WasReset,
+            E::PausedStateChanged { paused } => FfiSyncEvent::PausedStateChanged { paused },
         }
     }
 }
@@ -236,6 +240,20 @@ impl ContinuityEngine {
             peer_crypto_id: peer_id,
             path,
         });
+    }
+
+    /// Clears every paired device and disconnects all active peers — the
+    /// host app should confirm with the user before calling this, there's
+    /// no undo.
+    pub fn reset(&self) {
+        let _ = self.commands.send(EngineCommand::Reset);
+    }
+
+    /// Temporarily stop syncing (new connections, dialing, clipboard) in
+    /// either direction, without stopping the engine or foreground
+    /// service. Call again with `false` to resume.
+    pub fn set_paused(&self, paused: bool) {
+        let _ = self.commands.send(EngineCommand::SetPaused(paused));
     }
 }
 

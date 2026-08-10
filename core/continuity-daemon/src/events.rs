@@ -22,6 +22,14 @@ pub enum SyncEvent {
     FileSent { transfer_id: String, file_name: String, to_name: String },
     FileTransferFailed { transfer_id: String, reason: String },
     Error(String),
+    /// Trust store cleared and every active connection dropped, in
+    /// response to `EngineCommand::Reset` — confirms it actually happened
+    /// so a shell can show "All devices forgotten" rather than assuming.
+    WasReset,
+    /// Reflects the current pause state after `EngineCommand::SetPaused`,
+    /// so a shell's own UI (tray menu label, toggle) can follow the
+    /// engine's actual state instead of tracking it independently.
+    PausedStateChanged { paused: bool },
 }
 
 /// Requests a shell makes of the engine. Sent over the channel returned by
@@ -30,4 +38,13 @@ pub enum SyncEvent {
 pub enum EngineCommand {
     ConfirmPairing { peer_crypto_id: String, accept: bool },
     SendFile { peer_crypto_id: String, path: String },
+    /// Clears the trust store and disconnects every active peer, as if
+    /// freshly installed. Every previously paired device will need to be
+    /// paired again.
+    Reset,
+    /// Temporarily stops accepting new connections, dialing discovered
+    /// peers, and syncing the clipboard (in either direction), without
+    /// shutting the engine down — existing connections stay open but go
+    /// idle. Toggle back with `SetPaused(false)`.
+    SetPaused(bool),
 }

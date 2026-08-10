@@ -753,7 +753,21 @@ public protocol ContinuityEngineProtocol : AnyObject {
     
     func confirmPairing(peerId: String, accept: Bool) 
     
+    /**
+     * Clears every paired device and disconnects all active peers — the
+     * host app should confirm with the user before calling this, there's
+     * no undo.
+     */
+    func reset() 
+    
     func sendFile(peerId: String, path: String) 
+    
+    /**
+     * Temporarily stop syncing (new connections, dialing, clipboard) in
+     * either direction, without stopping the engine or foreground
+     * service. Call again with `false` to resume.
+     */
+    func setPaused(paused: Bool) 
     
 }
 
@@ -846,10 +860,33 @@ open func confirmPairing(peerId: String, accept: Bool) {try! rustCall() {
 }
 }
     
+    /**
+     * Clears every paired device and disconnects all active peers — the
+     * host app should confirm with the user before calling this, there's
+     * no undo.
+     */
+open func reset() {try! rustCall() {
+    uniffi_continuity_ffi_fn_method_continuityengine_reset(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
 open func sendFile(peerId: String, path: String) {try! rustCall() {
     uniffi_continuity_ffi_fn_method_continuityengine_send_file(self.uniffiClonePointer(),
         FfiConverterString.lower(peerId),
         FfiConverterString.lower(path),$0
+    )
+}
+}
+    
+    /**
+     * Temporarily stop syncing (new connections, dialing, clipboard) in
+     * either direction, without stopping the engine or foreground
+     * service. Call again with `false` to resume.
+     */
+open func setPaused(paused: Bool) {try! rustCall() {
+    uniffi_continuity_ffi_fn_method_continuityengine_set_paused(self.uniffiClonePointer(),
+        FfiConverterBool.lower(paused),$0
     )
 }
 }
@@ -1254,6 +1291,9 @@ public enum FfiSyncEvent {
     )
     case error(message: String
     )
+    case wasReset
+    case pausedStateChanged(paused: Bool
+    )
 }
 
 
@@ -1304,6 +1344,11 @@ public struct FfiConverterTypeFfiSyncEvent: FfiConverterRustBuffer {
         )
         
         case 13: return .error(message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 14: return .wasReset
+        
+        case 15: return .pausedStateChanged(paused: try FfiConverterBool.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -1388,6 +1433,15 @@ public struct FfiConverterTypeFfiSyncEvent: FfiConverterRustBuffer {
             writeInt(&buf, Int32(13))
             FfiConverterString.write(message, into: &buf)
             
+        
+        case .wasReset:
+            writeInt(&buf, Int32(14))
+        
+        
+        case let .pausedStateChanged(paused):
+            writeInt(&buf, Int32(15))
+            FfiConverterBool.write(paused, into: &buf)
+            
         }
     }
 }
@@ -1460,6 +1514,20 @@ public func generateIdentityDer()throws  -> Data {
     )
 })
 }
+/**
+ * Routes the Rust side's `tracing` output to `logcat` on Android. Without
+ * this, every `tracing::debug!`/`warn!` call in `continuity-daemon` and
+ * friends goes to stdout — which doesn't exist for an Android app, so it's
+ * silently discarded and there's no way to see what the engine is doing.
+ * No-op on iOS (Console.app / os_log integration is a reasonable follow-up
+ * but not needed yet — `print!`-based debugging has been enough there).
+ * Safe to call more than once; only the first call takes effect.
+ */
+public func initAndroidLogging() {try! rustCall() {
+    uniffi_continuity_ffi_fn_func_init_android_logging($0
+    )
+}
+}
 
 private enum InitializationResult {
     case ok
@@ -1482,6 +1550,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_continuity_ffi_checksum_func_generate_identity_der() != 21681) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_continuity_ffi_checksum_func_init_android_logging() != 39920) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_continuity_ffi_checksum_method_clipboardprovider_get_text() != 2767) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -1491,7 +1562,13 @@ private var initializationResult: InitializationResult = {
     if (uniffi_continuity_ffi_checksum_method_continuityengine_confirm_pairing() != 25048) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_continuity_ffi_checksum_method_continuityengine_reset() != 40739) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_continuity_ffi_checksum_method_continuityengine_send_file() != 32648) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_continuity_ffi_checksum_method_continuityengine_set_paused() != 20054) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_continuity_ffi_checksum_method_eventlistener_on_event() != 22386) {

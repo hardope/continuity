@@ -334,9 +334,19 @@ void*_Nonnull uniffi_continuity_ffi_fn_constructor_continuityengine_start(RustBu
 void uniffi_continuity_ffi_fn_method_continuityengine_confirm_pairing(void*_Nonnull ptr, RustBuffer peer_id, int8_t accept, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CONTINUITY_FFI_FN_METHOD_CONTINUITYENGINE_RESET
+#define UNIFFI_FFIDEF_UNIFFI_CONTINUITY_FFI_FN_METHOD_CONTINUITYENGINE_RESET
+void uniffi_continuity_ffi_fn_method_continuityengine_reset(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CONTINUITY_FFI_FN_METHOD_CONTINUITYENGINE_SEND_FILE
 #define UNIFFI_FFIDEF_UNIFFI_CONTINUITY_FFI_FN_METHOD_CONTINUITYENGINE_SEND_FILE
 void uniffi_continuity_ffi_fn_method_continuityengine_send_file(void*_Nonnull ptr, RustBuffer peer_id, RustBuffer path, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CONTINUITY_FFI_FN_METHOD_CONTINUITYENGINE_SET_PAUSED
+#define UNIFFI_FFIDEF_UNIFFI_CONTINUITY_FFI_FN_METHOD_CONTINUITYENGINE_SET_PAUSED
+void uniffi_continuity_ffi_fn_method_continuityengine_set_paused(void*_Nonnull ptr, int8_t paused, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CONTINUITY_FFI_FN_CLONE_EVENTLISTENER
@@ -367,6 +377,12 @@ RustBuffer uniffi_continuity_ffi_fn_func_device_id_for(RustBuffer identity_der, 
 #ifndef UNIFFI_FFIDEF_UNIFFI_CONTINUITY_FFI_FN_FUNC_GENERATE_IDENTITY_DER
 #define UNIFFI_FFIDEF_UNIFFI_CONTINUITY_FFI_FN_FUNC_GENERATE_IDENTITY_DER
 RustBuffer uniffi_continuity_ffi_fn_func_generate_identity_der(RustCallStatus *_Nonnull out_status
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CONTINUITY_FFI_FN_FUNC_INIT_ANDROID_LOGGING
+#define UNIFFI_FFIDEF_UNIFFI_CONTINUITY_FFI_FN_FUNC_INIT_ANDROID_LOGGING
+void uniffi_continuity_ffi_fn_func_init_android_logging(RustCallStatus *_Nonnull out_status
     
 );
 #endif
@@ -662,6 +678,12 @@ uint16_t uniffi_continuity_ffi_checksum_func_generate_identity_der(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CONTINUITY_FFI_CHECKSUM_FUNC_INIT_ANDROID_LOGGING
+#define UNIFFI_FFIDEF_UNIFFI_CONTINUITY_FFI_CHECKSUM_FUNC_INIT_ANDROID_LOGGING
+uint16_t uniffi_continuity_ffi_checksum_func_init_android_logging(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CONTINUITY_FFI_CHECKSUM_METHOD_CLIPBOARDPROVIDER_GET_TEXT
 #define UNIFFI_FFIDEF_UNIFFI_CONTINUITY_FFI_CHECKSUM_METHOD_CLIPBOARDPROVIDER_GET_TEXT
 uint16_t uniffi_continuity_ffi_checksum_method_clipboardprovider_get_text(void
@@ -680,9 +702,21 @@ uint16_t uniffi_continuity_ffi_checksum_method_continuityengine_confirm_pairing(
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CONTINUITY_FFI_CHECKSUM_METHOD_CONTINUITYENGINE_RESET
+#define UNIFFI_FFIDEF_UNIFFI_CONTINUITY_FFI_CHECKSUM_METHOD_CONTINUITYENGINE_RESET
+uint16_t uniffi_continuity_ffi_checksum_method_continuityengine_reset(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CONTINUITY_FFI_CHECKSUM_METHOD_CONTINUITYENGINE_SEND_FILE
 #define UNIFFI_FFIDEF_UNIFFI_CONTINUITY_FFI_CHECKSUM_METHOD_CONTINUITYENGINE_SEND_FILE
 uint16_t uniffi_continuity_ffi_checksum_method_continuityengine_send_file(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CONTINUITY_FFI_CHECKSUM_METHOD_CONTINUITYENGINE_SET_PAUSED
+#define UNIFFI_FFIDEF_UNIFFI_CONTINUITY_FFI_CHECKSUM_METHOD_CONTINUITYENGINE_SET_PAUSED
+uint16_t uniffi_continuity_ffi_checksum_method_continuityengine_set_paused(void
     
 );
 #endif

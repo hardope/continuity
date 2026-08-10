@@ -41,14 +41,21 @@ fn main() -> anyhow::Result<()> {
 
     let title_item = MenuItem::new(format!("Continuity — {device_name}"), false, None);
     let send_item = MenuItem::new("Send File... (no device connected)", false, None);
+    let pause_item = MenuItem::new("Pause Syncing", true, None);
+    let reset_item = MenuItem::new("Reset...", true, None);
     let quit_item = MenuItem::new("Quit", true, None);
     let send_item_id = send_item.id().clone();
+    let pause_item_id = pause_item.id().clone();
+    let reset_item_id = reset_item.id().clone();
     let quit_item_id = quit_item.id().clone();
 
     let menu = Menu::new();
     menu.append(&title_item)?;
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&send_item)?;
+    menu.append(&PredefinedMenuItem::separator())?;
+    menu.append(&pause_item)?;
+    menu.append(&reset_item)?;
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&quit_item)?;
 
@@ -60,6 +67,7 @@ fn main() -> anyhow::Result<()> {
 
     let commands = start_engine_thread(profile(), device_name, proxy)?;
     let last_connected_peer: Arc<Mutex<Option<(String, String)>>> = Arc::new(Mutex::new(None));
+    let is_paused: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
 
     event_loop.run(move |event, _target, control_flow| {
         // Keep the tray icon (and its menu) alive for the app's lifetime —
@@ -68,7 +76,7 @@ fn main() -> anyhow::Result<()> {
         *control_flow = ControlFlow::Wait;
 
         if let tao::event::Event::UserEvent(sync_event) = event {
-            handle_sync_event(sync_event, &send_item, &last_connected_peer, &commands);
+            handle_sync_event(sync_event, &send_item, &pause_item, &last_connected_peer, &is_paused, &commands);
         }
 
         if let Ok(event) = MenuEvent::receiver().try_recv() {
@@ -80,6 +88,20 @@ fn main() -> anyhow::Result<()> {
                             path: path.display().to_string(),
                         });
                     }
+                }
+            } else if event.id == pause_item_id {
+                let currently_paused = *is_paused.lock().unwrap();
+                let _ = commands.send(EngineCommand::SetPaused(!currently_paused));
+            } else if event.id == reset_item_id {
+                let result = rfd::MessageDialog::new()
+                    .set_title("Continuity — Reset")
+                    .set_description(
+                        "This disconnects every paired device and forgets them all. Each one will need to be paired again from scratch.\n\nAre you sure?",
+                    )
+                    .set_buttons(rfd::MessageButtons::YesNo)
+                    .show();
+                if matches!(result, rfd::MessageDialogResult::Yes) {
+                    let _ = commands.send(EngineCommand::Reset);
                 }
             } else if event.id == quit_item_id {
                 *control_flow = ControlFlow::Exit;
@@ -96,7 +118,9 @@ fn main() -> anyhow::Result<()> {
 fn handle_sync_event(
     event: SyncEvent,
     send_item: &MenuItem,
+    pause_item: &MenuItem,
     last_connected_peer: &Arc<Mutex<Option<(String, String)>>>,
+    is_paused: &Arc<Mutex<bool>>,
     commands: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
 ) {
     match event {
@@ -116,7 +140,10 @@ fn handle_sync_event(
                 accept: accepted,
             });
         }
-        SyncEvent::Paired { peer } => notify(&format!("Paired with {}", peer.name)),
+        // Paired/Connected/Disconnected/ClipboardReceived are routine —
+        // they'd fire constantly on an active mesh and a popup for each
+        // one is just noise. Still logged for debugging, just not shown.
+        SyncEvent::Paired { peer } => tracing::info!("paired with '{}'", peer.name),
         SyncEvent::PairingDeclined { peer_name } => {
             notify(&format!("Pairing with '{peer_name}' was declined"));
         }
@@ -132,16 +159,16 @@ fn handle_sync_event(
                 send_item.set_text("Send File... (no device connected)");
                 send_item.set_enabled(false);
             }
-            notify(&format!("'{peer_name}' disconnected"));
+            tracing::info!("'{peer_name}' disconnected");
         }
         SyncEvent::ClipboardReceived { from_name } => {
-            notify(&format!("Clipboard synced from '{from_name}'"));
+            tracing::info!("clipboard synced from '{from_name}'");
         }
         SyncEvent::ClipboardBroadcast { .. } => {}
         SyncEvent::FileReceiving { from_name, file_name, .. } => {
             notify(&format!("Receiving '{file_name}' from '{from_name}'..."));
         }
-        SyncEvent::FileReceived { file_name, .. } => notify(&format!("Received '{file_name}'")),
+        SyncEvent::FileReceived { file_name, path, .. } => notify_file_received(&file_name, &path),
         SyncEvent::FileSent { file_name, to_name, .. } => {
             notify(&format!("Sent '{file_name}' to '{to_name}'"));
         }
@@ -149,6 +176,16 @@ fn handle_sync_event(
             notify(&format!("File transfer failed: {reason}"));
         }
         SyncEvent::Error(e) => tracing::warn!("{e}"),
+        SyncEvent::WasReset => {
+            *last_connected_peer.lock().unwrap() = None;
+            send_item.set_text("Send File... (no device connected)");
+            send_item.set_enabled(false);
+            notify("All paired devices have been forgotten");
+        }
+        SyncEvent::PausedStateChanged { paused } => {
+            *is_paused.lock().unwrap() = paused;
+            pause_item.set_text(if paused { "Resume Syncing" } else { "Pause Syncing" });
+        }
     }
 }
 
@@ -165,6 +202,78 @@ fn notify(body: &str) {
     {
         tracing::debug!("notification not shown (expected for an unbundled binary): {e}");
     }
+}
+
+/// A file-received notification is worth acting on immediately, so it gets
+/// "Open" / "Show in Folder" actions instead of just announcing itself.
+/// `wait_for_action` blocks until the user interacts (or the notification
+/// times out/closes), so it runs on its own thread rather than the tao
+/// event loop's thread — blocking that would freeze the whole tray app
+/// until the notification was dismissed.
+fn notify_file_received(file_name: &str, path: &str) {
+    tracing::info!("received '{file_name}' at {path}");
+    let path = path.to_string();
+    match notify_rust::Notification::new()
+        .summary("Continuity")
+        .body(&format!("Received '{file_name}'"))
+        .action("default", "Open")
+        .action("show-folder", "Show in Folder")
+        .show()
+    {
+        Ok(handle) => {
+            std::thread::spawn(move || {
+                handle.wait_for_action(|action| match action {
+                    "default" => {
+                        if let Err(e) = open_path(&path) {
+                            tracing::debug!("couldn't open '{path}': {e}");
+                        }
+                    }
+                    "show-folder" => {
+                        if let Err(e) = reveal_in_folder(&path) {
+                            tracing::debug!("couldn't reveal '{path}': {e}");
+                        }
+                    }
+                    _ => {}
+                });
+            });
+        }
+        Err(e) => tracing::debug!("notification not shown (expected for an unbundled binary): {e}"),
+    }
+}
+
+fn open_path(path: &str) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg(path).spawn()?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd").args(["/C", "start", "", path]).spawn()?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open").arg(path).spawn()?;
+    }
+    Ok(())
+}
+
+fn reveal_in_folder(path: &str) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").args(["-R", path]).spawn()?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer").arg(format!("/select,{path}")).spawn()?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // No universal "reveal and select" on Linux — opening the
+        // containing folder is the practical equivalent.
+        let dir = std::path::Path::new(path).parent().unwrap_or_else(|| std::path::Path::new("."));
+        std::process::Command::new("xdg-open").arg(dir).spawn()?;
+    }
+    Ok(())
 }
 
 fn start_engine_thread(

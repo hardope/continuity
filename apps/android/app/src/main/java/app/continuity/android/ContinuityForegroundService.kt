@@ -3,12 +3,15 @@ package app.continuity.android
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.net.wifi.WifiManager
 import android.os.IBinder
+import android.webkit.MimeTypeMap
 import androidx.core.app.NotificationCompat
+import androidx.core.content.FileProvider
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -17,6 +20,7 @@ import kotlinx.coroutines.launch
 import uniffi.continuity_ffi.ContinuityEngine
 import uniffi.continuity_ffi.EventListener
 import uniffi.continuity_ffi.FfiSyncEvent
+import java.io.File
 
 /**
  * Foreground service hosting the engine for as long as the app should be
@@ -132,20 +136,33 @@ class ContinuityForegroundService : Service() {
             .build()
 
     private fun notifyForEvent(event: FfiSyncEvent) {
+        // Paired/Connected/Disconnected/ClipboardReceived are routine —
+        // on an active mesh they'd fire constantly, and a notification for
+        // each one is just noise. They're still logged to the in-app
+        // activity feed (see MainActivity), just not pushed as a system
+        // notification. Reset/pause are self-initiated from within the
+        // app, so there's no one to notify either.
         val text = when (event) {
             is FfiSyncEvent.PairingRequested ->
                 "Pairing request from '${event.peer.name}' — open Continue to confirm"
-            is FfiSyncEvent.Paired -> "Paired with '${event.peer.name}'"
             is FfiSyncEvent.PairingDeclined -> "Pairing with '${event.peerName}' was declined"
-            is FfiSyncEvent.Connected -> "Connected to '${event.peer.name}'"
-            is FfiSyncEvent.Disconnected -> "'${event.peerName}' disconnected"
-            is FfiSyncEvent.ClipboardReceived -> "Clipboard synced from '${event.fromName}'"
             is FfiSyncEvent.FileReceiving -> "Receiving '${event.fileName}' from '${event.fromName}'..."
-            is FfiSyncEvent.FileReceived -> "Received '${event.fileName}'"
+            is FfiSyncEvent.FileReceived -> {
+                notifyFileReceived(event.fileName, event.path)
+                return
+            }
             is FfiSyncEvent.FileSent -> "Sent '${event.fileName}' to '${event.toName}'"
             is FfiSyncEvent.FileTransferFailed -> "File transfer failed: ${event.reason}"
             is FfiSyncEvent.Error -> "Error: ${event.message}"
-            is FfiSyncEvent.Listening, is FfiSyncEvent.ClipboardBroadcast -> return
+            is FfiSyncEvent.Paired,
+            is FfiSyncEvent.Connected,
+            is FfiSyncEvent.Disconnected,
+            is FfiSyncEvent.ClipboardReceived,
+            is FfiSyncEvent.WasReset,
+            is FfiSyncEvent.PausedStateChanged,
+            is FfiSyncEvent.Listening,
+            is FfiSyncEvent.ClipboardBroadcast,
+            -> return
         }
 
         val notification = NotificationCompat.Builder(this, CHANNEL_EVENTS)
@@ -157,6 +174,41 @@ class ContinuityForegroundService : Service() {
 
         getSystemService(NotificationManager::class.java)
             .notify(NOTIFICATION_ID_EVENT_BASE + text.hashCode(), notification)
+    }
+
+    /// A received file is worth acting on immediately, so it gets an
+    /// "Open" action instead of just announcing itself — routes through
+    /// FileProvider since handing another app a raw file:// Uri throws
+    /// FileUriExposedException on API 24+.
+    private fun notifyFileReceived(fileName: String, path: String) {
+        val file = File(path)
+        val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
+        val extension = fileName.substringAfterLast('.', "")
+        val mimeType = MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension) ?: "*/*"
+
+        val viewIntent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, mimeType)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        val pendingIntent = PendingIntent.getActivity(
+            this,
+            path.hashCode(),
+            viewIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+
+        val notification = NotificationCompat.Builder(this, CHANNEL_EVENTS)
+            .setContentTitle(getString(R.string.app_name))
+            .setContentText("Received '$fileName'")
+            .setSmallIcon(R.drawable.ic_notification)
+            .setAutoCancel(true)
+            .setContentIntent(pendingIntent)
+            .addAction(0, "Open", pendingIntent)
+            .build()
+
+        getSystemService(NotificationManager::class.java)
+            .notify(NOTIFICATION_ID_EVENT_BASE + fileName.hashCode(), notification)
     }
 
     companion object {

@@ -8,8 +8,8 @@ Clipboard, file, and (eventually) keyboard continuity across macOS, Windows, Lin
 
 | Platform | Status |
 |---|---|
-| macOS / Windows / Linux (`continuityd`) | Core protocol (pairing, clipboard sync, file transfer) verified on macOS and Windows. `continuityd` is tray-icon-only by design (no main window) — on Windows 11, new tray icons often land behind the "^" overflow chevron rather than showing directly. Windows ships as a proper installer (`continuity-windows-setup.exe`); Linux ships both a `.deb` and a raw binary. Linux builds clean in CI but hasn't been run on real hardware yet. |
-| Android | Core protocol verified — real pairing and bidirectional clipboard sync confirmed against a desktop instance. Outbound sync only runs while the app is in the foreground (Android 10+ blocks background clipboard reads, a platform restriction — see `docs/protocol.md`), and there's an open report of sync not resuming reliably after returning to the app; the activity feed now logs every outbound broadcast attempt (including "no device connected" when one is detected but there's no peer to send to) specifically to help pin down where that's failing. |
+| macOS / Windows / Linux (`continuityd`) | Core protocol (pairing, clipboard sync, file transfer) verified on macOS and Windows. `continuityd` is tray-icon-only by design (no main window) — on Windows 11, new tray icons often land behind the "^" overflow chevron rather than showing directly. The tray menu has **Pause Syncing** (stops new connections/dialing/clipboard sync without quitting), **Reset...** (forgets every paired device, confirmed with a dialog first — see [`docs/protocol.md`](docs/protocol.md)), and **Quit**. Ships packaged per platform: macOS as a `.dmg` (real `.app` bundle), Windows as an installer, Linux as a `.deb`. Linux builds clean in CI but hasn't been run on real hardware yet. |
+| Android | Core protocol verified — real pairing and bidirectional clipboard sync confirmed against a desktop instance. Outbound sync only runs while the app is in the foreground (Android 10+ blocks background clipboard reads, a platform restriction — see `docs/protocol.md`). Has the same Pause/Reset/Quit controls as desktop, in the app's overflow menu. Routine sync activity (connect/disconnect, clipboard sync) no longer pushes a system notification — check the in-app activity feed for that; pairing requests, file transfers, and errors still notify, and a received file's notification has an "Open" action. |
 | iOS | Source complete, doesn't build yet — gets through code generation and framework packaging in CI but fails on an embedded-extension code-signing step. Not part of CI or releases until that's fixed. See [`docs/ios-build.md`](docs/ios-build.md) for exactly where it stands. |
 | Keyboard/mouse sharing | Not started — deferred, secondary goal. |
 
@@ -24,23 +24,16 @@ Full protocol and security-model writeup: [`docs/protocol.md`](docs/protocol.md)
 
 ## Download
 
-Each [release](https://github.com/hardope/continuity/releases) has five files attached, no zipping — download the one you need:
+Each [release](https://github.com/hardope/continuity/releases) has four files attached, no zipping, no raw binaries — download the one you need:
 
+- `continuity-macos.dmg` — mount it, drag Continuity to Applications
 - `continuity-windows-setup.exe` — Windows installer (Start Menu entry, autostart on sign-in, proper uninstall). Run it, follow the prompts, discard the installer afterward.
-- `continuity-linux.deb` — **recommended for Debian/Ubuntu**: `sudo apt install ./continuity-linux.deb`, which also pulls in the runtime libraries `continuityd` needs (GTK, AppIndicator, libxdo) so it doesn't fail with "error while loading shared libraries" the way the raw binary can if those aren't already on your system. Installs to `/usr/bin/continuityd` — just run `continuityd`, no autostart registration (yet).
-- `continuityd-linux` — raw binary for non-Debian distros; you'll need `libgtk-3-0`, `libayatana-appindicator3-1`, and `libxdo3` (or your distro's equivalents) installed yourself.
-- `continuityd-macos` — raw executable, run directly
+- `continuity-linux.deb` — `sudo apt install ./continuity-linux.deb`, which also pulls in the runtime libraries `continuityd` needs (GTK, AppIndicator, libxdo) so it doesn't fail with "error while loading shared libraries" the way a raw binary can if those aren't already on your system. Installs to `/usr/bin/continuityd` — just run `continuityd`.
 - `continuity-android.apk` — sideload with `adb install` or by opening the file on-device
 
 (`continuityctl`, the CLI test tool, isn't part of releases — it's a dev-only tool, see Building below if you want it.)
 
-All unsigned. Windows SmartScreen will warn once on the installer itself (no code-signing cert yet) — click "More info" → "Run anyway". On macOS, `continuityd-macos` ships as a bare executable rather than a `.app` bundle, so the usual "right-click → Open" Gatekeeper bypass doesn't apply the same way — from Terminal:
-```bash
-chmod +x continuityd-macos
-xattr -d com.apple.quarantine continuityd-macos
-./continuityd-macos
-```
-(Browsers never preserve the Unix execute bit on a plain file download regardless of platform — that first `chmod +x` is needed for `continuityd-linux` too, though not for the `.deb`, which apt handles.) On Android: enable "install from unknown sources" for a sideloaded APK.
+All unsigned. Windows SmartScreen will warn once on the installer itself (no code-signing cert yet) — click "More info" → "Run anyway". macOS Gatekeeper will similarly warn on first launch of the unsigned `.app` — right-click → Open the first time to get the bypass dialog. On Android: enable "install from unknown sources" for a sideloaded APK.
 
 The workflow can also be triggered by hand without cutting a release — see the "Run workflow" button on [Actions](https://github.com/hardope/continuity/actions/workflows/release.yml) — which builds the same binaries from whatever's on `master` and attaches them to that run's Artifacts section, no tag needed.
 

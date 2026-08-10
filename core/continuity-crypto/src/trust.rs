@@ -81,6 +81,13 @@ impl TrustStore {
         self.save()
     }
 
+    /// Forgets every paired device — a factory reset. Every previously
+    /// trusted peer will need to be paired again from scratch.
+    pub fn clear(&mut self) -> Result<(), TrustError> {
+        self.file.devices.clear();
+        self.save()
+    }
+
     fn save(&self) -> Result<(), TrustError> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;

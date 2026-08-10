@@ -14,27 +14,25 @@
 # needs Play Store signing secrets this repo doesn't have configured.
 # Still valuable as continuous "does it even build" verification.
 #
-# Release assets are the raw per-platform binaries, not zips — there's
-# exactly one file per platform (continuityd; continuityctl is a dev/test
-# tool and deliberately not shipped here), so zipping was pure friction
-# with no upside. Each binary gets explicitly chmod +x'd before upload —
-# GitHub's artifact upload/download round-trip has a history of not
-# reliably preserving the executable bit, and a binary that loses it
-# looks broken to a normal user (macOS Finder falls back to opening it
-# as a text file on double-click instead of running it, with nothing in
-# the UI suggesting *why*).
-#
-# Windows is the exception: its asset is an Inno Setup installer
-# (installers/windows/continuity.iss), not the raw exe — a portable exe
-# has no Start Menu entry, no autostart, and no uninstall, none of which
-# match how a background tray app is expected to behave on Windows.
-#
-# Linux ships both: the raw binary (for non-Debian distros) and a .deb
-# (continuity-linux.deb, via cargo-deb — see core/continuityd/Cargo.toml)
-# for the Debian/Ubuntu majority, since the raw binary needs its runtime
-# shared-lib deps (libxdo3, libayatana-appindicator3-1, ...) installed by
-# hand or it fails with "error while loading shared libraries", which the
-# .deb's auto-computed Depends: field avoids.
+# Release assets are one properly-packaged file per platform, not a raw
+# binary — continuityctl (the dev/test CLI) is deliberately not shipped:
+#   - macOS: continuity-macos.dmg — a real .app bundle (Info.plist, icon
+#     generated from assets/logo.svg) inside a .dmg with a drag-to-
+#     Applications symlink. A bare Mach-O executable isn't something
+#     Finder recognizes as an app; double-clicking it opened it as an
+#     unknown/text file instead of running it. See installers/macos/.
+#   - Windows: continuity-windows-setup.exe — an Inno Setup installer
+#     (installers/windows/continuity.iss). A portable exe has no Start
+#     Menu entry, no autostart, and no uninstall.
+#   - Linux: continuity-linux.deb — via cargo-deb (package metadata in
+#     core/continuityd/Cargo.toml). Its auto-computed Depends: field
+#     (libxdo3, libayatana-appindicator3-1, ...) is why this exists at
+#     all — a raw binary fails with "error while loading shared
+#     libraries" unless those happen to already be installed.
+#   - Android: continuity-android.apk (unsigned debug build — real
+#     distribution needs Play Store signing secrets this repo doesn't
+#     have configured, but it's still valuable as continuous "does it
+#     even build" verification).
 
 name: Release
 
@@ -54,16 +52,10 @@ jobs:
         include:
           - os: macos-latest
             name: macos
-            binary: continuityd
-            release_name: continuityd-macos
           - os: windows-latest
             name: windows
-            binary: continuityd.exe
-            release_name: continuity-windows-setup.exe
           - os: ubuntu-latest
             name: linux
-            binary: continuityd
-            release_name: continuityd-linux
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -93,12 +85,49 @@ jobs:
         # though it isn't released — catches regressions in it via CI.
         run: cargo build --release -p continuityd -p continuityctl
 
-      - name: Stage release binary
-        if: matrix.name != 'windows'
+      - name: Build macOS .app bundle + .dmg
+        # A bare Mach-O executable isn't something Finder recognizes as an
+        # app — double-clicking it opens it as a text/unknown file instead
+        # of running it. Wrapping it as a real .app (Info.plist, icon) and
+        # shipping that inside a .dmg (with a drag-to-Applications
+        # symlink) is the standard macOS distribution shape and fixes
+        # that. LSUIElement=true in Info.plist also means no Dock icon,
+        # matching the tray-only design.
+        if: matrix.name == 'macos'
         shell: bash
         run: |
-          cp target/release/${{ matrix.binary }} ${{ matrix.release_name }}
-          chmod +x ${{ matrix.release_name }} || true
+          APP=Continuity.app
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp target/release/continuityd "$APP/Contents/MacOS/continuityd"
+          chmod +x "$APP/Contents/MacOS/continuityd"
+          cp installers/macos/Info.plist "$APP/Contents/Info.plist"
+
+          # `sips` doesn't reliably rasterize SVG, but `qlmanage -t` (the
+          # QuickLook thumbnail generator) does — render once at the
+          # largest icon size, then downscale with sips for the rest.
+          # qlmanage requires the output dir to already exist, and names
+          # its output after the input file.
+          mkdir -p AppIcon.iconset /tmp/icon-src
+          qlmanage -t -s 1024 -o /tmp/icon-src assets/logo.svg
+          mv /tmp/icon-src/logo.svg.png /tmp/icon-src/base.png
+          for size in 16 32 128 256 512; do
+            sips -z $size $size /tmp/icon-src/base.png --out AppIcon.iconset/icon_${size}x${size}.png
+            double=$((size * 2))
+            sips -z $double $double /tmp/icon-src/base.png --out AppIcon.iconset/icon_${size}x${size}@2x.png
+          done
+          iconutil -c icns AppIcon.iconset -o "$APP/Contents/Resources/AppIcon.icns"
+
+          mkdir dmg-src
+          mv "$APP" dmg-src/
+          ln -s /Applications dmg-src/Applications
+          hdiutil create -volname Continuity -srcfolder dmg-src -ov -format UDZO continuity-macos.dmg
+
+      - name: Upload macOS .dmg
+        if: matrix.name == 'macos'
+        uses: actions/upload-artifact@v4
+        with:
+          name: continuity-macos.dmg
+          path: continuity-macos.dmg
 
       - name: Build Linux .deb package
         # The raw binary dynamically links libxdo, libayatana-appindicator3,
@@ -140,10 +169,12 @@ jobs:
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installers\windows\continuity.iss
           Copy-Item installers\windows\continuity-windows-setup.exe .
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload Windows installer
+        if: matrix.name == 'windows'
+        uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.release_name }}
-          path: ${{ matrix.release_name }}
+          name: continuity-windows-setup.exe
+          path: continuity-windows-setup.exe
 
   android:
     runs-on: ubuntu-latest
@@ -212,17 +243,14 @@ jobs:
         with:
           path: artifacts
           # Each artifact is already exactly one file (see the desktop/
-          # android jobs' "Stage release ..." steps) — merge them into one
-          # flat directory instead of one subdirectory per artifact name,
-          # so the release gets raw files, not a zip per platform.
+          # android jobs' "Upload ..."/"Stage release ..." steps) — merge
+          # them into one flat directory instead of one subdirectory per
+          # artifact name, so the release gets raw files, not a zip per
+          # platform. Every asset is now a packaged format (.dmg, the
+          # installer .exe, .deb, .apk) whose permissions are set inside
+          # the package itself at build time, so there's no separate
+          # executable-bit step needed here anymore.
           merge-multiple: true
-
-      - name: Re-assert executable bit
-        # Belt-and-suspenders on top of the desktop job's chmod — GitHub's
-        # artifact upload/download round-trip doesn't always preserve it
-        # reliably, and a binary that loses it just looks broken with no
-        # explanation (see the top-of-file note).
-        run: chmod +x artifacts/continuityd-macos artifacts/continuityd-linux 2>/dev/null || true
 
       - uses: softprops/action-gh-release@v2
         with:

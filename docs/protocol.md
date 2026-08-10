@@ -51,6 +51,15 @@ It's a channel-driven design, not a trait shells implement: `EngineHandle.events
 
 Clipboard access is the one piece the engine doesn't own directly — it takes a `ClipboardBackend` trait object at construction (`ArboardClipboard` on desktop; Android/iOS bridge it through their own `ClipboardProvider`/`ClipboardManager`/`UIPasteboard` code, since there's no cross-platform "background thread OS clipboard" API the way `arboard` provides on desktop).
 
+## Reset and pause
+
+Two `EngineCommand`s every shell exposes (desktop tray menu, Android's overflow menu):
+
+- **`Reset`** — clears the trust store entirely (`TrustStore::clear`) and force-disconnects every active connection. Every peer's task is tracked by an `AbortHandle` keyed on its crypto id specifically so this is possible — a connection is normally just a task blocked reading, with no other way to interrupt it from outside. There's no undo: every previously paired device needs to be paired again from scratch, on both sides. Shells confirm with the user before sending this.
+- **`SetPaused(bool)`** — temporarily stops accepting inbound connections, dialing discovered peers, and syncing the clipboard in either direction, without shutting the engine down or dropping connections already open. Checked in four places: the accept loop, the mDNS dial loop, the clipboard watcher, and inbound `ClipboardUpdate` handling. Toggling back off resumes all four immediately; it does not re-sync anything that changed while paused (the clipboard watcher only reacts to changes it observes after resuming, not a diff of what it missed).
+
+Both emit a confirming event (`SyncEvent::WasReset`, `SyncEvent::PausedStateChanged`) rather than assuming the command succeeded — a shell updates its own UI (tray menu label, activity feed) off that event, not off the click that sent the command.
+
 ## Clipboard sync
 
 Mesh, not hub-and-spoke: every device keeps a persistent connection to every currently-online trusted peer and pushes `ClipboardUpdate` to all of them when its own OS clipboard changes (the engine's watcher polls the injected `ClipboardBackend` every 500ms).

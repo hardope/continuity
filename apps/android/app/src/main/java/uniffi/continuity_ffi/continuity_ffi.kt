@@ -782,6 +782,10 @@ internal open class UniffiVTableCallbackInterfaceEventListener(
 
 
 
+
+
+
+
 // A JNA Library to expose the extern-C FFI definitions.
 // This is an implementation detail which will be called internally by the public API.
 
@@ -821,7 +825,11 @@ internal interface UniffiLib : Library {
     ): Pointer
     fun uniffi_continuity_ffi_fn_method_continuityengine_confirm_pairing(`ptr`: Pointer,`peerId`: RustBuffer.ByValue,`accept`: Byte,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    fun uniffi_continuity_ffi_fn_method_continuityengine_reset(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     fun uniffi_continuity_ffi_fn_method_continuityengine_send_file(`ptr`: Pointer,`peerId`: RustBuffer.ByValue,`path`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_continuity_ffi_fn_method_continuityengine_set_paused(`ptr`: Pointer,`paused`: Byte,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_continuity_ffi_fn_clone_eventlistener(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Pointer
@@ -961,7 +969,11 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_continuity_ffi_checksum_method_continuityengine_confirm_pairing(
     ): Short
+    fun uniffi_continuity_ffi_checksum_method_continuityengine_reset(
+    ): Short
     fun uniffi_continuity_ffi_checksum_method_continuityengine_send_file(
+    ): Short
+    fun uniffi_continuity_ffi_checksum_method_continuityengine_set_paused(
     ): Short
     fun uniffi_continuity_ffi_checksum_method_eventlistener_on_event(
     ): Short
@@ -1002,7 +1014,13 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_continuity_ffi_checksum_method_continuityengine_confirm_pairing() != 25048.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_continuity_ffi_checksum_method_continuityengine_reset() != 40739.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_continuity_ffi_checksum_method_continuityengine_send_file() != 32648.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_continuity_ffi_checksum_method_continuityengine_set_paused() != 20054.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_continuity_ffi_checksum_method_eventlistener_on_event() != 22386.toShort()) {
@@ -1732,7 +1750,21 @@ public interface ContinuityEngineInterface {
     
     fun `confirmPairing`(`peerId`: kotlin.String, `accept`: kotlin.Boolean)
     
+    /**
+     * Clears every paired device and disconnects all active peers — the
+     * host app should confirm with the user before calling this, there's
+     * no undo.
+     */
+    fun `reset`()
+    
     fun `sendFile`(`peerId`: kotlin.String, `path`: kotlin.String)
+    
+    /**
+     * Temporarily stop syncing (new connections, dialing, clipboard) in
+     * either direction, without stopping the engine or foreground
+     * service. Call again with `false` to resume.
+     */
+    fun `setPaused`(`paused`: kotlin.Boolean)
     
     companion object
 }
@@ -1835,12 +1867,44 @@ open class ContinuityEngine: Disposable, AutoCloseable, ContinuityEngineInterfac
     
     
 
+    
+    /**
+     * Clears every paired device and disconnects all active peers — the
+     * host app should confirm with the user before calling this, there's
+     * no undo.
+     */override fun `reset`()
+        = 
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_continuity_ffi_fn_method_continuityengine_reset(
+        it, _status)
+}
+    }
+    
+    
+
     override fun `sendFile`(`peerId`: kotlin.String, `path`: kotlin.String)
         = 
     callWithPointer {
     uniffiRustCall() { _status ->
     UniffiLib.INSTANCE.uniffi_continuity_ffi_fn_method_continuityengine_send_file(
         it, FfiConverterString.lower(`peerId`),FfiConverterString.lower(`path`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Temporarily stop syncing (new connections, dialing, clipboard) in
+     * either direction, without stopping the engine or foreground
+     * service. Call again with `false` to resume.
+     */override fun `setPaused`(`paused`: kotlin.Boolean)
+        = 
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_continuity_ffi_fn_method_continuityengine_set_paused(
+        it, FfiConverterBoolean.lower(`paused`),_status)
 }
     }
     
@@ -2362,6 +2426,14 @@ sealed class FfiSyncEvent {
         companion object
     }
     
+    object WasReset : FfiSyncEvent()
+    
+    
+    data class PausedStateChanged(
+        val `paused`: kotlin.Boolean) : FfiSyncEvent() {
+        companion object
+    }
+    
 
     
     companion object
@@ -2421,6 +2493,10 @@ public object FfiConverterTypeFfiSyncEvent : FfiConverterRustBuffer<FfiSyncEvent
                 )
             13 -> FfiSyncEvent.Error(
                 FfiConverterString.read(buf),
+                )
+            14 -> FfiSyncEvent.WasReset
+            15 -> FfiSyncEvent.PausedStateChanged(
+                FfiConverterBoolean.read(buf),
                 )
             else -> throw RuntimeException("invalid enum value, something is very wrong!!")
         }
@@ -2528,6 +2604,19 @@ public object FfiConverterTypeFfiSyncEvent : FfiConverterRustBuffer<FfiSyncEvent
                 + FfiConverterString.allocationSize(value.`message`)
             )
         }
+        is FfiSyncEvent.WasReset -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
+        is FfiSyncEvent.PausedStateChanged -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterBoolean.allocationSize(value.`paused`)
+            )
+        }
     }
 
     override fun write(value: FfiSyncEvent, buf: ByteBuffer) {
@@ -2605,6 +2694,15 @@ public object FfiConverterTypeFfiSyncEvent : FfiConverterRustBuffer<FfiSyncEvent
             is FfiSyncEvent.Error -> {
                 buf.putInt(13)
                 FfiConverterString.write(value.`message`, buf)
+                Unit
+            }
+            is FfiSyncEvent.WasReset -> {
+                buf.putInt(14)
+                Unit
+            }
+            is FfiSyncEvent.PausedStateChanged -> {
+                buf.putInt(15)
+                FfiConverterBoolean.write(value.`paused`, buf)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }

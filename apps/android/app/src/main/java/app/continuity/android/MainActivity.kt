@@ -1,6 +1,7 @@
 package app.continuity.android
 
 import android.Manifest
+import android.app.Activity
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
@@ -34,6 +35,9 @@ import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Inbox
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.LinkOff
+import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.PauseCircle
+import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material.icons.filled.Sensors
 import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material.icons.filled.VerifiedUser
@@ -41,6 +45,8 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
@@ -133,6 +139,8 @@ private fun ContinuityScreen(
     var deviceId by remember { mutableStateOf<String?>(null) }
     var connectedPeer by remember { mutableStateOf<uniffi.continuity_ffi.FfiDeviceInfo?>(null) }
     var pendingPairing by remember { mutableStateOf<Pair<uniffi.continuity_ffi.FfiDeviceInfo, String>?>(null) }
+    var isPaused by remember { mutableStateOf(false) }
+    var showResetConfirm by remember { mutableStateOf(false) }
     val activity = remember { mutableStateListOf<ActivityEntry>() }
 
     val successColor = if (isSystemDark()) SuccessGreenDark else SuccessGreen
@@ -169,6 +177,12 @@ private fun ContinuityScreen(
                 is FfiSyncEvent.FileSent -> activity.add(0, ActivityEntry(Icons.Default.FileUpload, "Sent '${event.fileName}' to '${event.toName}'", successColor))
                 is FfiSyncEvent.FileTransferFailed -> activity.add(0, ActivityEntry(Icons.Default.Error, "Transfer failed: ${event.reason}", warningColor))
                 is FfiSyncEvent.Error -> activity.add(0, ActivityEntry(Icons.Default.Error, event.message, warningColor))
+                is FfiSyncEvent.WasReset -> {
+                    connectedPeer = null
+                    pendingPairing = null
+                    activity.add(0, ActivityEntry(Icons.Default.RestartAlt, "All paired devices have been forgotten", warningColor))
+                }
+                is FfiSyncEvent.PausedStateChanged -> isPaused = event.paused
                 else -> {}
             }
         }
@@ -178,6 +192,39 @@ private fun ContinuityScreen(
         topBar = {
             TopAppBar(
                 title = { Text("Continue", fontWeight = FontWeight.SemiBold) },
+                actions = {
+                    var menuExpanded by remember { mutableStateOf(false) }
+                    IconButton(onClick = { menuExpanded = true }) {
+                        Icon(Icons.Default.MoreVert, contentDescription = "More options")
+                    }
+                    DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }) {
+                        DropdownMenuItem(
+                            text = { Text(if (isPaused) "Resume Syncing" else "Pause Syncing") },
+                            leadingIcon = { Icon(Icons.Default.PauseCircle, contentDescription = null) },
+                            onClick = {
+                                menuExpanded = false
+                                EngineHolder.engine?.setPaused(!isPaused)
+                            },
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Reset...") },
+                            leadingIcon = { Icon(Icons.Default.RestartAlt, contentDescription = null) },
+                            onClick = {
+                                menuExpanded = false
+                                showResetConfirm = true
+                            },
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Quit") },
+                            leadingIcon = { Icon(Icons.Default.LinkOff, contentDescription = null) },
+                            onClick = {
+                                menuExpanded = false
+                                context.stopService(Intent(context, ContinuityForegroundService::class.java))
+                                (context as? Activity)?.finishAndRemoveTask()
+                            },
+                        )
+                    }
+                },
                 colors = androidx.compose.material3.TopAppBarDefaults.topAppBarColors(
                     containerColor = MaterialTheme.colorScheme.surface,
                 ),
@@ -270,6 +317,29 @@ private fun ContinuityScreen(
                     EngineHolder.engine?.confirmPairing(peer.id, false)
                     pendingPairing = null
                 }) { Text("No") }
+            },
+        )
+    }
+
+    if (showResetConfirm) {
+        AlertDialog(
+            onDismissRequest = { showResetConfirm = false },
+            icon = { Icon(Icons.Default.RestartAlt, contentDescription = null) },
+            title = { Text("Reset Continuity?") },
+            text = {
+                Text(
+                    "This disconnects every paired device and forgets them all. " +
+                        "Each one will need to be paired again from scratch.\n\nAre you sure?",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    EngineHolder.engine?.reset()
+                    showResetConfirm = false
+                }) { Text("Reset") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showResetConfirm = false }) { Text("Cancel") }
             },
         )
     }

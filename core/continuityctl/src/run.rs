@@ -90,6 +90,10 @@ fn handle_event(event: SyncEvent, cli_state: &CliState) {
         SyncEvent::FileSent { file_name, to_name, .. } => println!("sent '{file_name}' to '{to_name}'"),
         SyncEvent::FileTransferFailed { reason, .. } => println!("file transfer failed: {reason}"),
         SyncEvent::Error(e) => tracing::warn!("{e}"),
+        SyncEvent::WasReset => println!("reset: all paired devices forgotten"),
+        SyncEvent::PausedStateChanged { paused } => {
+            println!("{}", if paused { "syncing paused" } else { "syncing resumed" });
+        }
     }
 }
 

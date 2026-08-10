@@ -11,6 +11,7 @@ use continuity_net::{
 use continuity_proto::{DeviceInfo, Message, Platform, PROTOCOL_VERSION};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -69,6 +70,12 @@ struct SharedState {
     /// dedup point (see `continuity-net`'s pairing docs for why this can't
     /// just be the pre-handshake mDNS-advertised id).
     connected: Mutex<HashSet<String>>,
+    /// Abort handles for each active connection's task, keyed by peer
+    /// crypto id — the only way to forcibly drop a connection from outside
+    /// its own task, since it's normally just blocked reading. Populated
+    /// at spawn time (both inbound accept and outbound dial), removed in
+    /// `handle_connection`'s cleanup. `Reset` aborts everything in here.
+    connection_handles: Mutex<HashMap<String, tokio::task::AbortHandle>>,
     peer_senders: Mutex<HashMap<String, mpsc::UnboundedSender<Message>>>,
     last_programmatic_hash: Mutex<Option<String>>,
     pending_pairings: Mutex<HashMap<String, oneshot::Sender<bool>>>,
@@ -76,6 +83,10 @@ struct SharedState {
     clipboard: Arc<dyn ClipboardBackend>,
     events_tx: mpsc::UnboundedSender<SyncEvent>,
     received_files_dir: PathBuf,
+    /// See `EngineCommand::SetPaused`. Checked by the accept loop, the
+    /// dial loop, the clipboard watcher, and inbound clipboard-update
+    /// handling — everywhere new syncing activity could start.
+    paused: AtomicBool,
 }
 
 impl SharedState {
@@ -106,6 +117,7 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
         tls_identity,
         trust_store: Mutex::new(config.trust_store),
         connected: Mutex::new(HashSet::new()),
+        connection_handles: Mutex::new(HashMap::new()),
         peer_senders: Mutex::new(HashMap::new()),
         last_programmatic_hash: Mutex::new(None),
         pending_pairings: Mutex::new(HashMap::new()),
@@ -113,6 +125,7 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
         clipboard: config.clipboard,
         events_tx,
         received_files_dir: config.received_files_dir,
+        paused: AtomicBool::new(false),
     });
 
     state.emit(SyncEvent::Listening { port });
@@ -129,12 +142,29 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
             loop {
                 match listener.accept().await {
                     Ok((conn, addr)) => {
-                        let state = state.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = handle_connection(conn, state).await {
+                        if state.paused.load(Ordering::Relaxed) {
+                            tracing::debug!("dropping inbound connection from {addr}: paused");
+                            continue;
+                        }
+                        let peer_crypto_id = match conn.peer_device_id() {
+                            Ok(id) => id,
+                            Err(e) => {
+                                tracing::debug!("couldn't read peer id for inbound conn from {addr}: {e}");
+                                continue;
+                            }
+                        };
+                        let conn_state = state.clone();
+                        let id_for_registry = peer_crypto_id.clone();
+                        let join = tokio::spawn(async move {
+                            if let Err(e) = handle_connection(conn, conn_state, peer_crypto_id).await {
                                 tracing::debug!("inbound connection from {addr} ended: {e}");
                             }
                         });
+                        state
+                            .connection_handles
+                            .lock()
+                            .unwrap()
+                            .insert(id_for_registry, join.abort_handle());
                     }
                     Err(e) => tracing::warn!("accept error: {e}"),
                 }
@@ -162,21 +192,32 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                 if peer.device.id >= state.my_device.id {
                     continue;
                 }
+                if state.paused.load(Ordering::Relaxed) {
+                    continue;
+                }
                 if state.connected.lock().unwrap().contains(&peer.device.id) {
                     continue;
                 }
 
-                let state = state.clone();
-                tokio::spawn(async move {
-                    match connect(peer.addr, &state.tls_identity).await {
+                let conn_state = state.clone();
+                let peer_id = peer.device.id.clone();
+                let id_for_registry = peer_id.clone();
+                let peer_addr = peer.addr;
+                let join = tokio::spawn(async move {
+                    match connect(peer_addr, &conn_state.tls_identity).await {
                         Ok(conn) => {
-                            if let Err(e) = handle_connection(conn, state).await {
-                                tracing::debug!("outbound connection to {} ended: {e}", peer.addr);
+                            if let Err(e) = handle_connection(conn, conn_state, peer_id).await {
+                                tracing::debug!("outbound connection to {peer_addr} ended: {e}");
                             }
                         }
-                        Err(e) => tracing::debug!("failed to dial {}: {e}", peer.addr),
+                        Err(e) => tracing::debug!("failed to dial {peer_addr}: {e}"),
                     }
                 });
+                state
+                    .connection_handles
+                    .lock()
+                    .unwrap()
+                    .insert(id_for_registry, join.abort_handle());
             }
         })
     });
@@ -197,6 +238,28 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                             send_file(&state, &peer_crypto_id, PathBuf::from(path)).await;
                         });
                     }
+                    EngineCommand::Reset => {
+                        let handles: Vec<_> = state
+                            .connection_handles
+                            .lock()
+                            .unwrap()
+                            .drain()
+                            .map(|(_, h)| h)
+                            .collect();
+                        for handle in handles {
+                            handle.abort();
+                        }
+                        state.connected.lock().unwrap().clear();
+                        state.peer_senders.lock().unwrap().clear();
+                        if let Err(e) = state.trust_store.lock().unwrap().clear() {
+                            tracing::warn!("failed to clear trust store during reset: {e}");
+                        }
+                        state.emit(SyncEvent::WasReset);
+                    }
+                    EngineCommand::SetPaused(paused) => {
+                        state.paused.store(paused, Ordering::Relaxed);
+                        state.emit(SyncEvent::PausedStateChanged { paused });
+                    }
                 }
             }
         })
@@ -212,9 +275,11 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
     })
 }
 
-async fn handle_connection(conn: Connection, state: Arc<SharedState>) -> anyhow::Result<()> {
-    let peer_crypto_id = conn.peer_device_id()?;
-
+async fn handle_connection(
+    conn: Connection,
+    state: Arc<SharedState>,
+    peer_crypto_id: String,
+) -> anyhow::Result<()> {
     {
         let mut connected = state.connected.lock().unwrap();
         if connected.contains(&peer_crypto_id) {
@@ -227,6 +292,11 @@ async fn handle_connection(conn: Connection, state: Arc<SharedState>) -> anyhow:
 
     state.connected.lock().unwrap().remove(&peer_crypto_id);
     state.peer_senders.lock().unwrap().remove(&peer_crypto_id);
+    // Not removed on the `Reset` path — that drains the whole map itself
+    // and aborts every handle, so there's nothing left here to remove by
+    // the time this cleanup runs (aborting a task doesn't let it finish
+    // this line).
+    state.connection_handles.lock().unwrap().remove(&peer_crypto_id);
     result
 }
 
@@ -311,6 +381,10 @@ async fn handle_connection_inner(
                 mime,
                 data,
             }) => {
+                if state.paused.load(Ordering::Relaxed) {
+                    tracing::debug!("ignoring clipboard update from {origin_device}: paused");
+                    continue;
+                }
                 if mime != "text/plain" {
                     tracing::debug!("ignoring non-text clipboard update from {origin_device}");
                     continue;
@@ -613,6 +687,10 @@ fn spawn_clipboard_watcher(state: Arc<SharedState>) -> JoinHandle<()> {
         let mut last_seen: Option<String> = None;
         loop {
             std::thread::sleep(Duration::from_millis(500));
+
+            if state.paused.load(Ordering::Relaxed) {
+                continue;
+            }
 
             // `get_text` crosses the FFI boundary into Kotlin/Swift on
             // mobile (desktop's `arboard` backend doesn't need this, but
