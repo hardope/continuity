@@ -1435,6 +1435,8 @@ public enum FfiMediaCommand {
     case playPause
     case next
     case previous
+    case volumeUp
+    case volumeDown
 }
 
 
@@ -1454,6 +1456,10 @@ public struct FfiConverterTypeFfiMediaCommand: FfiConverterRustBuffer {
         
         case 3: return .previous
         
+        case 4: return .volumeUp
+        
+        case 5: return .volumeDown
+        
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
@@ -1472,6 +1478,14 @@ public struct FfiConverterTypeFfiMediaCommand: FfiConverterRustBuffer {
         
         case .previous:
             writeInt(&buf, Int32(3))
+        
+        
+        case .volumeUp:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .volumeDown:
+            writeInt(&buf, Int32(5))
         
         }
     }
@@ -1536,6 +1550,8 @@ public enum FfiSyncEvent {
     )
     case nowPlayingChanged(peerId: String, peerName: String, info: FfiNowPlayingInfo
     )
+    case peerDiscovered(device: FfiDeviceInfo
+    )
 }
 
 
@@ -1597,6 +1613,9 @@ public struct FfiConverterTypeFfiSyncEvent: FfiConverterRustBuffer {
         )
         
         case 17: return .nowPlayingChanged(peerId: try FfiConverterString.read(from: &buf), peerName: try FfiConverterString.read(from: &buf), info: try FfiConverterTypeFfiNowPlayingInfo.read(from: &buf)
+        )
+        
+        case 18: return .peerDiscovered(device: try FfiConverterTypeFfiDeviceInfo.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -1701,6 +1720,11 @@ public struct FfiConverterTypeFfiSyncEvent: FfiConverterRustBuffer {
             FfiConverterString.write(peerId, into: &buf)
             FfiConverterString.write(peerName, into: &buf)
             FfiConverterTypeFfiNowPlayingInfo.write(info, into: &buf)
+            
+        
+        case let .peerDiscovered(device):
+            writeInt(&buf, Int32(18))
+            FfiConverterTypeFfiDeviceInfo.write(device, into: &buf)
             
         }
     }

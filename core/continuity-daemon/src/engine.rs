@@ -212,6 +212,22 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                 // dialing — `ReconnectPeer` needs it, and the tie-break
                 // below means this side often won't be the one connecting.
                 state.known_addresses.lock().unwrap().insert(peer.device.id.clone(), peer.addr);
+
+                let is_trusted = state.trust_store.lock().unwrap().is_trusted(&peer.device.id);
+                if !is_trusted {
+                    // Don't auto-dial (and therefore don't auto-initiate
+                    // pairing with) a device just because it's on the same
+                    // network — that meant a pairing prompt for literally
+                    // every other Continuity install anyone ever joined a
+                    // LAN with. Surface it as "nearby, tap to connect"
+                    // instead; the actual dial happens via `ReconnectPeer`
+                    // once the user picks it. No tie-break needed here
+                    // either — unlike auto-reconnect, there's no duplicate-
+                    // connection race to avoid when nothing is connecting.
+                    state.emit(SyncEvent::PeerDiscovered { device: peer.device.clone() });
+                    continue;
+                }
+
                 // Tie-break so only one side dials: without this, both
                 // devices would see each other over mDNS at roughly the
                 // same time and race to open duplicate connections.

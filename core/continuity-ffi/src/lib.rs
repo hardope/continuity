@@ -81,6 +81,8 @@ pub enum FfiMediaCommand {
     PlayPause,
     Next,
     Previous,
+    VolumeUp,
+    VolumeDown,
 }
 
 impl From<FfiMediaCommand> for CoreMediaCommand {
@@ -89,6 +91,8 @@ impl From<FfiMediaCommand> for CoreMediaCommand {
             FfiMediaCommand::PlayPause => CoreMediaCommand::PlayPause,
             FfiMediaCommand::Next => CoreMediaCommand::Next,
             FfiMediaCommand::Previous => CoreMediaCommand::Previous,
+            FfiMediaCommand::VolumeUp => CoreMediaCommand::VolumeUp,
+            FfiMediaCommand::VolumeDown => CoreMediaCommand::VolumeDown,
         }
     }
 }
@@ -137,6 +141,7 @@ pub enum FfiSyncEvent {
     PausedStateChanged { paused: bool },
     ReconnectFailed { peer_id: String },
     NowPlayingChanged { peer_id: String, peer_name: String, info: FfiNowPlayingInfo },
+    PeerDiscovered { device: FfiDeviceInfo },
 }
 
 impl From<continuity_daemon::SyncEvent> for FfiSyncEvent {
@@ -170,6 +175,7 @@ impl From<continuity_daemon::SyncEvent> for FfiSyncEvent {
             E::NowPlayingChanged { peer_id, peer_name, info } => {
                 FfiSyncEvent::NowPlayingChanged { peer_id, peer_name, info: info.into() }
             }
+            E::PeerDiscovered { device } => FfiSyncEvent::PeerDiscovered { device: device.into() },
         }
     }
 }

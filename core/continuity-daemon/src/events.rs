@@ -40,6 +40,15 @@ pub enum SyncEvent {
     /// response to a command. `info` is the full current snapshot, not a
     /// diff.
     NowPlayingChanged { peer_id: String, peer_name: String, info: NowPlayingInfo },
+    /// An untrusted (never-paired) device was seen on the network. Purely
+    /// informational — the engine does *not* auto-dial or auto-pair with
+    /// it; a shell shows it in a "Nearby Devices" list and the user
+    /// explicitly triggers the connection with `EngineCommand::ReconnectPeer`
+    /// (works the same for "connect to a never-seen device" as it does for
+    /// "reconnect a previously-disconnected one" — both just need a cached
+    /// address to dial). May fire more than once for the same device as
+    /// mDNS re-announces it; a shell should upsert by id, not append.
+    PeerDiscovered { device: DeviceInfo },
 }
 
 /// Requests a shell makes of the engine. Sent over the channel returned by
@@ -62,8 +71,12 @@ pub enum EngineCommand {
     /// reconnected. The disconnect sticks (neither side will silently
     /// reconnect) until `ReconnectPeer` is sent for the same id.
     DisconnectPeer { peer_crypto_id: String },
-    /// Re-dials a peer previously dropped with `DisconnectPeer`, using
-    /// its last-known network address. A no-op (well, emits
+    /// Dials a peer using its last-known network address — either to
+    /// reconnect one previously dropped with `DisconnectPeer`, or to
+    /// connect to an untrusted device for the first time after the user
+    /// picks it from a `PeerDiscovered` "Nearby Devices" list (dialing an
+    /// untrusted peer runs the normal pairing handshake on both ends, same
+    /// as any other first connection). A no-op (well, emits
     /// `ReconnectFailed`) if the engine has never seen that peer's
     /// address — e.g. it hasn't been on the network since this engine
     /// started.

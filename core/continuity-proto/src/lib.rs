@@ -136,15 +136,20 @@ pub enum Message {
     NowPlayingUpdate { info: NowPlayingInfo },
 }
 
-/// A media transport command sent over `Message::MediaCommand`. Deliberately
-/// minimal for now (no volume) — see `continuity-daemon::MediaController`
-/// for where a receiving platform acts on these.
+/// A media transport command sent over `Message::MediaCommand`. See
+/// `continuity-daemon::MediaController` for where a receiving platform acts
+/// on these. Volume is step-based (matching a physical keyboard's volume
+/// keys) rather than an absolute level — simpler and more portable across
+/// platforms than reading back and setting a device's current level, at
+/// the cost of the sender not being able to show an exact synced value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MediaCommand {
     PlayPause,
     Next,
     Previous,
+    VolumeUp,
+    VolumeDown,
 }
 
 /// Snapshot of a device's now-playing state, sent over

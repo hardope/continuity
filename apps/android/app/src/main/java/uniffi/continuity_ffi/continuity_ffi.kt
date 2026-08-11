@@ -2513,7 +2513,9 @@ enum class FfiMediaCommand {
     
     PLAY_PAUSE,
     NEXT,
-    PREVIOUS;
+    PREVIOUS,
+    VOLUME_UP,
+    VOLUME_DOWN;
     companion object
 }
 
@@ -2636,6 +2638,11 @@ sealed class FfiSyncEvent {
         companion object
     }
     
+    data class PeerDiscovered(
+        val `device`: FfiDeviceInfo) : FfiSyncEvent() {
+        companion object
+    }
+    
 
     
     companion object
@@ -2707,6 +2714,9 @@ public object FfiConverterTypeFfiSyncEvent : FfiConverterRustBuffer<FfiSyncEvent
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 FfiConverterTypeFfiNowPlayingInfo.read(buf),
+                )
+            18 -> FfiSyncEvent.PeerDiscovered(
+                FfiConverterTypeFfiDeviceInfo.read(buf),
                 )
             else -> throw RuntimeException("invalid enum value, something is very wrong!!")
         }
@@ -2843,6 +2853,13 @@ public object FfiConverterTypeFfiSyncEvent : FfiConverterRustBuffer<FfiSyncEvent
                 + FfiConverterTypeFfiNowPlayingInfo.allocationSize(value.`info`)
             )
         }
+        is FfiSyncEvent.PeerDiscovered -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterTypeFfiDeviceInfo.allocationSize(value.`device`)
+            )
+        }
     }
 
     override fun write(value: FfiSyncEvent, buf: ByteBuffer) {
@@ -2941,6 +2958,11 @@ public object FfiConverterTypeFfiSyncEvent : FfiConverterRustBuffer<FfiSyncEvent
                 FfiConverterString.write(value.`peerId`, buf)
                 FfiConverterString.write(value.`peerName`, buf)
                 FfiConverterTypeFfiNowPlayingInfo.write(value.`info`, buf)
+                Unit
+            }
+            is FfiSyncEvent.PeerDiscovered -> {
+                buf.putInt(18)
+                FfiConverterTypeFfiDeviceInfo.write(value.`device`, buf)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }

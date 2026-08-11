@@ -60,3 +60,19 @@ objc2-foundation = "0.3"
 block2 = "0.6"
 dispatch2 = "0.3"
 libc = "0.2"
+
+# Global media-key injection (SendInput) and now-playing metadata reads
+# (the WinRT GlobalSystemMediaTransportControlsSessionManager API) — see
+# src/media_windows.rs.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = [
+    "Media_Control",
+    "Storage_Streams",
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_UI_Input_KeyboardAndMouse",
+] }
+
+# MPRIS media control/reads over D-Bus — see src/media_linux.rs.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = "4"

@@ -16,6 +16,10 @@
 
 #[cfg(target_os = "macos")]
 mod media_mac;
+#[cfg(target_os = "windows")]
+mod media_windows;
+#[cfg(target_os = "linux")]
+mod media_linux;
 
 use continuity_crypto::{Identity, TrustStore};
 use continuity_daemon::{ArboardClipboard, EngineCommand, EngineConfig, SyncEvent};
@@ -54,6 +58,7 @@ fn main() -> anyhow::Result<()> {
     let device_name = continuity_daemon::default_device_name();
 
     let title_item = MenuItem::new(format!("Continuity — {device_name}"), false, None);
+    let nearby_submenu = Submenu::new("Nearby Devices", true);
     let send_submenu = Submenu::new("Send File", true);
     let pause_item = MenuItem::new("Pause Syncing", true, None);
     let reset_item = MenuItem::new("Reset...", true, None);
@@ -66,9 +71,21 @@ fn main() -> anyhow::Result<()> {
     let send_target_map: Arc<Mutex<HashMap<MenuId, SendTarget>>> = Arc::new(Mutex::new(HashMap::new()));
     rebuild_send_menu(&send_submenu, &connected_peers.lock().unwrap(), &send_target_map);
 
+    // Untrusted devices seen on the network (see SyncEvent::PeerDiscovered)
+    // — the engine deliberately doesn't auto-dial these anymore (that used
+    // to mean a pairing prompt for every Continuity install anyone ever
+    // shared a LAN with), so this is the only way to initiate pairing with
+    // a new device from desktop at all now. Clicking one sends
+    // EngineCommand::ReconnectPeer, which dials it and runs the normal
+    // pairing handshake.
+    let nearby_peers: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+    let nearby_target_map: Arc<Mutex<HashMap<MenuId, String>>> = Arc::new(Mutex::new(HashMap::new()));
+    rebuild_nearby_menu(&nearby_submenu, &nearby_peers.lock().unwrap(), &nearby_target_map);
+
     let menu = Menu::new();
     menu.append(&title_item)?;
     menu.append(&PredefinedMenuItem::separator())?;
+    menu.append(&nearby_submenu)?;
     menu.append(&send_submenu)?;
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&pause_item)?;
@@ -95,9 +112,12 @@ fn main() -> anyhow::Result<()> {
             handle_sync_event(
                 sync_event,
                 &send_submenu,
+                &nearby_submenu,
                 &pause_item,
                 &connected_peers,
                 &send_target_map,
+                &nearby_peers,
+                &nearby_target_map,
                 &is_paused,
                 &commands,
             );
@@ -138,6 +158,8 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
+            } else if let Some(peer_id) = nearby_target_map.lock().unwrap().get(&event.id).cloned() {
+                let _ = commands.send(EngineCommand::ReconnectPeer { peer_crypto_id: peer_id });
             }
         }
 
@@ -151,9 +173,12 @@ fn main() -> anyhow::Result<()> {
 fn handle_sync_event(
     event: SyncEvent,
     send_submenu: &Submenu,
+    nearby_submenu: &Submenu,
     pause_item: &MenuItem,
     connected_peers: &Arc<Mutex<HashMap<String, String>>>,
     send_target_map: &Arc<Mutex<HashMap<MenuId, SendTarget>>>,
+    nearby_peers: &Arc<Mutex<HashMap<String, String>>>,
+    nearby_target_map: &Arc<Mutex<HashMap<MenuId, String>>>,
     is_paused: &Arc<Mutex<bool>>,
     commands: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
 ) {
@@ -182,8 +207,15 @@ fn handle_sync_event(
             notify(&format!("Pairing with '{peer_name}' was declined"));
         }
         SyncEvent::Connected { peer } => {
+            // No longer "nearby, not yet connected" once it's connected.
+            nearby_peers.lock().unwrap().remove(&peer.id);
+            rebuild_nearby_menu(nearby_submenu, &nearby_peers.lock().unwrap(), nearby_target_map);
             connected_peers.lock().unwrap().insert(peer.id, peer.name);
             rebuild_send_menu(send_submenu, &connected_peers.lock().unwrap(), send_target_map);
+        }
+        SyncEvent::PeerDiscovered { device } => {
+            nearby_peers.lock().unwrap().insert(device.id, device.name);
+            rebuild_nearby_menu(nearby_submenu, &nearby_peers.lock().unwrap(), nearby_target_map);
         }
         SyncEvent::Disconnected { peer_id, peer_name } => {
             connected_peers.lock().unwrap().remove(&peer_id);
@@ -257,6 +289,33 @@ fn rebuild_send_menu(
         let broadcast = MenuItem::new(format!("Broadcast to All ({} devices)...", peers.len()), true, None);
         map.insert(broadcast.id().clone(), SendTarget::All);
         let _ = submenu.append(&broadcast);
+    }
+}
+
+/// Same rebuild-from-scratch approach as `rebuild_send_menu` — simpler
+/// content (just "Connect to X", no broadcast option) since this is about
+/// initiating a first connection, not fanning an action out to several
+/// already-connected ones.
+fn rebuild_nearby_menu(
+    submenu: &Submenu,
+    nearby: &HashMap<String, String>,
+    target_map: &Arc<Mutex<HashMap<MenuId, String>>>,
+) {
+    while submenu.remove_at(0).is_some() {}
+    let mut map = target_map.lock().unwrap();
+    map.clear();
+
+    if nearby.is_empty() {
+        let _ = submenu.append(&MenuItem::new("No new devices nearby", false, None));
+        return;
+    }
+
+    let mut peers: Vec<(&String, &String)> = nearby.iter().collect();
+    peers.sort_by(|a, b| a.1.cmp(b.1));
+    for (id, name) in &peers {
+        let item = MenuItem::new(format!("Connect to {name}..."), true, None);
+        map.insert(item.id().clone(), (*id).clone());
+        let _ = submenu.append(&item);
     }
 }
 
@@ -370,7 +429,11 @@ fn start_engine_thread(
                 let trust_store = TrustStore::load_default(&profile)?;
                 #[cfg(target_os = "macos")]
                 let media: Arc<dyn continuity_daemon::MediaController> = Arc::new(media_mac::MacMediaController);
-                #[cfg(not(target_os = "macos"))]
+                #[cfg(target_os = "windows")]
+                let media: Arc<dyn continuity_daemon::MediaController> = Arc::new(media_windows::WindowsMediaController);
+                #[cfg(target_os = "linux")]
+                let media: Arc<dyn continuity_daemon::MediaController> = Arc::new(media_linux::LinuxMediaController);
+                #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
                 let media: Arc<dyn continuity_daemon::MediaController> = Arc::new(continuity_daemon::NoopMediaController);
 
                 let config = EngineConfig {

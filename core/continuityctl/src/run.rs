@@ -107,6 +107,9 @@ fn handle_event(event: SyncEvent, cli_state: &CliState) {
                 println!("'{peer_name}' now playing: (nothing)");
             }
         }
+        SyncEvent::PeerDiscovered { device } => {
+            println!("nearby (not paired): '{}' ({})", device.name, device.id);
+        }
     }
 }
 

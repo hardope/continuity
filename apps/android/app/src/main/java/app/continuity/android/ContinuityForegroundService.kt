@@ -164,6 +164,7 @@ class ContinuityForegroundService : Service() {
             is FfiSyncEvent.ClipboardBroadcast,
             is FfiSyncEvent.ReconnectFailed,
             is FfiSyncEvent.NowPlayingChanged,
+            is FfiSyncEvent.PeerDiscovered,
             -> return
         }
 

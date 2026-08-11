@@ -29,12 +29,20 @@ pub struct MacMediaController;
 
 impl MediaController for MacMediaController {
     fn handle(&self, command: MediaCommand) {
-        let key = match command {
-            MediaCommand::PlayPause => NX_KEYTYPE_PLAY,
-            MediaCommand::Next => NX_KEYTYPE_NEXT,
-            MediaCommand::Previous => NX_KEYTYPE_PREVIOUS,
-        };
-        post_media_key(key);
+        match command {
+            MediaCommand::PlayPause => post_media_key(NX_KEYTYPE_PLAY),
+            MediaCommand::Next => post_media_key(NX_KEYTYPE_NEXT),
+            MediaCommand::Previous => post_media_key(NX_KEYTYPE_PREVIOUS),
+            // *Not* the same synthetic-media-key trick as transport
+            // control — tested first, and macOS silently ignores
+            // synthetic NX_KEYTYPE_SOUND_UP/DOWN events (0 effect on real
+            // output volume across five consecutive presses in testing),
+            // unlike the transport keys. System volume is public,
+            // documented CoreAudio territory instead — see
+            // system_volume::step below.
+            MediaCommand::VolumeUp => system_volume::step(0.0625),
+            MediaCommand::VolumeDown => system_volume::step(-0.0625),
+        }
     }
 
     fn now_playing(&self) -> Option<NowPlayingInfo> {
@@ -180,6 +188,158 @@ mod now_playing {
     }
 }
 
+/// System output volume via CoreAudio — public, documented API (unlike
+/// everything else in this file), linked directly rather than dlopen'd.
+/// There's no "now playing" volume distinct from the system's overall
+/// output volume; this is the same level the physical volume keys and the
+/// menu-bar volume slider control.
+mod system_volume {
+    use std::ffi::c_void;
+
+    type AudioObjectId = u32;
+    type OsStatus = i32;
+
+    #[repr(C)]
+    struct AudioObjectPropertyAddress {
+        selector: u32,
+        scope: u32,
+        element: u32,
+    }
+
+    const fn fourcc(s: &[u8; 4]) -> u32 {
+        ((s[0] as u32) << 24) | ((s[1] as u32) << 16) | ((s[2] as u32) << 8) | (s[3] as u32)
+    }
+
+    const K_AUDIO_OBJECT_SYSTEM_OBJECT: AudioObjectId = 1;
+    const K_AUDIO_HARDWARE_PROPERTY_DEFAULT_OUTPUT_DEVICE: u32 = fourcc(b"dOut");
+    const K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL: u32 = fourcc(b"glob");
+    const K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT: u32 = fourcc(b"outp");
+    const K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN: u32 = 0;
+    const K_AUDIO_DEVICE_PROPERTY_VOLUME_SCALAR: u32 = fourcc(b"volm");
+
+    #[link(name = "CoreAudio", kind = "framework")]
+    unsafe extern "C-unwind" {
+        fn AudioObjectHasProperty(object_id: AudioObjectId, address: *const AudioObjectPropertyAddress) -> u8;
+        fn AudioObjectGetPropertyData(
+            object_id: AudioObjectId,
+            address: *const AudioObjectPropertyAddress,
+            qualifier_data_size: u32,
+            qualifier_data: *const c_void,
+            io_data_size: *mut u32,
+            out_data: *mut c_void,
+        ) -> OsStatus;
+        fn AudioObjectSetPropertyData(
+            object_id: AudioObjectId,
+            address: *const AudioObjectPropertyAddress,
+            qualifier_data_size: u32,
+            qualifier_data: *const c_void,
+            in_data_size: u32,
+            in_data: *const c_void,
+        ) -> OsStatus;
+    }
+
+    fn default_output_device() -> Option<AudioObjectId> {
+        let address = AudioObjectPropertyAddress {
+            selector: K_AUDIO_HARDWARE_PROPERTY_DEFAULT_OUTPUT_DEVICE,
+            scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
+            element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+        };
+        let mut device_id: AudioObjectId = 0;
+        let mut size = std::mem::size_of::<AudioObjectId>() as u32;
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                K_AUDIO_OBJECT_SYSTEM_OBJECT,
+                &address,
+                0,
+                std::ptr::null(),
+                &mut size,
+                (&mut device_id) as *mut AudioObjectId as *mut c_void,
+            )
+        };
+        (status == 0 && device_id != 0).then_some(device_id)
+    }
+
+    fn volume_address(element: u32) -> AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress {
+            selector: K_AUDIO_DEVICE_PROPERTY_VOLUME_SCALAR,
+            scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT,
+            element,
+        }
+    }
+
+    fn has_property(device_id: u32, address: &AudioObjectPropertyAddress) -> bool {
+        unsafe { AudioObjectHasProperty(device_id, address) != 0 }
+    }
+
+    fn get_element(device_id: u32, element: u32) -> Option<f32> {
+        let address = volume_address(element);
+        if !has_property(device_id, &address) {
+            return None;
+        }
+        let mut volume: f32 = 0.0;
+        let mut size = std::mem::size_of::<f32>() as u32;
+        let status = unsafe {
+            AudioObjectGetPropertyData(device_id, &address, 0, std::ptr::null(), &mut size, (&mut volume) as *mut f32 as *mut c_void)
+        };
+        (status == 0).then_some(volume)
+    }
+
+    fn set_element(device_id: u32, element: u32, volume: f32) -> bool {
+        let address = volume_address(element);
+        if !has_property(device_id, &address) {
+            return false;
+        }
+        let volume = volume.clamp(0.0, 1.0);
+        let status = unsafe {
+            AudioObjectSetPropertyData(
+                device_id,
+                &address,
+                0,
+                std::ptr::null(),
+                std::mem::size_of::<f32>() as u32,
+                (&volume) as *const f32 as *const c_void,
+            )
+        };
+        status == 0
+    }
+
+    /// Element 0 ("main") covers some output devices, but plenty of real
+    /// hardware — this dev machine's built-in speakers included — only
+    /// expose separate per-channel volume instead (element 1 = left,
+    /// element 2 = right, the near-universal convention for stereo
+    /// devices). Reads whichever is actually available, and when setting,
+    /// writes to every element that responds (main if present, otherwise
+    /// both channels) so mono *and* stereo devices end up adjusted either
+    /// way.
+    fn get(device_id: u32) -> Option<f32> {
+        get_element(device_id, K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN).or_else(|| get_element(device_id, 1))
+    }
+
+    fn set(device_id: u32, volume: f32) -> bool {
+        let mut set_any = false;
+        for element in [K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN, 1, 2] {
+            if set_element(device_id, element, volume) {
+                set_any = true;
+            }
+        }
+        set_any
+    }
+
+    pub fn step(delta: f32) {
+        let Some(device_id) = default_output_device() else {
+            tracing::debug!("couldn't get default output device for volume change");
+            return;
+        };
+        let Some(current) = get(device_id) else {
+            tracing::debug!("couldn't read current output volume");
+            return;
+        };
+        if !set(device_id, current + delta) {
+            tracing::debug!("couldn't set output volume");
+        }
+    }
+}
+
 #[cfg(test)]
 mod manual_verification {
     // Not a real test — run with
@@ -205,6 +365,18 @@ mod manual_verification {
     #[ignore]
     fn send_previous() {
         MacMediaController.handle(MediaCommand::Previous);
+    }
+
+    #[test]
+    #[ignore]
+    fn send_volume_up() {
+        MacMediaController.handle(MediaCommand::VolumeUp);
+    }
+
+    #[test]
+    #[ignore]
+    fn send_volume_down() {
+        MacMediaController.handle(MediaCommand::VolumeDown);
     }
 
     #[test]
