@@ -211,7 +211,22 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                 // Cache the address regardless of whether this side ends up
                 // dialing — `ReconnectPeer` needs it, and the tie-break
                 // below means this side often won't be the one connecting.
-                state.known_addresses.lock().unwrap().insert(peer.device.id.clone(), peer.addr);
+                // mdns-sd delivers `ServiceResolved` incrementally (each
+                // event can carry a different subset of the peer's
+                // addresses as they resolve), so a later event can easily
+                // have only link-local IPv6 addresses where an earlier one
+                // had the real LAN IPv4 — don't let that downgrade an
+                // already-good cached address, or a `ReconnectPeer` sent
+                // right after such an event dials an unroutable address
+                // and fails silently ("no route to host"), which reads to
+                // the user as clicking Connect just doing nothing.
+                {
+                    let mut known = state.known_addresses.lock().unwrap();
+                    let already_have_ipv4 = known.get(&peer.device.id).is_some_and(|a| a.is_ipv4());
+                    if !already_have_ipv4 || peer.addr.is_ipv4() {
+                        known.insert(peer.device.id.clone(), peer.addr);
+                    }
+                }
 
                 let is_trusted = state.trust_store.lock().unwrap().is_trusted(&peer.device.id);
                 if !is_trusted {

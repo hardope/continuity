@@ -16,7 +16,10 @@ pub async fn run(profile: &str, name: Option<String>) -> anyhow::Result<()> {
     println!("device id:   {}", identity.device_id());
     println!("device name: {}", device_name);
     println!("received files will be saved to: {}", received_files_dir(profile).display());
-    println!("commands: y/n confirms a pending pairing request; 'send <path>' sends a file to the most recently connected peer");
+    println!(
+        "commands: y/n confirms a pending pairing request; 'connect <id>' dials a nearby (not yet paired) device; \
+         'send <path>' sends a file to the most recently connected peer"
+    );
 
     let config = EngineConfig {
         identity,
@@ -128,6 +131,13 @@ fn spawn_stdin_reader(
             }
             let line = line.trim();
             if line.is_empty() {
+                continue;
+            }
+
+            if let Some(peer_crypto_id) = line.strip_prefix("connect ") {
+                let _ = commands.send(EngineCommand::ReconnectPeer {
+                    peer_crypto_id: peer_crypto_id.trim().to_string(),
+                });
                 continue;
             }
 

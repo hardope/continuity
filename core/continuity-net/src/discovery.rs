@@ -104,7 +104,18 @@ pub fn peer_from_service_info(info: &ServiceInfo) -> Option<DiscoveredPeer> {
     let name = props.get_property_val_str("name")?.to_string();
     let platform = platform_from_str(props.get_property_val_str("platform")?)?;
     let protocol_version = props.get_property_val_str("protocol_version")?.parse().ok()?;
-    let addr = *info.get_addresses().iter().next()?;
+    // `get_addresses()` is an unordered `HashSet` mixing the real LAN IPv4
+    // address with link-local IPv6 ones (`fe80::...`) that carry no
+    // interface/zone index the way they're resolved here — dialing one of
+    // those fails outright ("no route to host"), and plain `.next()` could
+    // land on either. Prefer IPv4 (always safely dialable on the LAN);
+    // fall back to whatever's there for IPv6-only networks.
+    let addr = info
+        .get_addresses()
+        .iter()
+        .find(|a| a.is_ipv4())
+        .or_else(|| info.get_addresses().iter().next())
+        .copied()?;
     let port = info.get_port();
 
     Some(DiscoveredPeer {
