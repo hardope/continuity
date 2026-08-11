@@ -74,8 +74,8 @@ fn first_player_bus_name(conn: &Connection) -> zbus::Result<Option<String>> {
     Ok(names.into_iter().map(|n| n.to_string()).find(|n| n.starts_with("org.mpris.MediaPlayer2.")))
 }
 
-fn player_proxy<'a>(conn: &'a Connection, bus_name: &str) -> zbus::Result<PlayerProxyBlocking<'a>> {
-    PlayerProxyBlocking::builder(conn).destination(bus_name.to_string())?.build()
+fn player_proxy<'a>(conn: &'a Connection, bus_name: &str) -> zbus::Result<PlayerProxy<'a>> {
+    PlayerProxy::builder(conn).destination(bus_name.to_string())?.build()
 }
 
 fn send_command(command: MediaCommand) -> zbus::Result<()> {
@@ -104,21 +104,27 @@ fn read_now_playing() -> zbus::Result<Option<NowPlayingInfo>> {
     let player = player_proxy(&conn, &bus_name)?;
 
     let metadata = player.metadata().unwrap_or_default();
-    let title = metadata.get("xesam:title").and_then(|v| String::try_from(v.clone()).ok()).filter(|s| !s.is_empty());
+    let str_prop = |key: &str| -> Option<String> {
+        metadata.get(key).and_then(|v| <&str>::try_from(v).ok()).map(str::to_string).filter(|s| !s.is_empty())
+    };
+    let title = str_prop("xesam:title");
+    let album = str_prop("xesam:album");
+    // `OwnedValue` has no infallible `Clone` (only fallible `try_clone`), so
+    // this can't reuse `str_prop`'s borrowed-conversion path — going from
+    // an array element to an owned `Vec<String>` needs an owned `Value`.
     let artist = metadata
         .get("xesam:artist")
-        .and_then(|v| Vec::<String>::try_from(v.clone()).ok())
+        .and_then(|v| v.try_clone().ok())
+        .and_then(|v| Vec::<String>::try_from(v).ok())
         .and_then(|v| v.into_iter().next());
-    let album = metadata.get("xesam:album").and_then(|v| String::try_from(v.clone()).ok()).filter(|s| !s.is_empty());
 
     // Artwork is a URL in MPRIS, not raw bytes (unlike macOS/Windows) —
     // only `file://` is handled, since fetching an arbitrary http(s) URL
     // on every metadata poll isn't something to do without the user
     // knowing about it.
-    let artwork = metadata
-        .get("mpris:artUrl")
-        .and_then(|v| String::try_from(v.clone()).ok())
-        .and_then(|url| url.strip_prefix("file://").map(str::to_string))
+    let artwork = str_prop("mpris:artUrl")
+        .as_deref()
+        .and_then(|url| url.strip_prefix("file://"))
         .and_then(|path| std::fs::read(path).ok())
         .unwrap_or_default();
 
