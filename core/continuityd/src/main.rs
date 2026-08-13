@@ -59,10 +59,12 @@ fn main() -> anyhow::Result<()> {
 
     let title_item = MenuItem::new(format!("Continuity — {device_name}"), false, None);
     let nearby_submenu = Submenu::new("Nearby Devices", true);
+    let refresh_item = MenuItem::new("Refresh Nearby Devices", true, None);
     let send_submenu = Submenu::new("Send File", true);
     let pause_item = MenuItem::new("Pause Syncing", true, None);
     let reset_item = MenuItem::new("Reset...", true, None);
     let quit_item = MenuItem::new("Quit", true, None);
+    let refresh_item_id = refresh_item.id().clone();
     let pause_item_id = pause_item.id().clone();
     let reset_item_id = reset_item.id().clone();
     let quit_item_id = quit_item.id().clone();
@@ -86,6 +88,7 @@ fn main() -> anyhow::Result<()> {
     menu.append(&title_item)?;
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&nearby_submenu)?;
+    menu.append(&refresh_item)?;
     menu.append(&send_submenu)?;
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&pause_item)?;
@@ -127,6 +130,8 @@ fn main() -> anyhow::Result<()> {
             if event.id == pause_item_id {
                 let currently_paused = *is_paused.lock().unwrap();
                 let _ = commands.send(EngineCommand::SetPaused(!currently_paused));
+            } else if event.id == refresh_item_id {
+                let _ = commands.send(EngineCommand::RefreshDiscovery);
             } else if event.id == reset_item_id {
                 let result = rfd::MessageDialog::new()
                     .set_title("Continuity — Reset")

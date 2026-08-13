@@ -18,7 +18,7 @@ pub async fn run(profile: &str, name: Option<String>) -> anyhow::Result<()> {
     println!("received files will be saved to: {}", received_files_dir(profile).display());
     println!(
         "commands: y/n confirms a pending pairing request; 'connect <id>' dials a nearby (not yet paired) device; \
-         'send <path>' sends a file to the most recently connected peer"
+         'refresh' re-queries mDNS right now; 'send <path>' sends a file to the most recently connected peer"
     );
 
     let config = EngineConfig {
@@ -138,6 +138,11 @@ fn spawn_stdin_reader(
                 let _ = commands.send(EngineCommand::ReconnectPeer {
                     peer_crypto_id: peer_crypto_id.trim().to_string(),
                 });
+                continue;
+            }
+
+            if line == "refresh" {
+                let _ = commands.send(EngineCommand::RefreshDiscovery);
                 continue;
             }
 

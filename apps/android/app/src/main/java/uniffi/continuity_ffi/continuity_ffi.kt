@@ -792,6 +792,8 @@ internal open class UniffiVTableCallbackInterfaceEventListener(
 
 
 
+
+
 // A JNA Library to expose the extern-C FFI definitions.
 // This is an implementation detail which will be called internally by the public API.
 
@@ -834,6 +836,8 @@ internal interface UniffiLib : Library {
     fun uniffi_continuity_ffi_fn_method_continuityengine_disconnect_peer(`ptr`: Pointer,`peerId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_continuity_ffi_fn_method_continuityengine_reconnect_peer(`ptr`: Pointer,`peerId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_continuity_ffi_fn_method_continuityengine_refresh_discovery(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_continuity_ffi_fn_method_continuityengine_reset(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
@@ -985,6 +989,8 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_continuity_ffi_checksum_method_continuityengine_reconnect_peer(
     ): Short
+    fun uniffi_continuity_ffi_checksum_method_continuityengine_refresh_discovery(
+    ): Short
     fun uniffi_continuity_ffi_checksum_method_continuityengine_reset(
     ): Short
     fun uniffi_continuity_ffi_checksum_method_continuityengine_send_file(
@@ -1036,6 +1042,9 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_continuity_ffi_checksum_method_continuityengine_reconnect_peer() != 56890.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_continuity_ffi_checksum_method_continuityengine_refresh_discovery() != 59286.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_continuity_ffi_checksum_method_continuityengine_reset() != 40739.toShort()) {
@@ -1795,6 +1804,13 @@ public interface ContinuityEngineInterface {
     fun `reconnectPeer`(`peerId`: kotlin.String)
     
     /**
+     * Re-queries mDNS right now for a manual "Refresh" action, instead of
+     * waiting for the background querier's own timer — for when a device
+     * that should be nearby isn't showing up yet.
+     */
+    fun `refreshDiscovery`()
+    
+    /**
      * Clears every paired device and disconnects all active peers — the
      * host app should confirm with the user before calling this, there's
      * no undo.
@@ -1949,6 +1965,22 @@ open class ContinuityEngine: Disposable, AutoCloseable, ContinuityEngineInterfac
     uniffiRustCall() { _status ->
     UniffiLib.INSTANCE.uniffi_continuity_ffi_fn_method_continuityengine_reconnect_peer(
         it, FfiConverterString.lower(`peerId`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Re-queries mDNS right now for a manual "Refresh" action, instead of
+     * waiting for the background querier's own timer — for when a device
+     * that should be nearby isn't showing up yet.
+     */override fun `refreshDiscovery`()
+        = 
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_continuity_ffi_fn_method_continuityengine_refresh_discovery(
+        it, _status)
 }
     }
     

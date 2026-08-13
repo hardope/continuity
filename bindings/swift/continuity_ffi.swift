@@ -771,6 +771,13 @@ public protocol ContinuityEngineProtocol : AnyObject {
     func reconnectPeer(peerId: String) 
     
     /**
+     * Re-queries mDNS right now for a manual "Refresh" action, instead of
+     * waiting for the background querier's own timer — for when a device
+     * that should be nearby isn't showing up yet.
+     */
+    func refreshDiscovery() 
+    
+    /**
      * Clears every paired device and disconnects all active peers — the
      * host app should confirm with the user before calling this, there's
      * no undo.
@@ -908,6 +915,17 @@ open func disconnectPeer(peerId: String) {try! rustCall() {
 open func reconnectPeer(peerId: String) {try! rustCall() {
     uniffi_continuity_ffi_fn_method_continuityengine_reconnect_peer(self.uniffiClonePointer(),
         FfiConverterString.lower(peerId),$0
+    )
+}
+}
+    
+    /**
+     * Re-queries mDNS right now for a manual "Refresh" action, instead of
+     * waiting for the background querier's own timer — for when a device
+     * that should be nearby isn't showing up yet.
+     */
+open func refreshDiscovery() {try! rustCall() {
+    uniffi_continuity_ffi_fn_method_continuityengine_refresh_discovery(self.uniffiClonePointer(),$0
     )
 }
 }
@@ -1850,6 +1868,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_continuity_ffi_checksum_method_continuityengine_reconnect_peer() != 56890) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_continuity_ffi_checksum_method_continuityengine_refresh_discovery() != 59286) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_continuity_ffi_checksum_method_continuityengine_reset() != 40739) {

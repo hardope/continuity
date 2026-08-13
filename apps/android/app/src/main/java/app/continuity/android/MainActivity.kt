@@ -267,6 +267,14 @@ private fun ContinuityScreen(onFilePickerRequested: ((Uri) -> Unit) -> Unit) {
                     }
                     DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }) {
                         DropdownMenuItem(
+                            text = { Text("Refresh Nearby Devices") },
+                            leadingIcon = { Icon(Icons.Default.Refresh, contentDescription = null) },
+                            onClick = {
+                                menuExpanded = false
+                                EngineHolder.engine?.refreshDiscovery()
+                            },
+                        )
+                        DropdownMenuItem(
                             text = { Text(if (isPaused) "Resume Syncing" else "Pause Syncing") },
                             leadingIcon = { Icon(Icons.Default.PauseCircle, contentDescription = null) },
                             onClick = {
@@ -289,6 +297,18 @@ private fun ContinuityScreen(onFilePickerRequested: ((Uri) -> Unit) -> Unit) {
                                 menuExpanded = false
                                 context.stopService(Intent(context, ContinuityForegroundService::class.java))
                                 (context as? Activity)?.finishAndRemoveTask()
+                                // stopService()/finishAndRemoveTask() don't
+                                // guarantee the process actually dies — Android
+                                // may keep it cached, with the engine's async
+                                // shutdown (mDNS daemon, multicast lock, tokio
+                                // tasks) still mid-teardown. Reopening quickly
+                                // then races a fresh engine startup against
+                                // that still-in-flight cleanup — the app "doesn't
+                                // launch", needing a retry once teardown finally
+                                // finishes. Killing the process outright makes
+                                // the OS reclaim every resource immediately and
+                                // completely, so a relaunch always starts clean.
+                                android.os.Process.killProcess(android.os.Process.myPid())
                             },
                         )
                     }

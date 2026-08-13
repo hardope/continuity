@@ -18,7 +18,12 @@ pub struct DiscoveredPeer {
 
 /// Wraps mDNS/DNS-SD advertise + browse for the `_continuity._tcp.local`
 /// service. One `Discovery` instance per process is enough — `advertise`
-/// and `browse` can both be called on it.
+/// and `browse` can both be called on it. Cheap to clone (`ServiceDaemon`
+/// itself is a cloneable handle to the daemon's background thread, not the
+/// daemon itself), so a second handle can be kept around just to trigger
+/// `refresh()` without needing to share the original browse loop's
+/// receiver.
+#[derive(Clone)]
 pub struct Discovery {
     daemon: ServiceDaemon,
 }
@@ -65,6 +70,17 @@ impl Discovery {
     /// Callers filter/collect these into their own view of the mesh.
     pub fn browse(&self) -> Result<mdns_sd::Receiver<ServiceEvent>, DiscoveryError> {
         Ok(self.daemon.browse(SERVICE_TYPE)?)
+    }
+
+    /// Re-issues an mDNS query for `SERVICE_TYPE` right now instead of
+    /// waiting for `mdns-sd`'s own internal re-query timer — for a manual
+    /// "Refresh" action. The original `browse()` receiver keeps working;
+    /// this one is discarded (dropping an `mdns-sd` receiver just
+    /// unregisters that particular listener, it doesn't stop the browse
+    /// the first receiver is still reading from).
+    pub fn refresh(&self) -> Result<(), DiscoveryError> {
+        self.daemon.browse(SERVICE_TYPE)?;
+        Ok(())
     }
 
     pub fn shutdown(&self) -> Result<(), DiscoveryError> {

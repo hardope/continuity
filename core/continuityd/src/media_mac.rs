@@ -16,7 +16,47 @@ use objc2_core_graphics::{CGEvent, CGEventTapLocation};
 use objc2_foundation::NSPoint;
 use std::ffi::{c_void, CStr};
 use std::sync::mpsc;
+use std::sync::Once;
 use std::time::Duration;
+
+#[link(name = "ApplicationServices", kind = "framework")]
+unsafe extern "C" {
+    fn AXIsProcessTrusted() -> u8;
+}
+
+/// `CGEventPost`ing a synthetic media key — unlike the CoreAudio volume
+/// calls below — is gated behind Accessibility permission on modern macOS.
+/// An unsigned/ad-hoc-signed dev build (or a rebuilt one — ad-hoc
+/// signatures change per build, and TCC tracks trust per signature) starts
+/// out untrusted every time, so transport commands silently no-op while
+/// volume keeps working — exactly the asymmetry a user would see and
+/// report as "play/pause do nothing but volume works". Checked once (not
+/// once per command, to avoid spamming a notification on every remote tap)
+/// and, if untrusted, tells the user and jumps them straight to the
+/// System Settings pane that grants it.
+fn ensure_accessibility_trust() {
+    static CHECKED: Once = Once::new();
+    CHECKED.call_once(|| {
+        if unsafe { AXIsProcessTrusted() } != 0 {
+            return;
+        }
+        tracing::warn!(
+            "Continuity isn't trusted for Accessibility — remote play/pause/next/previous will silently do nothing until it's granted in System Settings > Privacy & Security > Accessibility"
+        );
+        if let Err(e) = notify_rust::Notification::new()
+            .summary("Continuity")
+            .body("Grant Accessibility permission for remote play/pause/next/previous to work. Volume control isn't affected.")
+            .show()
+        {
+            tracing::debug!("accessibility notification not shown: {e}");
+        }
+        if let Err(e) =
+            std::process::Command::new("open").arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility").spawn()
+        {
+            tracing::debug!("couldn't open System Settings: {e}");
+        }
+    });
+}
 
 // From IOKit/hidsystem/ev_keymap.h — not exposed as a public header import,
 // these are the well-known reverse-engineered values every media-key-
@@ -51,6 +91,7 @@ impl MediaController for MacMediaController {
 }
 
 fn post_media_key(key: i64) {
+    ensure_accessibility_trust();
     // A real key press is a down event followed by an up event — sending
     // only one or the other is ignored by most apps.
     for key_down in [true, false] {
@@ -377,6 +418,12 @@ mod manual_verification {
     #[ignore]
     fn send_volume_down() {
         MacMediaController.handle(MediaCommand::VolumeDown);
+    }
+
+    #[test]
+    #[ignore]
+    fn print_ax_trust() {
+        println!("AXIsProcessTrusted = {}", unsafe { AXIsProcessTrusted() != 0 });
     }
 
     #[test]

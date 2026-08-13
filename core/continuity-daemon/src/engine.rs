@@ -22,6 +22,30 @@ use tokio::task::JoinHandle;
 
 const CHUNK_SIZE: usize = 64 * 1024;
 const FILE_ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Nothing else in this connection's message loop ever sends anything
+/// unprompted except on real activity (clipboard changes, file transfers,
+/// now-playing changes) — a quiet-but-healthy connection can go long
+/// stretches with no traffic at all. Without an active ping, a connection
+/// that goes silently dead (wifi drop, sleep/wake, a NAT/router dropping
+/// idle mappings) has no way to be detected: nothing here sets a TCP
+/// keepalive, so `read_message` just blocks forever, `connected` never
+/// clears the peer, and the mDNS tie-break logic that would otherwise
+/// redial on rediscovery sees "already connected" and skips it — the
+/// reported "device doesn't reconnect until I restart the app" symptom.
+const PING_INTERVAL: Duration = Duration::from_secs(20);
+/// A couple of missed ping/pong round trips' worth of grace before giving
+/// up on the connection — long enough to not false-positive on ordinary
+/// network jitter, short enough that a real drop gets noticed (and
+/// `SyncEvent::Disconnected` fired, and the peer freed up for the next
+/// mDNS-triggered reconnect attempt) well within a user's patience.
+const CONNECTION_READ_TIMEOUT: Duration = Duration::from_secs(50);
+/// How often to re-issue an mDNS query on its own, without the user having
+/// to notice a device is missing and hit the manual Refresh action —
+/// self-healing for the case mdns-sd's background query timers don't
+/// promptly pick up a network change (sleep/wake, wifi reconnect) on their
+/// own. Cheap (just re-sends a query over the existing socket — see
+/// `Discovery::refresh`), so a fairly short interval is fine.
+const DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 /// Only a trusted (paired) peer can send a file at all, but this still
 /// bounds how much an unattended auto-accept can write to disk.
 const MAX_AUTO_ACCEPT_BYTES: u64 = 500 * 1024 * 1024;
@@ -43,6 +67,7 @@ pub struct EngineHandle {
     commands_tx: mpsc::UnboundedSender<EngineCommand>,
     tasks: Vec<JoinHandle<()>>,
     discovery: Discovery,
+    state: Arc<SharedState>,
 }
 
 impl EngineHandle {
@@ -60,6 +85,18 @@ impl EngineHandle {
     pub fn shutdown(self) {
         for task in &self.tasks {
             task.abort();
+        }
+        // `self.tasks` only holds the top-level background loops (mDNS
+        // browse, inbound-accept, command processing, the watchers) — each
+        // individual peer connection's task lives in its own place
+        // (`state.connection_handles`, keyed by peer id, the same map
+        // `Reset` aborts everything in) and was never in `tasks` at all.
+        // Without this, `shutdown()` left every active connection's task
+        // running untouched — harmless if the whole process exits right
+        // after, but a real bug for any caller that expects `shutdown()`
+        // to actually tear the engine down while the process keeps living.
+        for handle in self.state.connection_handles.lock().unwrap().values() {
+            handle.abort();
         }
         let _ = self.discovery.shutdown();
     }
@@ -101,6 +138,9 @@ struct SharedState {
     /// dial loop, the clipboard watcher, and inbound clipboard-update
     /// handling — everywhere new syncing activity could start.
     paused: AtomicBool,
+    /// A cloned handle to the same mDNS daemon the browse loop's receiver
+    /// came from — `Discovery::refresh()` for `EngineCommand::RefreshDiscovery`.
+    discovery: Discovery,
 }
 
 impl SharedState {
@@ -126,6 +166,10 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
     let (events_tx, events_rx) = mpsc::unbounded_channel();
     let (commands_tx, mut commands_rx) = mpsc::unbounded_channel();
 
+    let discovery = Discovery::new()?;
+    discovery.advertise(&my_device, port)?;
+    let browse_rx = discovery.browse()?;
+
     let state = Arc::new(SharedState {
         my_device: my_device.clone(),
         tls_identity,
@@ -143,13 +187,10 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
         events_tx,
         received_files_dir: config.received_files_dir,
         paused: AtomicBool::new(false),
+        discovery: discovery.clone(),
     });
 
     state.emit(SyncEvent::Listening { port });
-
-    let discovery = Discovery::new()?;
-    discovery.advertise(&my_device, port)?;
-    let browse_rx = discovery.browse()?;
 
     let mut tasks = Vec::new();
 
@@ -374,6 +415,11 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                             let _ = tx.send(Message::MediaCommand { command });
                         }
                     }
+                    EngineCommand::RefreshDiscovery => {
+                        if let Err(e) = state.discovery.refresh() {
+                            tracing::debug!("couldn't refresh mDNS discovery: {e}");
+                        }
+                    }
                 }
             }
         })
@@ -381,12 +427,14 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
 
     tasks.push(spawn_clipboard_watcher(state.clone()));
     tasks.push(spawn_now_playing_watcher(state.clone()));
+    tasks.push(spawn_discovery_refresh_ticker(state.clone()));
 
     Ok(EngineHandle {
         events: events_rx,
         commands_tx,
         tasks,
         discovery,
+        state,
     })
 }
 
@@ -484,8 +532,37 @@ async fn handle_connection_inner(
 
     let mut receiving: HashMap<String, ReceivingFile> = HashMap::new();
 
+    let mut ping_ticker = tokio::time::interval(PING_INTERVAL);
+    ping_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Tracks time since the last *received* message (any message, not just
+    // Pong — anything arriving proves the connection is alive). Deliberately
+    // NOT a `timeout()` wrapped fresh around `read_message` each iteration:
+    // since PING_INTERVAL < CONNECTION_READ_TIMEOUT, the ping branch would
+    // win the select every cycle and recreate that timeout from scratch
+    // before it could ever elapse, so a truly dead connection would never
+    // be detected. Checking elapsed-since-`last_activity` on each ping tick
+    // instead means sending a ping can't reset a clock it doesn't own.
+    let mut last_activity = std::time::Instant::now();
+
     loop {
-        match read_message(&mut read_half).await {
+        let read_result = tokio::select! {
+            _ = ping_ticker.tick() => {
+                if last_activity.elapsed() > CONNECTION_READ_TIMEOUT {
+                    tracing::debug!(
+                        "no message from '{}' in over {CONNECTION_READ_TIMEOUT:?} — treating as disconnected",
+                        peer.name
+                    );
+                    break;
+                }
+                if tx.send(Message::Ping).is_err() {
+                    break; // writer task is gone — connection is already dead
+                }
+                continue;
+            }
+            result = read_message(&mut read_half) => result,
+        };
+        last_activity = std::time::Instant::now();
+        match read_result {
             Ok(Message::Ping) => {
                 let _ = tx.send(Message::Pong);
             }
@@ -911,6 +988,28 @@ fn spawn_now_playing_watcher(state: Arc<SharedState>) -> JoinHandle<()> {
             let senders: Vec<_> = state.peer_senders.lock().unwrap().values().cloned().collect();
             for tx in senders {
                 let _ = tx.send(msg.clone());
+            }
+        }
+    })
+}
+
+/// Self-heal companion to the manual "Refresh" action (`EngineCommand::
+/// RefreshDiscovery`) — re-issues the mDNS query on a timer instead of
+/// waiting for the user to notice a device went missing. `tokio::spawn`
+/// rather than `spawn_blocking` like the other watchers: `Discovery::
+/// refresh` just sends a query over an already-open socket, no blocking
+/// host-language/FFI call involved.
+fn spawn_discovery_refresh_ticker(state: Arc<SharedState>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(DISCOVERY_REFRESH_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            if state.paused.load(Ordering::Relaxed) {
+                continue;
+            }
+            if let Err(e) = state.discovery.refresh() {
+                tracing::debug!("periodic discovery refresh failed: {e}");
             }
         }
     })

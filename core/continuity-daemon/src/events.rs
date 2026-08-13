@@ -86,4 +86,10 @@ pub enum EngineCommand {
     /// shell wires in a real `MediaController` (macOS only for now; every
     /// other platform's `NoopMediaController` silently drops it).
     SendMediaCommand { peer_crypto_id: String, command: MediaCommand },
+    /// Re-issues an mDNS query right now instead of waiting for the
+    /// background querier's own timer — for a manual "Refresh" action when
+    /// a device that should be nearby isn't showing up (a missed
+    /// broadcast/multicast hiccup, not something this can diagnose or fix
+    /// on its own, just retry sooner than the automatic interval would).
+    RefreshDiscovery,
 }

@@ -346,6 +346,13 @@ impl ContinuityEngine {
             command: command.into(),
         });
     }
+
+    /// Re-queries mDNS right now for a manual "Refresh" action, instead of
+    /// waiting for the background querier's own timer — for when a device
+    /// that should be nearby isn't showing up yet.
+    pub fn refresh_discovery(&self) {
+        let _ = self.commands.send(EngineCommand::RefreshDiscovery);
+    }
 }
 
 /// Generates a fresh identity's PKCS8 DER bytes. Call once on first run;

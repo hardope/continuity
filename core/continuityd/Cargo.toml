@@ -12,17 +12,21 @@ path = "src/main.rs"
 # Consumed by `cargo deb` (see the "linux" leg of .github/workflows/release.yml)
 # to build a .deb instead of shipping a bare binary that needs its shared-lib
 # runtime dependencies (libxdo3, libayatana-appindicator3-1, etc.) installed
-# by hand. `depends` is left at its default ("$auto") deliberately — cargo-deb
-# runs `ldd` against the built binary and resolves each .so it links to the
-# Debian package that provides it, which is exactly the set of packages a
-# user would otherwise have to guess at from a "cannot open shared object
-# file" error.
+# by hand. `"$auto"` runs `ldd` against the built binary and resolves each
+# .so it links to the Debian package that provides it — exactly the set of
+# packages a user would otherwise have to guess at from a "cannot open
+# shared object file" error. `zenity` is added explicitly alongside it: `ldd`
+# can't see it since it's not a linked library but an external binary rfd
+# shells out to as its Linux `MessageDialog` fallback (Reset confirmation,
+# pairing-request accept/decline) wherever its own `gtk3` feature isn't
+# doing the job — see the `rfd` dependency override below.
 [package.metadata.deb]
 maintainer = "hardope"
 copyright = "2026, hardope"
 extended-description = "Cross-platform clipboard, file, and (eventually) keyboard continuity across macOS, Windows, Linux, Android, and iOS over the local network — no cloud relay, no account."
 section = "utils"
 priority = "optional"
+depends = ["$auto", "zenity"]
 assets = [
     ["target/release/continuityd", "usr/bin/", "755"],
     ["../../installers/linux/continuity.desktop", "usr/share/applications/", "644"],
@@ -74,5 +78,21 @@ windows = { version = "0.58", features = [
 ] }
 
 # MPRIS media control/reads over D-Bus — see src/media_linux.rs.
+#
+# Also pulls in rfd's `gtk3` feature (additive with the default `xdg-portal`
+# feature already requested by the unconditional `rfd` dependency above —
+# Cargo unions features per-platform rather than picking one declaration).
+# `rfd::MessageDialog` (Reset confirmation, pairing-request accept/decline)
+# has no XDG Desktop Portal equivalent at all — Portal has no message-dialog
+# API — so on `xdg-portal`-only Linux builds rfd falls back to shelling out
+# to the external `zenity` binary, which silently does nothing useful if
+# it isn't installed (a real bug: reported as "Reset doesn't bring up the
+# confirm dialogue" and, since the pairing-request dialog goes through the
+# exact same `MessageDialog::show()` call, also as "a Mac connecting to
+# Linux doesn't show anything on the Linux side"). `gtk3` gives rfd a real,
+# directly-linked implementation instead — and GTK is already a mandatory
+# runtime dependency here regardless, since tray-icon needs it for the tray
+# icon itself, so this doesn't add any new system requirement.
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = "4"
+rfd = { version = "0.15", features = ["gtk3"] }
