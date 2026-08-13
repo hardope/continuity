@@ -18,12 +18,23 @@ pub struct DiscoveredPeer {
 
 /// Wraps mDNS/DNS-SD advertise + browse for the `_continuity._tcp.local`
 /// service. One `Discovery` instance per process is enough — `advertise`
-/// and `browse` can both be called on it. Cheap to clone (`ServiceDaemon`
-/// itself is a cloneable handle to the daemon's background thread, not the
-/// daemon itself), so a second handle can be kept around just to trigger
-/// `refresh()` without needing to share the original browse loop's
-/// receiver.
-#[derive(Clone)]
+/// and `browse` can both be called on it.
+///
+/// **There is deliberately no "refresh" method here.** `ServiceDaemon::
+/// browse()` registers exactly one listener per service type — call it a
+/// second time for the same type and the *first* listener is silently
+/// overwritten (straight from `mdns_sd`'s own doc comment: "if there is
+/// already a listener, it will be updated, i.e. overwritten"). A real bug
+/// shipped because of this: `Discovery` used to derive `Clone` specifically
+/// so a second handle could call `browse()` again as a "refresh", which
+/// orphaned the original receiver the whole engine's browse loop actually
+/// reads from — killing all further discovery, new devices and
+/// rediscovery-triggered reconnects alike, after the first refresh. `mdns_sd`
+/// already re-queries on its own over time via retransmission, using the
+/// original listener, so nothing external is needed for that. If a manual
+/// "refresh" is ever wanted again, it needs `stop_browse` + `browse` and a
+/// way to hand the *new* receiver back to whatever's reading the old one —
+/// not a second call on a cloned handle.
 pub struct Discovery {
     daemon: ServiceDaemon,
 }
@@ -70,17 +81,6 @@ impl Discovery {
     /// Callers filter/collect these into their own view of the mesh.
     pub fn browse(&self) -> Result<mdns_sd::Receiver<ServiceEvent>, DiscoveryError> {
         Ok(self.daemon.browse(SERVICE_TYPE)?)
-    }
-
-    /// Re-issues an mDNS query for `SERVICE_TYPE` right now instead of
-    /// waiting for `mdns-sd`'s own internal re-query timer — for a manual
-    /// "Refresh" action. The original `browse()` receiver keeps working;
-    /// this one is discarded (dropping an `mdns-sd` receiver just
-    /// unregisters that particular listener, it doesn't stop the browse
-    /// the first receiver is still reading from).
-    pub fn refresh(&self) -> Result<(), DiscoveryError> {
-        self.daemon.browse(SERVICE_TYPE)?;
-        Ok(())
     }
 
     pub fn shutdown(&self) -> Result<(), DiscoveryError> {

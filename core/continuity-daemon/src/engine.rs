@@ -32,20 +32,22 @@ const FILE_ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
 /// clears the peer, and the mDNS tie-break logic that would otherwise
 /// redial on rediscovery sees "already connected" and skips it — the
 /// reported "device doesn't reconnect until I restart the app" symptom.
-const PING_INTERVAL: Duration = Duration::from_secs(20);
-/// A couple of missed ping/pong round trips' worth of grace before giving
-/// up on the connection — long enough to not false-positive on ordinary
-/// network jitter, short enough that a real drop gets noticed (and
-/// `SyncEvent::Disconnected` fired, and the peer freed up for the next
-/// mDNS-triggered reconnect attempt) well within a user's patience.
-const CONNECTION_READ_TIMEOUT: Duration = Duration::from_secs(50);
-/// How often to re-issue an mDNS query on its own, without the user having
-/// to notice a device is missing and hit the manual Refresh action —
-/// self-healing for the case mdns-sd's background query timers don't
-/// promptly pick up a network change (sleep/wake, wifi reconnect) on their
-/// own. Cheap (just re-sends a query over the existing socket — see
-/// `Discovery::refresh`), so a fairly short interval is fine.
-const DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const PING_INTERVAL: Duration = Duration::from_secs(30);
+/// **Tuned up once already** — this started at 50s, which turned out far
+/// too tight for real WiFi: normal jitter (roaming between APs, a laptop
+/// waking from a brief sleep, a router's own hiccups) can plausibly stall
+/// all traffic for the better part of a minute on its own, and TCP is
+/// already resilient to exactly that — it just retransmits and carries on
+/// once packets flow again, with the application never needing to know
+/// anything happened. A 50s application-level timeout was *more*
+/// aggressive than TCP's own recovery, actively tearing down connections
+/// TCP would have quietly kept alive — reported as "connections are a lot
+/// more unstable, randomly disconnecting" after this was first added.
+/// Three minutes gives real transient conditions plenty of room to
+/// resolve themselves before this steps in, while still being enormously
+/// better than the pre-keepalive "never" for a truly dead connection
+/// (wifi off, device asleep, out of range).
+const CONNECTION_READ_TIMEOUT: Duration = Duration::from_secs(180);
 /// Only a trusted (paired) peer can send a file at all, but this still
 /// bounds how much an unattended auto-accept can write to disk.
 const MAX_AUTO_ACCEPT_BYTES: u64 = 500 * 1024 * 1024;
@@ -138,9 +140,6 @@ struct SharedState {
     /// dial loop, the clipboard watcher, and inbound clipboard-update
     /// handling — everywhere new syncing activity could start.
     paused: AtomicBool,
-    /// A cloned handle to the same mDNS daemon the browse loop's receiver
-    /// came from — `Discovery::refresh()` for `EngineCommand::RefreshDiscovery`.
-    discovery: Discovery,
 }
 
 impl SharedState {
@@ -187,7 +186,6 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
         events_tx,
         received_files_dir: config.received_files_dir,
         paused: AtomicBool::new(false),
-        discovery: discovery.clone(),
     });
 
     state.emit(SyncEvent::Listening { port });
@@ -416,8 +414,49 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                         }
                     }
                     EngineCommand::RefreshDiscovery => {
-                        if let Err(e) = state.discovery.refresh() {
-                            tracing::debug!("couldn't refresh mDNS discovery: {e}");
+                        // *Not* an mDNS re-query — `mdns_sd::ServiceDaemon::
+                        // browse()` unconditionally overwrites its single
+                        // registered listener for a service type ("if there
+                        // is already a listener, it will be updated, i.e.
+                        // overwritten" — straight from its own doc comment),
+                        // so calling it a second time silently orphans the
+                        // receiver this engine's whole browse loop actually
+                        // reads from: real bug, shipped and caught after the
+                        // fact — it killed all further discovery (new
+                        // devices *and* rediscovery-triggered reconnects)
+                        // after the first refresh, whether from this timer
+                        // or the user's own Refresh click. mdns-sd already
+                        // re-queries on its own via retransmission using the
+                        // *original* listener, so nothing external is needed
+                        // for that half. What's actually useful here instead:
+                        // retry dialing every trusted peer with a cached
+                        // address that isn't currently connected — doesn't
+                        // touch mDNS at all, so it can't repeat that mistake.
+                        let targets: Vec<(String, SocketAddr)> = {
+                            let trust_store = state.trust_store.lock().unwrap();
+                            let connected = state.connected.lock().unwrap();
+                            let manually_disconnected = state.manually_disconnected.lock().unwrap();
+                            let known_addresses = state.known_addresses.lock().unwrap();
+                            trust_store
+                                .list()
+                                .filter(|d| !connected.contains(&d.id) && !manually_disconnected.contains(&d.id))
+                                .filter_map(|d| known_addresses.get(&d.id).copied().map(|addr| (d.id.clone(), addr)))
+                                .collect()
+                        };
+                        for (peer_crypto_id, addr) in targets {
+                            let conn_state = state.clone();
+                            let id_for_registry = peer_crypto_id.clone();
+                            let join = tokio::spawn(async move {
+                                match connect(addr, &conn_state.tls_identity).await {
+                                    Ok(conn) => {
+                                        if let Err(e) = handle_connection(conn, conn_state, peer_crypto_id).await {
+                                            tracing::debug!("refresh-triggered reconnect to {addr} ended: {e}");
+                                        }
+                                    }
+                                    Err(e) => tracing::debug!("refresh-triggered reconnect to {addr} failed: {e}"),
+                                }
+                            });
+                            state.connection_handles.lock().unwrap().insert(id_for_registry, join.abort_handle());
                         }
                     }
                 }
@@ -427,7 +466,6 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
 
     tasks.push(spawn_clipboard_watcher(state.clone()));
     tasks.push(spawn_now_playing_watcher(state.clone()));
-    tasks.push(spawn_discovery_refresh_ticker(state.clone()));
 
     Ok(EngineHandle {
         events: events_rx,
@@ -988,28 +1026,6 @@ fn spawn_now_playing_watcher(state: Arc<SharedState>) -> JoinHandle<()> {
             let senders: Vec<_> = state.peer_senders.lock().unwrap().values().cloned().collect();
             for tx in senders {
                 let _ = tx.send(msg.clone());
-            }
-        }
-    })
-}
-
-/// Self-heal companion to the manual "Refresh" action (`EngineCommand::
-/// RefreshDiscovery`) — re-issues the mDNS query on a timer instead of
-/// waiting for the user to notice a device went missing. `tokio::spawn`
-/// rather than `spawn_blocking` like the other watchers: `Discovery::
-/// refresh` just sends a query over an already-open socket, no blocking
-/// host-language/FFI call involved.
-fn spawn_discovery_refresh_ticker(state: Arc<SharedState>) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(DISCOVERY_REFRESH_INTERVAL);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            ticker.tick().await;
-            if state.paused.load(Ordering::Relaxed) {
-                continue;
-            }
-            if let Err(e) = state.discovery.refresh() {
-                tracing::debug!("periodic discovery refresh failed: {e}");
             }
         }
     })
