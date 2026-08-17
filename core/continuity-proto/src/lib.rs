@@ -134,6 +134,16 @@ pub enum Message {
     /// watcher polls for changes and broadcasts them unprompted, mirroring
     /// how `ClipboardUpdate` works.
     NowPlayingUpdate { info: NowPlayingInfo },
+
+    /// Sent once, right before the sender closes the connection, when the
+    /// user removes this peer from their trust store
+    /// (`EngineCommand::RevokeDevice`). One-directional by design, the same
+    /// way an SSH host removing a key from its `authorized_keys` doesn't
+    /// touch the client's own `known_hosts` — the receiver does *not*
+    /// automatically forget the sender in turn, it just learns why the
+    /// connection is about to drop instead of seeing a plain, unexplained
+    /// disconnect, and can choose to revoke back or not.
+    Revoked,
 }
 
 /// A media transport command sent over `Message::MediaCommand`. See
@@ -150,6 +160,11 @@ pub enum MediaCommand {
     Previous,
     VolumeUp,
     VolumeDown,
+    /// Jump playback to an absolute position, for a remote scrub/seek
+    /// gesture — unlike everything else here, sent once when the user
+    /// releases the seek gesture, not on every drag movement, so scrubbing
+    /// doesn't flood the connection with a command per frame.
+    Seek { position_ms: u64 },
 }
 
 /// Snapshot of a device's now-playing state, sent over
@@ -157,7 +172,18 @@ pub enum MediaCommand {
 /// `None` for "no artwork" — the shared `b64` codec below only handles
 /// `Vec<u8>` directly, and an empty vec is unambiguous here since real
 /// artwork is never zero bytes.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `position_ms` deliberately isn't excluded from equality even though it
+/// changes on essentially every poll while something is playing — the
+/// engine's dedupe-against-last-seen watcher (see `spawn_now_playing_
+/// watcher`) uses this type's `PartialEq` directly to decide whether to
+/// broadcast at all, and a live position is exactly the case where
+/// broadcasting on (almost) every poll is the *correct* behavior: a
+/// receiver's progress bar needs a real update roughly every watcher tick
+/// to track playback without drifting, the same way it needs a real
+/// `is_playing` change to know when a peer paused. `Eq` isn't derived
+/// (unlike before this field existed) since `volume_percent` is a float.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct NowPlayingInfo {
     pub title: Option<String>,
     pub artist: Option<String>,
@@ -165,6 +191,15 @@ pub struct NowPlayingInfo {
     #[serde(with = "b64")]
     pub artwork: Vec<u8>,
     pub is_playing: bool,
+    /// Elapsed playback position, milliseconds into the current track.
+    pub position_ms: u64,
+    /// Total track length, milliseconds — 0 if unknown (e.g. a live
+    /// stream with no fixed duration, or nothing playing).
+    pub duration_ms: u64,
+    /// Current output/session volume, 0.0–1.0. `None` when the sending
+    /// platform's `MediaController` doesn't report a readable volume
+    /// level (distinct from 0.0, which is "definitely muted").
+    pub volume_percent: Option<f32>,
 }
 
 #[cfg(test)]

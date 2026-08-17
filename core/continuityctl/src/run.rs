@@ -18,7 +18,8 @@ pub async fn run(profile: &str, name: Option<String>) -> anyhow::Result<()> {
     println!("received files will be saved to: {}", received_files_dir(profile).display());
     println!(
         "commands: y/n confirms a pending pairing request; 'connect <id>' dials a nearby (not yet paired) device; \
-         'refresh' re-queries mDNS right now; 'send <path>' sends a file to the most recently connected peer"
+         'refresh' re-queries mDNS right now; 'send <path>' sends a file to the most recently connected peer; \
+         'revoke <id>' forgets a paired device and closes its connection"
     );
 
     let config = EngineConfig {
@@ -117,6 +118,10 @@ fn handle_event(event: SyncEvent, cli_state: &CliState) {
         // health telemetry, not worth printing on every tick in a CLI
         // that otherwise logs real events.
         SyncEvent::PeerActivity { .. } => {}
+        SyncEvent::WasRevoked { peer_name, .. } => println!("forgot '{peer_name}'"),
+        SyncEvent::RevokedByPeer { peer_name, .. } => {
+            println!("'{peer_name}' removed this device — pair again to reconnect");
+        }
     }
 }
 
@@ -147,6 +152,13 @@ fn spawn_stdin_reader(
 
             if line == "refresh" {
                 let _ = commands.send(EngineCommand::RefreshDiscovery);
+                continue;
+            }
+
+            if let Some(peer_crypto_id) = line.strip_prefix("revoke ") {
+                let _ = commands.send(EngineCommand::RevokeDevice {
+                    peer_crypto_id: peer_crypto_id.trim().to_string(),
+                });
                 continue;
             }
 

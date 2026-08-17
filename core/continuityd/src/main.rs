@@ -61,6 +61,7 @@ fn main() -> anyhow::Result<()> {
     let nearby_submenu = Submenu::new("Nearby Devices", true);
     let refresh_item = MenuItem::new("Refresh Nearby Devices", true, None);
     let send_submenu = Submenu::new("Send File", true);
+    let forget_submenu = Submenu::new("Forget Device", true);
     let pause_item = MenuItem::new("Pause Syncing", true, None);
     let reset_item = MenuItem::new("Reset...", true, None);
     let quit_item = MenuItem::new("Quit", true, None);
@@ -72,6 +73,15 @@ fn main() -> anyhow::Result<()> {
     let connected_peers: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
     let send_target_map: Arc<Mutex<HashMap<MenuId, SendTarget>>> = Arc::new(Mutex::new(HashMap::new()));
     rebuild_send_menu(&send_submenu, &connected_peers.lock().unwrap(), &send_target_map);
+
+    // "Forget" only offers currently-connected peers, same scope as "Send
+    // File" above — there's no UI surface yet for interacting with a
+    // paired-but-offline peer individually (only bulk `Reset` reaches
+    // those). Separate map/submenu rather than reusing `send_target_map`
+    // since a click here means something structurally different
+    // (`EngineCommand::RevokeDevice`, not `SendFile`).
+    let forget_target_map: Arc<Mutex<HashMap<MenuId, String>>> = Arc::new(Mutex::new(HashMap::new()));
+    rebuild_forget_menu(&forget_submenu, &connected_peers.lock().unwrap(), &forget_target_map);
 
     // Untrusted devices seen on the network (see SyncEvent::PeerDiscovered)
     // — the engine deliberately doesn't auto-dial these anymore (that used
@@ -90,6 +100,7 @@ fn main() -> anyhow::Result<()> {
     menu.append(&nearby_submenu)?;
     menu.append(&refresh_item)?;
     menu.append(&send_submenu)?;
+    menu.append(&forget_submenu)?;
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&pause_item)?;
     menu.append(&reset_item)?;
@@ -115,10 +126,12 @@ fn main() -> anyhow::Result<()> {
             handle_sync_event(
                 sync_event,
                 &send_submenu,
+                &forget_submenu,
                 &nearby_submenu,
                 &pause_item,
                 &connected_peers,
                 &send_target_map,
+                &forget_target_map,
                 &nearby_peers,
                 &nearby_target_map,
                 &is_paused,
@@ -165,6 +178,18 @@ fn main() -> anyhow::Result<()> {
                 }
             } else if let Some(peer_id) = nearby_target_map.lock().unwrap().get(&event.id).cloned() {
                 let _ = commands.send(EngineCommand::ReconnectPeer { peer_crypto_id: peer_id });
+            } else if let Some(peer_id) = forget_target_map.lock().unwrap().get(&event.id).cloned() {
+                let peer_name = connected_peers.lock().unwrap().get(&peer_id).cloned().unwrap_or_else(|| peer_id.clone());
+                let result = rfd::MessageDialog::new()
+                    .set_title("Continuity — Forget Device")
+                    .set_description(format!(
+                        "Forget '{peer_name}'? This closes the connection now and it'll need to be paired again from scratch to reconnect.\n\nAre you sure?"
+                    ))
+                    .set_buttons(rfd::MessageButtons::YesNo)
+                    .show();
+                if matches!(result, rfd::MessageDialogResult::Yes) {
+                    let _ = commands.send(EngineCommand::RevokeDevice { peer_crypto_id: peer_id });
+                }
             }
         }
 
@@ -178,10 +203,12 @@ fn main() -> anyhow::Result<()> {
 fn handle_sync_event(
     event: SyncEvent,
     send_submenu: &Submenu,
+    forget_submenu: &Submenu,
     nearby_submenu: &Submenu,
     pause_item: &MenuItem,
     connected_peers: &Arc<Mutex<HashMap<String, String>>>,
     send_target_map: &Arc<Mutex<HashMap<MenuId, SendTarget>>>,
+    forget_target_map: &Arc<Mutex<HashMap<MenuId, String>>>,
     nearby_peers: &Arc<Mutex<HashMap<String, String>>>,
     nearby_target_map: &Arc<Mutex<HashMap<MenuId, String>>>,
     is_paused: &Arc<Mutex<bool>>,
@@ -217,6 +244,7 @@ fn handle_sync_event(
             rebuild_nearby_menu(nearby_submenu, &nearby_peers.lock().unwrap(), nearby_target_map);
             connected_peers.lock().unwrap().insert(peer.id, peer.name);
             rebuild_send_menu(send_submenu, &connected_peers.lock().unwrap(), send_target_map);
+            rebuild_forget_menu(forget_submenu, &connected_peers.lock().unwrap(), forget_target_map);
         }
         SyncEvent::PeerDiscovered { device } => {
             nearby_peers.lock().unwrap().insert(device.id, device.name);
@@ -225,6 +253,7 @@ fn handle_sync_event(
         SyncEvent::Disconnected { peer_id, peer_name } => {
             connected_peers.lock().unwrap().remove(&peer_id);
             rebuild_send_menu(send_submenu, &connected_peers.lock().unwrap(), send_target_map);
+            rebuild_forget_menu(forget_submenu, &connected_peers.lock().unwrap(), forget_target_map);
             tracing::info!("'{peer_name}' disconnected");
         }
         SyncEvent::ClipboardReceived { from_name } => {
@@ -245,7 +274,22 @@ fn handle_sync_event(
         SyncEvent::WasReset => {
             connected_peers.lock().unwrap().clear();
             rebuild_send_menu(send_submenu, &connected_peers.lock().unwrap(), send_target_map);
+            rebuild_forget_menu(forget_submenu, &connected_peers.lock().unwrap(), forget_target_map);
             notify("All paired devices have been forgotten");
+        }
+        SyncEvent::WasRevoked { peer_id, peer_name } => {
+            // Unlike `Disconnected` (which keeps the entry, just marked
+            // offline, so it can be reconnected with one click) this
+            // removes it outright — the device is forgotten, not just
+            // temporarily unreachable, and reconnecting now means pairing
+            // again from scratch.
+            connected_peers.lock().unwrap().remove(&peer_id);
+            rebuild_send_menu(send_submenu, &connected_peers.lock().unwrap(), send_target_map);
+            rebuild_forget_menu(forget_submenu, &connected_peers.lock().unwrap(), forget_target_map);
+            notify(&format!("Forgot '{peer_name}'"));
+        }
+        SyncEvent::RevokedByPeer { peer_name, .. } => {
+            notify(&format!("'{peer_name}' removed this device — pair again to reconnect"));
         }
         SyncEvent::PausedStateChanged { paused } => {
             *is_paused.lock().unwrap() = paused;
@@ -298,6 +342,33 @@ fn rebuild_send_menu(
         let broadcast = MenuItem::new(format!("Broadcast to All ({} devices)...", peers.len()), true, None);
         map.insert(broadcast.id().clone(), SendTarget::All);
         let _ = submenu.append(&broadcast);
+    }
+}
+
+/// Same rebuild-from-scratch approach as `rebuild_send_menu`, same
+/// currently-connected-only scope — no broadcast option, since forgetting
+/// is inherently per-device and clicking one always shows its own
+/// confirmation dialog before `EngineCommand::RevokeDevice` is sent.
+fn rebuild_forget_menu(
+    submenu: &Submenu,
+    connected: &HashMap<String, String>,
+    target_map: &Arc<Mutex<HashMap<MenuId, String>>>,
+) {
+    while submenu.remove_at(0).is_some() {}
+    let mut map = target_map.lock().unwrap();
+    map.clear();
+
+    if connected.is_empty() {
+        let _ = submenu.append(&MenuItem::new("No device connected", false, None));
+        return;
+    }
+
+    let mut peers: Vec<(&String, &String)> = connected.iter().collect();
+    peers.sort_by(|a, b| a.1.cmp(b.1));
+    for (id, name) in &peers {
+        let item = MenuItem::new(format!("Forget {name}..."), true, None);
+        map.insert(item.id().clone(), (*id).clone());
+        let _ = submenu.append(&item);
     }
 }
 

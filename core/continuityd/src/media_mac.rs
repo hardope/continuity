@@ -82,6 +82,7 @@ impl MediaController for MacMediaController {
             // system_volume::step below.
             MediaCommand::VolumeUp => system_volume::step(0.0625),
             MediaCommand::VolumeDown => system_volume::step(-0.0625),
+            MediaCommand::Seek { position_ms } => now_playing::set_elapsed_time(position_ms as f64 / 1000.0),
         }
     }
 
@@ -148,18 +149,47 @@ mod now_playing {
     use objc2_core_foundation::{CFDictionary, CFRetained, CFString, CFType};
 
     type GetNowPlayingInfoFn = unsafe extern "C-unwind" fn(*mut c_void, *mut c_void);
+    // Reverse-engineered the same way as `MRMediaRemoteGetNowPlayingInfo` —
+    // takes elapsed time in *seconds* (a double, matching
+    // `kMRMediaRemoteNowPlayingInfoElapsedTime`'s own unit below), applies
+    // immediately, synchronously, no completion callback. This is the same
+    // primitive Control Center's own scrubber uses internally.
+    type SetElapsedTimeFn = unsafe extern "C-unwind" fn(f64);
 
-    pub fn get() -> Option<NowPlayingInfo> {
+    fn media_remote_handle() -> Option<*mut c_void> {
         unsafe {
             let path = CStr::from_bytes_with_nul(
                 b"/System/Library/PrivateFrameworks/MediaRemote.framework/MediaRemote\0",
             )
             .unwrap();
             let handle = libc::dlopen(path.as_ptr(), libc::RTLD_LAZY);
-            if handle.is_null() {
+            (!handle.is_null()).then_some(handle)
+        }
+    }
+
+    pub fn set_elapsed_time(seconds: f64) {
+        unsafe {
+            let Some(handle) = media_remote_handle() else {
+                tracing::debug!("couldn't dlopen MediaRemote.framework for seek");
+                return;
+            };
+            let sym_name = CStr::from_bytes_with_nul(b"MRMediaRemoteSetElapsedTime\0").unwrap();
+            let sym = libc::dlsym(handle, sym_name.as_ptr());
+            if sym.is_null() {
+                tracing::debug!("MRMediaRemoteSetElapsedTime symbol not found");
+                return;
+            }
+            let set_elapsed_time: SetElapsedTimeFn = std::mem::transmute(sym);
+            set_elapsed_time(seconds);
+        }
+    }
+
+    pub fn get() -> Option<NowPlayingInfo> {
+        unsafe {
+            let Some(handle) = media_remote_handle() else {
                 tracing::debug!("couldn't dlopen MediaRemote.framework");
                 return None;
-            }
+            };
 
             let sym_name = CStr::from_bytes_with_nul(b"MRMediaRemoteGetNowPlayingInfo\0").unwrap();
             let sym = libc::dlsym(handle, sym_name.as_ptr());
@@ -175,7 +205,14 @@ mod now_playing {
                     None
                 } else {
                     let dict = &*(dict_ptr as *const CFDictionary<CFString, CFType>);
-                    Some(parse_dict(dict))
+                    let mut info = parse_dict(dict);
+                    // Not part of the MediaRemote dictionary at all — the
+                    // system output volume (see `system_volume` below) is a
+                    // separate CoreAudio concept, folded in here only
+                    // because this is the one snapshot type that already
+                    // gets polled and broadcast on a change.
+                    info.volume_percent = super::system_volume::current();
+                    Some(info)
                 };
                 let _ = tx.send(info);
             });
@@ -225,7 +262,53 @@ mod now_playing {
             .map(|rate| rate != 0.0)
             .unwrap_or(false);
 
-        NowPlayingInfo { title, artist, album, artwork, is_playing }
+        // Both keys hold seconds as a double (confirmed against a real
+        // dumped dictionary, same as the string/rate keys above) — `*
+        // 1000.0` to match this protocol's millisecond convention
+        // everywhere else (see continuity_proto::NowPlayingInfo).
+        let seconds_field = |key: &str| -> Option<f64> {
+            dict.get(&CFString::from_str(key)).and_then(|v: CFRetained<CFType>| {
+                v.downcast_ref::<objc2_core_foundation::CFNumber>().and_then(|n| n.as_cgfloat())
+            })
+        };
+        let duration_ms = seconds_field("kMRMediaRemoteNowPlayingInfoDuration").map(|s| (s * 1000.0) as u64).unwrap_or(0);
+
+        // `ElapsedTime` is a *snapshot*, not a live value — confirmed by
+        // testing against QuickTime Player: it read back as exactly 0
+        // seconds after several real seconds of playback, unmoving. Every
+        // real MediaRemote-based "now playing" tool interpolates using the
+        // paired `Timestamp` field for exactly this reason: the source app
+        // only pushes a fresh dict on discrete events (play, pause, seek,
+        // track change), not continuously, so a client reading the raw
+        // elapsed value gets whatever it was at the *last* such event, not
+        // "right now". True live position while playing is `snapshot
+        // elapsed + (now - snapshot timestamp)`; while paused, playback
+        // hasn't advanced at all since the snapshot, so the raw value is
+        // already correct as-is.
+        let snapshot_elapsed_s = seconds_field("kMRMediaRemoteNowPlayingInfoElapsedTime").unwrap_or(0.0);
+        let snapshot_timestamp = dict
+            .get(&CFString::from_str("kMRMediaRemoteNowPlayingInfoTimestamp"))
+            .and_then(|v: CFRetained<CFType>| v.downcast_ref::<objc2_core_foundation::CFDate>().map(|d| d.absolute_time()));
+        let elapsed_s = match (is_playing, snapshot_timestamp) {
+            (true, Some(ts)) => {
+                let now = objc2_core_foundation::CFAbsoluteTimeGetCurrent();
+                // Clamp at 0 in case the snapshot timestamp is somehow in
+                // the future (clock oddities) — better a frozen position
+                // than one that runs backwards.
+                snapshot_elapsed_s + (now - ts).max(0.0)
+            }
+            _ => snapshot_elapsed_s,
+        };
+        // A live position can't legitimately exceed the track's own
+        // duration — the interpolation above has no way to know playback
+        // actually stopped/looped at the end without a fresh snapshot, so
+        // without this a track left playing past its nominal end (the
+        // watcher's next real snapshot hasn't arrived yet) would show a
+        // progress bar stuck past 100% instead of pinned at the end.
+        let elapsed_s = if duration_ms > 0 { elapsed_s.min(duration_ms as f64 / 1000.0) } else { elapsed_s };
+        let position_ms = (elapsed_s * 1000.0) as u64;
+
+        NowPlayingInfo { title, artist, album, artwork, is_playing, position_ms, duration_ms, volume_percent: None }
     }
 }
 
@@ -379,6 +462,13 @@ mod system_volume {
             tracing::debug!("couldn't set output volume");
         }
     }
+
+    /// Current output volume, 0.0–1.0, for `NowPlayingInfo::volume_percent`
+    /// — read-only counterpart to `step`, same default-output-device +
+    /// main-or-per-channel-element lookup.
+    pub fn current() -> Option<f32> {
+        get(default_output_device()?)
+    }
 }
 
 #[cfg(test)]
@@ -432,15 +522,34 @@ mod manual_verification {
         match MacMediaController.now_playing() {
             Some(info) => {
                 println!(
-                    "title={:?} artist={:?} album={:?} is_playing={} artwork_bytes={}",
+                    "title={:?} artist={:?} album={:?} is_playing={} position_ms={} duration_ms={} volume_percent={:?} artwork_bytes={}",
                     info.title,
                     info.artist,
                     info.album,
                     info.is_playing,
+                    info.position_ms,
+                    info.duration_ms,
+                    info.volume_percent,
                     info.artwork.len(),
                 );
             }
             None => println!("now_playing() returned None"),
         }
+    }
+
+    #[test]
+    #[ignore]
+    fn print_volume() {
+        println!("current volume = {:?}", super::system_volume::current());
+    }
+
+    // Run alongside `print_now_playing` (before/after) to confirm the
+    // reported `position_ms` actually moved to roughly the requested spot
+    // — this only proves the call didn't error, not that playback actually
+    // jumped.
+    #[test]
+    #[ignore]
+    fn send_seek_to_30s() {
+        MacMediaController.handle(MediaCommand::Seek { position_ms: 30_000 });
     }
 }

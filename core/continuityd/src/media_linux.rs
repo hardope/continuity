@@ -36,12 +36,24 @@ trait Player {
     fn play_pause(&self) -> zbus::Result<()>;
     fn next(&self) -> zbus::Result<()>;
     fn previous(&self) -> zbus::Result<()>;
+    /// Relative seek, microseconds (MPRIS's own unit — this file converts
+    /// to/from this protocol's milliseconds at the boundary). Used instead
+    /// of MPRIS's other seek method, `SetPosition(TrackId, Position)`,
+    /// which the spec requires silently no-op if the given `TrackId`
+    /// doesn't exactly match the player's *current* track — a real
+    /// footgun for a fire-and-forget remote command with no acknowledgement,
+    /// since a stale/wrong id fails silently with nothing to detect it by.
+    /// `Seek` has no such requirement — just an offset from wherever
+    /// playback currently is.
+    fn seek(&self, offset_us: i64) -> zbus::Result<()>;
 
     #[zbus(property)]
     fn volume(&self) -> zbus::Result<f64>;
     #[zbus(property)]
     fn set_volume(&self, value: f64) -> zbus::Result<()>;
 
+    #[zbus(property)]
+    fn position(&self) -> zbus::Result<i64>;
     #[zbus(property)]
     fn playback_status(&self) -> zbus::Result<String>;
     #[zbus(property)]
@@ -93,6 +105,18 @@ fn send_command(command: MediaCommand) -> zbus::Result<()> {
             let current = player.volume()?;
             player.set_volume((current + delta).clamp(0.0, 1.0))
         }
+        MediaCommand::Seek { position_ms } => {
+            // MPRIS's `Seek` is relative, not absolute, but this protocol's
+            // `Seek` is always an absolute target — reading the current
+            // position right before computing the offset keeps the window
+            // for it to have moved (from playback continuing, or a race
+            // with another remote command) as small as this one round trip,
+            // rather than relying on a possibly-stale value cached from an
+            // earlier poll.
+            let current_us = player.position()?;
+            let target_us = position_ms as i64 * 1000;
+            player.seek(target_us - current_us)
+        }
     }
 }
 
@@ -118,6 +142,17 @@ fn read_now_playing() -> zbus::Result<Option<NowPlayingInfo>> {
         .and_then(|v| Vec::<String>::try_from(v).ok())
         .and_then(|v| v.into_iter().next());
 
+    // `mpris:length` is microseconds, same unit `Position` (read below) and
+    // `Seek` (see `send_command`) use — converted to this protocol's
+    // milliseconds at this boundary, same as every other field here.
+    let duration_ms = metadata.get("mpris:length").and_then(|v| i64::try_from(v).ok()).map(|us| (us / 1000).max(0) as u64).unwrap_or(0);
+    // Unlike macOS's `ElapsedTime` (a stale snapshot needing manual
+    // interpolation against a paired timestamp — see media_mac.rs), MPRIS's
+    // `Position` is specified as always reflecting the player's actual
+    // current position when read, no interpolation needed here.
+    let position_ms = player.position().ok().map(|us| (us / 1000).max(0) as u64).unwrap_or(0);
+    let volume_percent = player.volume().ok().map(|v| v as f32);
+
     // Artwork is a URL in MPRIS, not raw bytes (unlike macOS/Windows) —
     // only `file://` is handled, since fetching an arbitrary http(s) URL
     // on every metadata poll isn't something to do without the user
@@ -130,5 +165,5 @@ fn read_now_playing() -> zbus::Result<Option<NowPlayingInfo>> {
 
     let is_playing = player.playback_status().map(|s| s == "Playing").unwrap_or(false);
 
-    Ok(Some(NowPlayingInfo { title, artist, album, artwork, is_playing }))
+    Ok(Some(NowPlayingInfo { title, artist, album, artwork, is_playing, position_ms, duration_ms, volume_percent }))
 }

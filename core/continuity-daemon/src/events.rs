@@ -56,6 +56,19 @@ pub enum SyncEvent {
     /// `engine.rs`), so it fires at that same bounded rate per peer — no
     /// separate timer, no risk of flooding a host UI.
     PeerActivity { peer_id: String, seconds_since_activity: u64 },
+    /// Confirms `EngineCommand::RevokeDevice` actually happened — a shell
+    /// removes the peer from its own device list off this event, not off
+    /// the click that sent the command (same reasoning as `WasReset`).
+    WasRevoked { peer_id: String, peer_name: String },
+    /// A connected peer sent `Message::Revoked` just before closing the
+    /// connection — they removed *this* device from *their* trust store.
+    /// This side's own trust of them is untouched (revocation doesn't
+    /// propagate automatically — see `Message::Revoked`); a shell should
+    /// surface this distinctly from a plain `Disconnected` (which still
+    /// fires right after) so the user understands *why* the peer dropped
+    /// and stopped reconnecting, rather than reading it as a network
+    /// hiccup.
+    RevokedByPeer { peer_id: String, peer_name: String },
 }
 
 /// Requests a shell makes of the engine. Sent over the channel returned by
@@ -109,4 +122,14 @@ pub enum EngineCommand {
     /// a network change can keep multicasting on an interface that no
     /// longer exists instead of the new one.
     NetworkChanged,
+    /// Forgets one specific paired device — unlike `Reset` (which forgets
+    /// everyone), this removes just `peer_crypto_id` from the trust store.
+    /// If currently connected, sends `Message::Revoked` first (best
+    /// effort — the peer might not receive it if the connection is
+    /// already half-dead) and then force-closes the connection
+    /// immediately, rather than leaving it open until it happens to drop
+    /// on its own. The peer's own trust of this device is untouched; if
+    /// they're still nearby afterward, mDNS will surface them again as an
+    /// untrusted `PeerDiscovered`, same as any other never-paired device.
+    RevokeDevice { peer_crypto_id: String },
 }

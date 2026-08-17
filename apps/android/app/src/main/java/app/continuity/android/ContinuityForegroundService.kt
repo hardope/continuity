@@ -154,11 +154,20 @@ class ContinuityForegroundService : Service() {
             is FfiSyncEvent.FileSent -> "Sent '${event.fileName}' to '${event.toName}'"
             is FfiSyncEvent.FileTransferFailed -> "File transfer failed: ${event.reason}"
             is FfiSyncEvent.Error -> "Error: ${event.message}"
+            // A peer forgetting *this* device is worth surfacing even when
+            // the app isn't in the foreground — it explains why sync just
+            // stopped, the same way PairingDeclined does above. WasRevoked
+            // is the mirror of that but from this device's own deliberate
+            // action (the user just tapped "Forget" in-app), so — like
+            // WasReset below — there's no one who needs telling who isn't
+            // already looking at the screen.
+            is FfiSyncEvent.RevokedByPeer -> "'${event.peerName}' removed this device — pair again to reconnect"
             is FfiSyncEvent.Paired,
             is FfiSyncEvent.Connected,
             is FfiSyncEvent.Disconnected,
             is FfiSyncEvent.ClipboardReceived,
             is FfiSyncEvent.WasReset,
+            is FfiSyncEvent.WasRevoked,
             is FfiSyncEvent.PausedStateChanged,
             is FfiSyncEvent.Listening,
             is FfiSyncEvent.ClipboardBroadcast,

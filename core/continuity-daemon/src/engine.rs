@@ -549,6 +549,69 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                             peer_name,
                         });
                     }
+                    EngineCommand::RevokeDevice { peer_crypto_id } => {
+                        let peer_name = state
+                            .trust_store
+                            .lock()
+                            .unwrap()
+                            .get(&peer_crypto_id)
+                            .map(|d| d.name.clone())
+                            .unwrap_or_else(|| peer_crypto_id.clone());
+
+                        // Best-effort — if the send fails (channel already
+                        // gone) there's nothing to notify anyway, the
+                        // connection's already on its way down.
+                        let notified_peer = if let Some(tx) = state.peer_senders.lock().unwrap().get(&peer_crypto_id) {
+                            tx.send(Message::Revoked).is_ok()
+                        } else {
+                            false
+                        };
+
+                        if let Err(e) = state.trust_store.lock().unwrap().revoke(&peer_crypto_id) {
+                            tracing::warn!("failed to revoke {peer_crypto_id} from trust store: {e}");
+                        }
+                        // Emitted right away rather than after the delayed
+                        // abort below — a shell updating its UI shouldn't
+                        // wait on a network flush it has no reason to care
+                        // about.
+                        state.emit(SyncEvent::WasRevoked { peer_id: peer_crypto_id.clone(), peer_name });
+
+                        // Queuing onto `tx` above only *schedules* the
+                        // write on the connection's own writer loop, which
+                        // needs an actual scheduler turn to run and put it
+                        // on the wire — aborting the connection task right
+                        // away would otherwise very reliably win that race
+                        // (no `.await` in between means the writer task
+                        // never even gets polled once), silently dropping
+                        // the notification every time instead of just
+                        // occasionally. Spawned separately rather than
+                        // `.await`ed inline so a brief, bounded wait here
+                        // doesn't stall this shared command loop from
+                        // processing whatever's queued behind it.
+                        let state = state.clone();
+                        tokio::spawn(async move {
+                            if notified_peer {
+                                tokio::time::sleep(Duration::from_millis(150)).await;
+                            }
+                            // Same abort/cleanup sequence as `DisconnectPeer`
+                            // — aborting skips `handle_connection`'s own
+                            // normal cleanup tail, so it's repeated here.
+                            // Deliberately *not* added to
+                            // `manually_disconnected`: that set is for
+                            // "stays paired, don't auto-reconnect", but this
+                            // peer is being forgotten outright — the
+                            // `is_trusted` check in the mDNS auto-dial loop
+                            // is what actually keeps it from being silently
+                            // redialed now, the same as any other untrusted
+                            // device.
+                            if let Some(handle) = state.connection_handles.lock().unwrap().remove(&peer_crypto_id) {
+                                handle.abort();
+                            }
+                            state.connected.lock().unwrap().remove(&peer_crypto_id);
+                            release_dial_claim(&state, &peer_crypto_id);
+                            state.peer_senders.lock().unwrap().remove(&peer_crypto_id);
+                        });
+                    }
                     EngineCommand::ReconnectPeer { peer_crypto_id } => {
                         state.manually_disconnected.lock().unwrap().remove(&peer_crypto_id);
                         let Some(addr) = state.known_addresses.lock().unwrap().get(&peer_crypto_id).copied() else {
@@ -822,6 +885,19 @@ async fn handle_connection_inner(
                 }
                 Ok(Message::FileComplete { transfer_id, content_hash: expected_hash }) => {
                     handle_file_complete(state, &mut receiving, &transfer_id, expected_hash).await;
+                }
+                Ok(Message::Revoked) => {
+                    state.emit(SyncEvent::RevokedByPeer {
+                        peer_id: peer.id.clone(),
+                        peer_name: peer.name.clone(),
+                    });
+                    // The sender is about to close their side anyway, but
+                    // don't wait on that — end the loop here so the
+                    // `Disconnected` emit below (and this side's own
+                    // connection-state cleanup in `handle_connection`)
+                    // isn't left hanging on a socket the peer no longer
+                    // wants open.
+                    break;
                 }
                 Ok(other) => tracing::debug!("ignoring unhandled message from '{}': {other:?}", peer.name),
                 Err(_) => break,

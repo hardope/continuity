@@ -794,6 +794,8 @@ internal open class UniffiVTableCallbackInterfaceEventListener(
 
 
 
+
+
 // A JNA Library to expose the extern-C FFI definitions.
 // This is an implementation detail which will be called internally by the public API.
 
@@ -840,6 +842,8 @@ internal interface UniffiLib : Library {
     fun uniffi_continuity_ffi_fn_method_continuityengine_refresh_discovery(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_continuity_ffi_fn_method_continuityengine_reset(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_continuity_ffi_fn_method_continuityengine_revoke_device(`ptr`: Pointer,`peerId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_continuity_ffi_fn_method_continuityengine_send_file(`ptr`: Pointer,`peerId`: RustBuffer.ByValue,`path`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
@@ -993,6 +997,8 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_continuity_ffi_checksum_method_continuityengine_reset(
     ): Short
+    fun uniffi_continuity_ffi_checksum_method_continuityengine_revoke_device(
+    ): Short
     fun uniffi_continuity_ffi_checksum_method_continuityengine_send_file(
     ): Short
     fun uniffi_continuity_ffi_checksum_method_continuityengine_send_media_command(
@@ -1048,6 +1054,9 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_continuity_ffi_checksum_method_continuityengine_reset() != 40739.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_continuity_ffi_checksum_method_continuityengine_revoke_device() != 18662.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_continuity_ffi_checksum_method_continuityengine_send_file() != 32648.toShort()) {
@@ -1178,6 +1187,29 @@ public object FfiConverterULong: FfiConverter<ULong, Long> {
 
     override fun write(value: ULong, buf: ByteBuffer) {
         buf.putLong(value.toLong())
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterFloat: FfiConverter<Float, Float> {
+    override fun lift(value: Float): Float {
+        return value
+    }
+
+    override fun read(buf: ByteBuffer): Float {
+        return buf.getFloat()
+    }
+
+    override fun lower(value: Float): Float {
+        return value
+    }
+
+    override fun allocationSize(value: Float) = 4UL
+
+    override fun write(value: Float, buf: ByteBuffer) {
+        buf.putFloat(value)
     }
 }
 
@@ -1817,6 +1849,14 @@ public interface ContinuityEngineInterface {
      */
     fun `reset`()
     
+    /**
+     * Forgets one specific paired device and closes its connection now —
+     * unlike `reset`, every other paired device is untouched. There's no
+     * undo; the host app should confirm with the user before calling
+     * this, same as `reset`.
+     */
+    fun `revokeDevice`(`peerId`: kotlin.String)
+    
     fun `sendFile`(`peerId`: kotlin.String, `path`: kotlin.String)
     
     /**
@@ -1997,6 +2037,23 @@ open class ContinuityEngine: Disposable, AutoCloseable, ContinuityEngineInterfac
     uniffiRustCall() { _status ->
     UniffiLib.INSTANCE.uniffi_continuity_ffi_fn_method_continuityengine_reset(
         it, _status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Forgets one specific paired device and closes its connection now —
+     * unlike `reset`, every other paired device is untouched. There's no
+     * undo; the host app should confirm with the user before calling
+     * this, same as `reset`.
+     */override fun `revokeDevice`(`peerId`: kotlin.String)
+        = 
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_continuity_ffi_fn_method_continuityengine_revoke_device(
+        it, FfiConverterString.lower(`peerId`),_status)
 }
     }
     
@@ -2437,7 +2494,32 @@ data class FfiNowPlayingInfo (
     var `artist`: kotlin.String?, 
     var `album`: kotlin.String?, 
     var `artwork`: kotlin.ByteArray, 
-    var `isPlaying`: kotlin.Boolean
+    var `isPlaying`: kotlin.Boolean, 
+    /**
+     * Elapsed position, milliseconds into the current track. Already
+     * corrected for the "stale snapshot" gap in the underlying platform
+     * APIs (see `media_mac.rs`/`media_windows.rs`) — safe to treat as the
+     * real live position at the moment this event was received, not a
+     * value that needs its own platform-specific interpolation on the
+     * host side. It *will* still lag reality between updates (the
+     * now-playing watcher polls every 1.5s) — animate it forward
+     * client-side using the host's own clock for a smooth progress bar
+     * between real updates, the same anchor-timestamp approach already
+     * used for `SyncEvent::PeerActivity`'s "active Ns ago".
+     */
+    var `positionMs`: kotlin.ULong, 
+    /**
+     * Total track length, milliseconds — 0 if unknown (live stream, or
+     * nothing playing).
+     */
+    var `durationMs`: kotlin.ULong, 
+    /**
+     * Current output/session volume, 0.0–1.0. `null` when the sending
+     * platform doesn't report a readable level (distinct from 0.0, which
+     * is "definitely muted") — a host UI should hide/disable a volume
+     * slider rather than show it pinned at zero in that case.
+     */
+    var `volumePercent`: kotlin.Float?
 ) {
     
     companion object
@@ -2454,6 +2536,9 @@ public object FfiConverterTypeFfiNowPlayingInfo: FfiConverterRustBuffer<FfiNowPl
             FfiConverterOptionalString.read(buf),
             FfiConverterByteArray.read(buf),
             FfiConverterBoolean.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterOptionalFloat.read(buf),
         )
     }
 
@@ -2462,7 +2547,10 @@ public object FfiConverterTypeFfiNowPlayingInfo: FfiConverterRustBuffer<FfiNowPl
             FfiConverterOptionalString.allocationSize(value.`artist`) +
             FfiConverterOptionalString.allocationSize(value.`album`) +
             FfiConverterByteArray.allocationSize(value.`artwork`) +
-            FfiConverterBoolean.allocationSize(value.`isPlaying`)
+            FfiConverterBoolean.allocationSize(value.`isPlaying`) +
+            FfiConverterULong.allocationSize(value.`positionMs`) +
+            FfiConverterULong.allocationSize(value.`durationMs`) +
+            FfiConverterOptionalFloat.allocationSize(value.`volumePercent`)
     )
 
     override fun write(value: FfiNowPlayingInfo, buf: ByteBuffer) {
@@ -2471,6 +2559,9 @@ public object FfiConverterTypeFfiNowPlayingInfo: FfiConverterRustBuffer<FfiNowPl
             FfiConverterOptionalString.write(value.`album`, buf)
             FfiConverterByteArray.write(value.`artwork`, buf)
             FfiConverterBoolean.write(value.`isPlaying`, buf)
+            FfiConverterULong.write(value.`positionMs`, buf)
+            FfiConverterULong.write(value.`durationMs`, buf)
+            FfiConverterOptionalFloat.write(value.`volumePercent`, buf)
     }
 }
 
@@ -2540,32 +2631,123 @@ public object FfiConverterTypeFfiError : FfiConverterRustBuffer<FfiException> {
  * `ContinuityEngine::send_media_command` for where the host language uses
  * this.
  */
-
-enum class FfiMediaCommand {
+sealed class FfiMediaCommand {
     
-    PLAY_PAUSE,
-    NEXT,
-    PREVIOUS,
-    VOLUME_UP,
-    VOLUME_DOWN;
+    object PlayPause : FfiMediaCommand()
+    
+    
+    object Next : FfiMediaCommand()
+    
+    
+    object Previous : FfiMediaCommand()
+    
+    
+    object VolumeUp : FfiMediaCommand()
+    
+    
+    object VolumeDown : FfiMediaCommand()
+    
+    
+    /**
+     * Absolute jump, not relative — sent once when the user releases a
+     * scrub/seek gesture, not on every drag movement.
+     */
+    data class Seek(
+        val `positionMs`: kotlin.ULong) : FfiMediaCommand() {
+        companion object
+    }
+    
+
+    
     companion object
 }
-
 
 /**
  * @suppress
  */
-public object FfiConverterTypeFfiMediaCommand: FfiConverterRustBuffer<FfiMediaCommand> {
-    override fun read(buf: ByteBuffer) = try {
-        FfiMediaCommand.values()[buf.getInt() - 1]
-    } catch (e: IndexOutOfBoundsException) {
-        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+public object FfiConverterTypeFfiMediaCommand : FfiConverterRustBuffer<FfiMediaCommand>{
+    override fun read(buf: ByteBuffer): FfiMediaCommand {
+        return when(buf.getInt()) {
+            1 -> FfiMediaCommand.PlayPause
+            2 -> FfiMediaCommand.Next
+            3 -> FfiMediaCommand.Previous
+            4 -> FfiMediaCommand.VolumeUp
+            5 -> FfiMediaCommand.VolumeDown
+            6 -> FfiMediaCommand.Seek(
+                FfiConverterULong.read(buf),
+                )
+            else -> throw RuntimeException("invalid enum value, something is very wrong!!")
+        }
     }
 
-    override fun allocationSize(value: FfiMediaCommand) = 4UL
+    override fun allocationSize(value: FfiMediaCommand) = when(value) {
+        is FfiMediaCommand.PlayPause -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
+        is FfiMediaCommand.Next -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
+        is FfiMediaCommand.Previous -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
+        is FfiMediaCommand.VolumeUp -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
+        is FfiMediaCommand.VolumeDown -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
+        is FfiMediaCommand.Seek -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterULong.allocationSize(value.`positionMs`)
+            )
+        }
+    }
 
     override fun write(value: FfiMediaCommand, buf: ByteBuffer) {
-        buf.putInt(value.ordinal + 1)
+        when(value) {
+            is FfiMediaCommand.PlayPause -> {
+                buf.putInt(1)
+                Unit
+            }
+            is FfiMediaCommand.Next -> {
+                buf.putInt(2)
+                Unit
+            }
+            is FfiMediaCommand.Previous -> {
+                buf.putInt(3)
+                Unit
+            }
+            is FfiMediaCommand.VolumeUp -> {
+                buf.putInt(4)
+                Unit
+            }
+            is FfiMediaCommand.VolumeDown -> {
+                buf.putInt(5)
+                Unit
+            }
+            is FfiMediaCommand.Seek -> {
+                buf.putInt(6)
+                FfiConverterULong.write(value.`positionMs`, buf)
+                Unit
+            }
+        }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
     }
 }
 
@@ -2681,6 +2863,18 @@ sealed class FfiSyncEvent {
         companion object
     }
     
+    data class WasRevoked(
+        val `peerId`: kotlin.String, 
+        val `peerName`: kotlin.String) : FfiSyncEvent() {
+        companion object
+    }
+    
+    data class RevokedByPeer(
+        val `peerId`: kotlin.String, 
+        val `peerName`: kotlin.String) : FfiSyncEvent() {
+        companion object
+    }
+    
 
     
     companion object
@@ -2759,6 +2953,14 @@ public object FfiConverterTypeFfiSyncEvent : FfiConverterRustBuffer<FfiSyncEvent
             19 -> FfiSyncEvent.PeerActivity(
                 FfiConverterString.read(buf),
                 FfiConverterULong.read(buf),
+                )
+            20 -> FfiSyncEvent.WasRevoked(
+                FfiConverterString.read(buf),
+                FfiConverterString.read(buf),
+                )
+            21 -> FfiSyncEvent.RevokedByPeer(
+                FfiConverterString.read(buf),
+                FfiConverterString.read(buf),
                 )
             else -> throw RuntimeException("invalid enum value, something is very wrong!!")
         }
@@ -2910,6 +3112,22 @@ public object FfiConverterTypeFfiSyncEvent : FfiConverterRustBuffer<FfiSyncEvent
                 + FfiConverterULong.allocationSize(value.`secondsSinceActivity`)
             )
         }
+        is FfiSyncEvent.WasRevoked -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`peerId`)
+                + FfiConverterString.allocationSize(value.`peerName`)
+            )
+        }
+        is FfiSyncEvent.RevokedByPeer -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`peerId`)
+                + FfiConverterString.allocationSize(value.`peerName`)
+            )
+        }
     }
 
     override fun write(value: FfiSyncEvent, buf: ByteBuffer) {
@@ -3021,11 +3239,55 @@ public object FfiConverterTypeFfiSyncEvent : FfiConverterRustBuffer<FfiSyncEvent
                 FfiConverterULong.write(value.`secondsSinceActivity`, buf)
                 Unit
             }
+            is FfiSyncEvent.WasRevoked -> {
+                buf.putInt(20)
+                FfiConverterString.write(value.`peerId`, buf)
+                FfiConverterString.write(value.`peerName`, buf)
+                Unit
+            }
+            is FfiSyncEvent.RevokedByPeer -> {
+                buf.putInt(21)
+                FfiConverterString.write(value.`peerId`, buf)
+                FfiConverterString.write(value.`peerName`, buf)
+                Unit
+            }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
     }
 }
 
 
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalFloat: FfiConverterRustBuffer<kotlin.Float?> {
+    override fun read(buf: ByteBuffer): kotlin.Float? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterFloat.read(buf)
+    }
+
+    override fun allocationSize(value: kotlin.Float?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterFloat.allocationSize(value)
+        }
+    }
+
+    override fun write(value: kotlin.Float?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterFloat.write(value, buf)
+        }
+    }
+}
 
 
 

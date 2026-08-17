@@ -447,6 +447,22 @@ fileprivate struct FfiConverterUInt64: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterFloat: FfiConverterPrimitive {
+    typealias FfiType = Float
+    typealias SwiftType = Float
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Float {
+        return try lift(readFloat(&buf))
+    }
+
+    public static func write(_ value: Float, into buf: inout [UInt8]) {
+        writeFloat(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterBool : FfiConverter {
     typealias FfiType = Int8
     typealias SwiftType = Bool
@@ -784,6 +800,14 @@ public protocol ContinuityEngineProtocol : AnyObject {
      */
     func reset() 
     
+    /**
+     * Forgets one specific paired device and closes its connection now —
+     * unlike `reset`, every other paired device is untouched. There's no
+     * undo; the host app should confirm with the user before calling
+     * this, same as `reset`.
+     */
+    func revokeDevice(peerId: String) 
+    
     func sendFile(peerId: String, path: String) 
     
     /**
@@ -937,6 +961,19 @@ open func refreshDiscovery() {try! rustCall() {
      */
 open func reset() {try! rustCall() {
     uniffi_continuity_ffi_fn_method_continuityengine_reset(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
+    /**
+     * Forgets one specific paired device and closes its connection now —
+     * unlike `reset`, every other paired device is untouched. There's no
+     * undo; the host app should confirm with the user before calling
+     * this, same as `reset`.
+     */
+open func revokeDevice(peerId: String) {try! rustCall() {
+    uniffi_continuity_ffi_fn_method_continuityengine_revoke_device(self.uniffiClonePointer(),
+        FfiConverterString.lower(peerId),$0
     )
 }
 }
@@ -1302,15 +1339,65 @@ public struct FfiNowPlayingInfo {
     public var album: String?
     public var artwork: Data
     public var isPlaying: Bool
+    /**
+     * Elapsed position, milliseconds into the current track. Already
+     * corrected for the "stale snapshot" gap in the underlying platform
+     * APIs (see `media_mac.rs`/`media_windows.rs`) — safe to treat as the
+     * real live position at the moment this event was received, not a
+     * value that needs its own platform-specific interpolation on the
+     * host side. It *will* still lag reality between updates (the
+     * now-playing watcher polls every 1.5s) — animate it forward
+     * client-side using the host's own clock for a smooth progress bar
+     * between real updates, the same anchor-timestamp approach already
+     * used for `SyncEvent::PeerActivity`'s "active Ns ago".
+     */
+    public var positionMs: UInt64
+    /**
+     * Total track length, milliseconds — 0 if unknown (live stream, or
+     * nothing playing).
+     */
+    public var durationMs: UInt64
+    /**
+     * Current output/session volume, 0.0–1.0. `null` when the sending
+     * platform doesn't report a readable level (distinct from 0.0, which
+     * is "definitely muted") — a host UI should hide/disable a volume
+     * slider rather than show it pinned at zero in that case.
+     */
+    public var volumePercent: Float?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(title: String?, artist: String?, album: String?, artwork: Data, isPlaying: Bool) {
+    public init(title: String?, artist: String?, album: String?, artwork: Data, isPlaying: Bool, 
+        /**
+         * Elapsed position, milliseconds into the current track. Already
+         * corrected for the "stale snapshot" gap in the underlying platform
+         * APIs (see `media_mac.rs`/`media_windows.rs`) — safe to treat as the
+         * real live position at the moment this event was received, not a
+         * value that needs its own platform-specific interpolation on the
+         * host side. It *will* still lag reality between updates (the
+         * now-playing watcher polls every 1.5s) — animate it forward
+         * client-side using the host's own clock for a smooth progress bar
+         * between real updates, the same anchor-timestamp approach already
+         * used for `SyncEvent::PeerActivity`'s "active Ns ago".
+         */positionMs: UInt64, 
+        /**
+         * Total track length, milliseconds — 0 if unknown (live stream, or
+         * nothing playing).
+         */durationMs: UInt64, 
+        /**
+         * Current output/session volume, 0.0–1.0. `null` when the sending
+         * platform doesn't report a readable level (distinct from 0.0, which
+         * is "definitely muted") — a host UI should hide/disable a volume
+         * slider rather than show it pinned at zero in that case.
+         */volumePercent: Float?) {
         self.title = title
         self.artist = artist
         self.album = album
         self.artwork = artwork
         self.isPlaying = isPlaying
+        self.positionMs = positionMs
+        self.durationMs = durationMs
+        self.volumePercent = volumePercent
     }
 }
 
@@ -1333,6 +1420,15 @@ extension FfiNowPlayingInfo: Equatable, Hashable {
         if lhs.isPlaying != rhs.isPlaying {
             return false
         }
+        if lhs.positionMs != rhs.positionMs {
+            return false
+        }
+        if lhs.durationMs != rhs.durationMs {
+            return false
+        }
+        if lhs.volumePercent != rhs.volumePercent {
+            return false
+        }
         return true
     }
 
@@ -1342,6 +1438,9 @@ extension FfiNowPlayingInfo: Equatable, Hashable {
         hasher.combine(album)
         hasher.combine(artwork)
         hasher.combine(isPlaying)
+        hasher.combine(positionMs)
+        hasher.combine(durationMs)
+        hasher.combine(volumePercent)
     }
 }
 
@@ -1357,7 +1456,10 @@ public struct FfiConverterTypeFfiNowPlayingInfo: FfiConverterRustBuffer {
                 artist: FfiConverterOptionString.read(from: &buf), 
                 album: FfiConverterOptionString.read(from: &buf), 
                 artwork: FfiConverterData.read(from: &buf), 
-                isPlaying: FfiConverterBool.read(from: &buf)
+                isPlaying: FfiConverterBool.read(from: &buf), 
+                positionMs: FfiConverterUInt64.read(from: &buf), 
+                durationMs: FfiConverterUInt64.read(from: &buf), 
+                volumePercent: FfiConverterOptionFloat.read(from: &buf)
         )
     }
 
@@ -1367,6 +1469,9 @@ public struct FfiConverterTypeFfiNowPlayingInfo: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.album, into: &buf)
         FfiConverterData.write(value.artwork, into: &buf)
         FfiConverterBool.write(value.isPlaying, into: &buf)
+        FfiConverterUInt64.write(value.positionMs, into: &buf)
+        FfiConverterUInt64.write(value.durationMs, into: &buf)
+        FfiConverterOptionFloat.write(value.volumePercent, into: &buf)
     }
 }
 
@@ -1455,6 +1560,12 @@ public enum FfiMediaCommand {
     case previous
     case volumeUp
     case volumeDown
+    /**
+     * Absolute jump, not relative — sent once when the user releases a
+     * scrub/seek gesture, not on every drag movement.
+     */
+    case seek(positionMs: UInt64
+    )
 }
 
 
@@ -1477,6 +1588,9 @@ public struct FfiConverterTypeFfiMediaCommand: FfiConverterRustBuffer {
         case 4: return .volumeUp
         
         case 5: return .volumeDown
+        
+        case 6: return .seek(positionMs: try FfiConverterUInt64.read(from: &buf)
+        )
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -1505,6 +1619,11 @@ public struct FfiConverterTypeFfiMediaCommand: FfiConverterRustBuffer {
         case .volumeDown:
             writeInt(&buf, Int32(5))
         
+        
+        case let .seek(positionMs):
+            writeInt(&buf, Int32(6))
+            FfiConverterUInt64.write(positionMs, into: &buf)
+            
         }
     }
 }
@@ -1571,6 +1690,10 @@ public enum FfiSyncEvent {
     case peerDiscovered(device: FfiDeviceInfo
     )
     case peerActivity(peerId: String, secondsSinceActivity: UInt64
+    )
+    case wasRevoked(peerId: String, peerName: String
+    )
+    case revokedByPeer(peerId: String, peerName: String
     )
 }
 
@@ -1639,6 +1762,12 @@ public struct FfiConverterTypeFfiSyncEvent: FfiConverterRustBuffer {
         )
         
         case 19: return .peerActivity(peerId: try FfiConverterString.read(from: &buf), secondsSinceActivity: try FfiConverterUInt64.read(from: &buf)
+        )
+        
+        case 20: return .wasRevoked(peerId: try FfiConverterString.read(from: &buf), peerName: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 21: return .revokedByPeer(peerId: try FfiConverterString.read(from: &buf), peerName: try FfiConverterString.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -1755,6 +1884,18 @@ public struct FfiConverterTypeFfiSyncEvent: FfiConverterRustBuffer {
             FfiConverterString.write(peerId, into: &buf)
             FfiConverterUInt64.write(secondsSinceActivity, into: &buf)
             
+        
+        case let .wasRevoked(peerId,peerName):
+            writeInt(&buf, Int32(20))
+            FfiConverterString.write(peerId, into: &buf)
+            FfiConverterString.write(peerName, into: &buf)
+            
+        
+        case let .revokedByPeer(peerId,peerName):
+            writeInt(&buf, Int32(21))
+            FfiConverterString.write(peerId, into: &buf)
+            FfiConverterString.write(peerName, into: &buf)
+            
         }
     }
 }
@@ -1779,6 +1920,30 @@ public func FfiConverterTypeFfiSyncEvent_lower(_ value: FfiSyncEvent) -> RustBuf
 extension FfiSyncEvent: Equatable, Hashable {}
 
 
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionFloat: FfiConverterRustBuffer {
+    typealias SwiftType = Float?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterFloat.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterFloat.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
@@ -1885,6 +2050,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_continuity_ffi_checksum_method_continuityengine_reset() != 40739) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_continuity_ffi_checksum_method_continuityengine_revoke_device() != 18662) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_continuity_ffi_checksum_method_continuityengine_send_file() != 32648) {

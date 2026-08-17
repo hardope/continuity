@@ -83,6 +83,9 @@ pub enum FfiMediaCommand {
     Previous,
     VolumeUp,
     VolumeDown,
+    /// Absolute jump, not relative — sent once when the user releases a
+    /// scrub/seek gesture, not on every drag movement.
+    Seek { position_ms: u64 },
 }
 
 impl From<FfiMediaCommand> for CoreMediaCommand {
@@ -93,6 +96,7 @@ impl From<FfiMediaCommand> for CoreMediaCommand {
             FfiMediaCommand::Previous => CoreMediaCommand::Previous,
             FfiMediaCommand::VolumeUp => CoreMediaCommand::VolumeUp,
             FfiMediaCommand::VolumeDown => CoreMediaCommand::VolumeDown,
+            FfiMediaCommand::Seek { position_ms } => CoreMediaCommand::Seek { position_ms },
         }
     }
 }
@@ -108,6 +112,25 @@ pub struct FfiNowPlayingInfo {
     pub album: Option<String>,
     pub artwork: Vec<u8>,
     pub is_playing: bool,
+    /// Elapsed position, milliseconds into the current track. Already
+    /// corrected for the "stale snapshot" gap in the underlying platform
+    /// APIs (see `media_mac.rs`/`media_windows.rs`) — safe to treat as the
+    /// real live position at the moment this event was received, not a
+    /// value that needs its own platform-specific interpolation on the
+    /// host side. It *will* still lag reality between updates (the
+    /// now-playing watcher polls every 1.5s) — animate it forward
+    /// client-side using the host's own clock for a smooth progress bar
+    /// between real updates, the same anchor-timestamp approach already
+    /// used for `SyncEvent::PeerActivity`'s "active Ns ago".
+    pub position_ms: u64,
+    /// Total track length, milliseconds — 0 if unknown (live stream, or
+    /// nothing playing).
+    pub duration_ms: u64,
+    /// Current output/session volume, 0.0–1.0. `null` when the sending
+    /// platform doesn't report a readable level (distinct from 0.0, which
+    /// is "definitely muted") — a host UI should hide/disable a volume
+    /// slider rather than show it pinned at zero in that case.
+    pub volume_percent: Option<f32>,
 }
 
 impl From<continuity_proto::NowPlayingInfo> for FfiNowPlayingInfo {
@@ -118,6 +141,9 @@ impl From<continuity_proto::NowPlayingInfo> for FfiNowPlayingInfo {
             album: i.album,
             artwork: i.artwork,
             is_playing: i.is_playing,
+            position_ms: i.position_ms,
+            duration_ms: i.duration_ms,
+            volume_percent: i.volume_percent,
         }
     }
 }
@@ -143,6 +169,8 @@ pub enum FfiSyncEvent {
     NowPlayingChanged { peer_id: String, peer_name: String, info: FfiNowPlayingInfo },
     PeerDiscovered { device: FfiDeviceInfo },
     PeerActivity { peer_id: String, seconds_since_activity: u64 },
+    WasRevoked { peer_id: String, peer_name: String },
+    RevokedByPeer { peer_id: String, peer_name: String },
 }
 
 impl From<continuity_daemon::SyncEvent> for FfiSyncEvent {
@@ -180,6 +208,8 @@ impl From<continuity_daemon::SyncEvent> for FfiSyncEvent {
             E::PeerActivity { peer_id, seconds_since_activity } => {
                 FfiSyncEvent::PeerActivity { peer_id, seconds_since_activity }
             }
+            E::WasRevoked { peer_id, peer_name } => FfiSyncEvent::WasRevoked { peer_id, peer_name },
+            E::RevokedByPeer { peer_id, peer_name } => FfiSyncEvent::RevokedByPeer { peer_id, peer_name },
         }
     }
 }
@@ -356,6 +386,14 @@ impl ContinuityEngine {
     /// that should be nearby isn't showing up yet.
     pub fn refresh_discovery(&self) {
         let _ = self.commands.send(EngineCommand::RefreshDiscovery);
+    }
+
+    /// Forgets one specific paired device and closes its connection now —
+    /// unlike `reset`, every other paired device is untouched. There's no
+    /// undo; the host app should confirm with the user before calling
+    /// this, same as `reset`.
+    pub fn revoke_device(&self, peer_id: String) {
+        let _ = self.commands.send(EngineCommand::RevokeDevice { peer_crypto_id: peer_id });
     }
 }
 

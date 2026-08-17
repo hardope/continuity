@@ -34,6 +34,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -54,6 +55,7 @@ import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PauseCircle
+import androidx.compose.material.icons.filled.PersonRemove
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material.icons.filled.PlayArrow
@@ -78,6 +80,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -102,6 +105,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.ContextCompat
@@ -171,6 +175,16 @@ private data class DeviceStatus(
     val lastActivityAtMillis: Long? = null,
 )
 
+/** A [uniffi.continuity_ffi.FfiNowPlayingInfo] plus the wall-clock moment
+ * it arrived — [FullScreenNowPlayingDialog] needs this to animate the
+ * progress bar forward between real updates (the now-playing watcher only
+ * pushes a fresh one every 1.5s) without waiting on the next network
+ * update to move the slider at all. */
+private data class NowPlayingSnapshot(
+    val info: uniffi.continuity_ffi.FfiNowPlayingInfo,
+    val receivedAtMillis: Long,
+)
+
 /** Who a "Send File" action targets, chosen via the device picker when
  * more than one device is connected. */
 private sealed class SendTarget {
@@ -185,11 +199,14 @@ private fun ContinuityScreen(onFilePickerRequested: ((Uri) -> Unit) -> Unit) {
     var deviceId by remember { mutableStateOf<String?>(null) }
     val devices = remember { mutableStateMapOf<String, DeviceStatus>() }
     val nearby = remember { mutableStateMapOf<String, String>() }
-    val nowPlaying = remember { mutableStateMapOf<String, uniffi.continuity_ffi.FfiNowPlayingInfo>() }
+    val nowPlaying = remember { mutableStateMapOf<String, NowPlayingSnapshot>() }
     var pendingPairing by remember { mutableStateOf<Pair<uniffi.continuity_ffi.FfiDeviceInfo, String>?>(null) }
     var isPaused by remember { mutableStateOf(false) }
     var showResetConfirm by remember { mutableStateOf(false) }
     var showDevicePicker by remember { mutableStateOf(false) }
+    // (peerId, name) of the device a "Forget" tap is asking to confirm —
+    // null when no confirmation is pending.
+    var pendingForget by remember { mutableStateOf<Pair<String, String>?>(null) }
     var activityExpanded by remember { mutableStateOf(false) }
     var fullScreenPlayerPeerId by remember { mutableStateOf<String?>(null) }
     val activity = remember { mutableStateListOf<ActivityEntry>() }
@@ -272,7 +289,7 @@ private fun ContinuityScreen(onFilePickerRequested: ((Uri) -> Unit) -> Unit) {
                     activity.add(0, ActivityEntry(Icons.Default.Error, "Couldn't reconnect to '$name' — not seen on the network yet", warningColor))
                 }
                 is FfiSyncEvent.NowPlayingChanged -> {
-                    nowPlaying[event.peerId] = event.info
+                    nowPlaying[event.peerId] = NowPlayingSnapshot(event.info, System.currentTimeMillis())
                 }
                 is FfiSyncEvent.PeerActivity -> {
                     devices[event.peerId]?.let {
@@ -280,6 +297,20 @@ private fun ContinuityScreen(onFilePickerRequested: ((Uri) -> Unit) -> Unit) {
                             lastActivityAtMillis = System.currentTimeMillis() - event.secondsSinceActivity.toLong() * 1000,
                         )
                     }
+                }
+                is FfiSyncEvent.WasRevoked -> {
+                    // Unlike a plain Disconnected, the entry is removed
+                    // outright rather than marked offline — the device is
+                    // forgotten, reconnecting now means pairing again from
+                    // scratch, so a "Reconnect" button here would be a lie.
+                    devices.remove(event.peerId)
+                    nowPlaying.remove(event.peerId)
+                    activity.add(0, ActivityEntry(Icons.Default.PersonRemove, "Forgot '${event.peerName}'", warningColor))
+                }
+                is FfiSyncEvent.RevokedByPeer -> {
+                    devices.remove(event.peerId)
+                    nowPlaying.remove(event.peerId)
+                    activity.add(0, ActivityEntry(Icons.Default.PersonRemove, "'${event.peerName}' removed this device", warningColor))
                 }
                 else -> {}
             }
@@ -368,9 +399,12 @@ private fun ContinuityScreen(onFilePickerRequested: ((Uri) -> Unit) -> Unit) {
                 devices = devices,
                 nowPlaying = nowPlaying,
                 nowMillis = nowMillis,
+                hasNearby = nearby.isNotEmpty(),
                 successColor = successColor,
+                warningColor = warningColor,
                 onDisconnect = { peerId -> EngineHolder.engine?.disconnectPeer(peerId) },
                 onReconnect = { peerId -> EngineHolder.engine?.reconnectPeer(peerId) },
+                onForget = { peerId, name -> pendingForget = peerId to name },
                 onMediaCommand = { peerId, command -> EngineHolder.engine?.sendMediaCommand(peerId, command) },
                 onOpenFullScreenPlayer = { peerId -> fullScreenPlayerPeerId = peerId },
             )
@@ -436,16 +470,29 @@ private fun ContinuityScreen(onFilePickerRequested: ((Uri) -> Unit) -> Unit) {
                         shape = MaterialTheme.shapes.medium,
                     ) {
                         Text(
-                            code,
+                            // Grouped into pairs ("12 34 56") rather than a
+                            // solid run of six digits — a solid run is easy
+                            // to skim-match on a superficial "same length,
+                            // similar shape" glance instead of actually
+                            // comparing every digit, which is the one thing
+                            // that makes this confirmation step meaningful
+                            // at all (see continuity-crypto::pairing).
+                            code.chunked(2).joinToString(" "),
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .padding(vertical = 12.dp),
-                            style = MaterialTheme.typography.headlineSmall,
+                                .padding(vertical = 16.dp),
+                            style = MaterialTheme.typography.displaySmall,
+                            fontWeight = androidx.compose.ui.text.font.FontWeight.Bold,
+                            letterSpacing = 4.sp,
                             color = MaterialTheme.colorScheme.onPrimaryContainer,
                             textAlign = androidx.compose.ui.text.style.TextAlign.Center,
                         )
                     }
-                    Text("Does this match the code shown on the other device?")
+                    Text(
+                        "Only confirm if every digit matches the code shown on '${peer.name}' — this is what proves it's really that device.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
             },
             confirmButton = {
@@ -482,6 +529,29 @@ private fun ContinuityScreen(onFilePickerRequested: ((Uri) -> Unit) -> Unit) {
             },
             dismissButton = {
                 TextButton(onClick = { showResetConfirm = false }) { Text("Cancel") }
+            },
+        )
+    }
+
+    pendingForget?.let { (peerId, name) ->
+        AlertDialog(
+            onDismissRequest = { pendingForget = null },
+            icon = { Icon(Icons.Default.PersonRemove, contentDescription = null) },
+            title = { Text("Forget '$name'?") },
+            text = {
+                Text(
+                    "This closes the connection now and forgets this device. " +
+                        "It'll need to be paired again from scratch to reconnect.\n\nAre you sure?",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    EngineHolder.engine?.revokeDevice(peerId)
+                    pendingForget = null
+                }) { Text("Forget") }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingForget = null }) { Text("Cancel") }
             },
         )
     }
@@ -538,7 +608,7 @@ private fun ContinuityScreen(onFilePickerRequested: ((Uri) -> Unit) -> Unit) {
         } else {
             FullScreenNowPlayingDialog(
                 deviceName = status.name,
-                info = nowPlaying[fullScreenPeerId],
+                snapshot = nowPlaying[fullScreenPeerId],
                 onDismiss = { fullScreenPlayerPeerId = null },
                 onMediaCommand = { command -> EngineHolder.engine?.sendMediaCommand(fullScreenPeerId, command) },
             )
@@ -596,14 +666,38 @@ private fun activityLabel(lastActivityAtMillis: Long?, nowMillis: Long): String 
     }
 }
 
+/** Three-tier status color, aligned with [activityLabel]'s own tiers so the
+ * dot and the text it sits next to always agree: green while the label
+ * would say "just now"/"Ns ago" (<60s since the last ping heartbeat),
+ * amber once it's aged into "Nm ago"/"Nh ago", neutral when disconnected.
+ * A connection that's actually gone stale doesn't linger in amber long —
+ * `CONNECTION_READ_TIMEOUT` tears it down well before the label would
+ * reach the hour mark. */
+private fun activityColor(
+    connected: Boolean,
+    lastActivityAtMillis: Long?,
+    nowMillis: Long,
+    successColor: Color,
+    warningColor: Color,
+    neutralColor: Color,
+): Color {
+    if (!connected) return neutralColor
+    val anchor = lastActivityAtMillis ?: return successColor
+    val secondsAgo = (nowMillis - anchor) / 1000
+    return if (secondsAgo < 60) successColor else warningColor
+}
+
 @Composable
 private fun DeviceListCard(
     devices: Map<String, DeviceStatus>,
-    nowPlaying: Map<String, uniffi.continuity_ffi.FfiNowPlayingInfo>,
+    nowPlaying: Map<String, NowPlayingSnapshot>,
     nowMillis: Long,
+    hasNearby: Boolean,
     successColor: Color,
+    warningColor: Color,
     onDisconnect: (String) -> Unit,
     onReconnect: (String) -> Unit,
+    onForget: (peerId: String, name: String) -> Unit,
     onMediaCommand: (peerId: String, command: uniffi.continuity_ffi.FfiMediaCommand) -> Unit,
     onOpenFullScreenPlayer: (String) -> Unit,
 ) {
@@ -612,15 +706,48 @@ private fun DeviceListCard(
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
     ) {
         if (devices.isEmpty()) {
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(16.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
-            ) {
-                CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
-                Column {
-                    Text("Waiting", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Text("No device connected", style = MaterialTheme.typography.titleMedium)
+            // Two genuinely different situations were both rendering as the
+            // same bare spinner before: "nothing paired, nothing nearby
+            // either" (nothing is actually in progress — a spinner there
+            // reads as broken, not as waiting) vs "a device is right there
+            // in Nearby Devices, this card is just waiting on a tap." Only
+            // the second one is actually "waiting" on something.
+            if (hasNearby) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                    Column {
+                        Text("Waiting", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text("Tap a nearby device above to connect", style = MaterialTheme.typography.titleMedium)
+                    }
+                }
+            } else {
+                Column(
+                    modifier = Modifier.fillMaxWidth().padding(20.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    Icon(
+                        Icons.Default.Sensors,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(28.dp),
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        "No devices nearby yet",
+                        style = MaterialTheme.typography.titleMedium,
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                    )
+                    Spacer(Modifier.height(2.dp))
+                    Text(
+                        "Open Continuity on another device on the same Wi-Fi network to get started.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                    )
                 }
             }
         } else {
@@ -636,7 +763,14 @@ private fun DeviceListCard(
                             Icon(
                                 if (status.connected) Icons.Default.CheckCircle else Icons.Default.LinkOff,
                                 contentDescription = null,
-                                tint = if (status.connected) successColor else MaterialTheme.colorScheme.onSurfaceVariant,
+                                tint = activityColor(
+                                    connected = status.connected,
+                                    lastActivityAtMillis = status.lastActivityAtMillis,
+                                    nowMillis = nowMillis,
+                                    successColor = successColor,
+                                    warningColor = warningColor,
+                                    neutralColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                ),
                             )
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(status.name, style = MaterialTheme.typography.titleMedium)
@@ -655,6 +789,13 @@ private fun DeviceListCard(
                                     Text("Reconnect")
                                 }
                             }
+                            IconButton(onClick = { onForget(peerId, status.name) }) {
+                                Icon(
+                                    Icons.Default.PersonRemove,
+                                    contentDescription = "Forget ${status.name}",
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
                         }
                         // Media control works against macOS, Windows, and Linux
                         // desktop peers (see core/continuityd/src/media_*.rs) —
@@ -662,22 +803,22 @@ private fun DeviceListCard(
                         // than shown and silently doing nothing.
                         val mediaCapablePlatform = status.platform == "mac_os" || status.platform == "windows" || status.platform == "linux"
                         if (status.connected && mediaCapablePlatform) {
-                            NowPlayingRow(info = nowPlaying[peerId], onClick = { onOpenFullScreenPlayer(peerId) })
+                            NowPlayingRow(info = nowPlaying[peerId]?.info, onClick = { onOpenFullScreenPlayer(peerId) })
                             Row(
                                 modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
                                 horizontalArrangement = Arrangement.Center,
                             ) {
-                                IconButton(onClick = { onMediaCommand(peerId, uniffi.continuity_ffi.FfiMediaCommand.PREVIOUS) }) {
+                                IconButton(onClick = { onMediaCommand(peerId, uniffi.continuity_ffi.FfiMediaCommand.Previous) }) {
                                     Icon(Icons.Default.SkipPrevious, contentDescription = "Previous")
                                 }
-                                IconButton(onClick = { onMediaCommand(peerId, uniffi.continuity_ffi.FfiMediaCommand.PLAY_PAUSE) }) {
-                                    val isPlaying = nowPlaying[peerId]?.isPlaying == true
+                                IconButton(onClick = { onMediaCommand(peerId, uniffi.continuity_ffi.FfiMediaCommand.PlayPause) }) {
+                                    val isPlaying = nowPlaying[peerId]?.info?.isPlaying == true
                                     Icon(
                                         if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
                                         contentDescription = if (isPlaying) "Pause" else "Play",
                                     )
                                 }
-                                IconButton(onClick = { onMediaCommand(peerId, uniffi.continuity_ffi.FfiMediaCommand.NEXT) }) {
+                                IconButton(onClick = { onMediaCommand(peerId, uniffi.continuity_ffi.FfiMediaCommand.Next) }) {
                                     Icon(Icons.Default.SkipNext, contentDescription = "Next")
                                 }
                             }
@@ -756,18 +897,25 @@ private fun NowPlayingRow(info: uniffi.continuity_ffi.FfiNowPlayingInfo?, onClic
 }
 
 /// Opened by tapping a device's now-playing row — same transport controls
-/// as the inline row, at a bigger, focused scale, plus volume (which the
-/// inline row doesn't have room for). Volume is step-based, not a synced
-/// slider — see MediaCommand::VolumeUp/VolumeDown in continuity-proto for
-/// why (in short: no cross-platform "read the current level" story yet
-/// that's worth the complexity for a first version).
+/// as the inline row, at a bigger, focused scale, plus a scrubbable
+/// progress bar and a volume level (neither of which the compact inline
+/// row has room for).
+///
+/// Volume is still only *controlled* via step commands
+/// (MediaCommand::VolumeUp/VolumeDown) — there's no "set absolute volume"
+/// command, so the volume slider here is a disabled, read-only display of
+/// the level reported back by the host, not itself draggable. Seeking is
+/// different: MediaCommand::Seek takes an absolute position, so the
+/// progress slider *is* draggable, sending one Seek command on release
+/// (not continuously while dragging).
 @Composable
 private fun FullScreenNowPlayingDialog(
     deviceName: String,
-    info: uniffi.continuity_ffi.FfiNowPlayingInfo?,
+    snapshot: NowPlayingSnapshot?,
     onDismiss: () -> Unit,
     onMediaCommand: (uniffi.continuity_ffi.FfiMediaCommand) -> Unit,
 ) {
+    val info = snapshot?.info
     Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
         Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.surface) {
             Column(
@@ -830,37 +978,139 @@ private fun FullScreenNowPlayingDialog(
                     Text(artist, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
 
-                Spacer(Modifier.height(32.dp))
+                Spacer(Modifier.height(24.dp))
+
+                val durationMs = (info?.durationMs ?: 0uL).toLong()
+                // Ticks independently of whether anything's actually
+                // playing (cheap — just a state write every 250ms while
+                // this dialog is open) rather than gating the effect on
+                // `isPlaying`, so it doesn't need restarting every time
+                // play/pause toggles.
+                var tickNowMillis by remember { mutableStateOf(System.currentTimeMillis()) }
+                LaunchedEffect(Unit) {
+                    while (true) {
+                        delay(250)
+                        tickNowMillis = System.currentTimeMillis()
+                    }
+                }
+                // The position in `info` is only as fresh as the last
+                // NowPlayingUpdate (the watcher polls every 1.5s) — while
+                // playing, animate forward from it using this device's own
+                // clock so the bar moves smoothly between real updates
+                // instead of visibly jumping every 1.5s.
+                val livePositionMs = remember(snapshot, tickNowMillis) {
+                    val base = (info?.positionMs ?: 0uL).toLong()
+                    if (snapshot != null && snapshot.info.isPlaying) {
+                        val projected = base + (tickNowMillis - snapshot.receivedAtMillis)
+                        projected.coerceIn(0, if (durationMs > 0) durationMs else Long.MAX_VALUE)
+                    } else {
+                        base
+                    }
+                }
+                var isDraggingPosition by remember { mutableStateOf(false) }
+                var dragPositionMs by remember { mutableStateOf(0L) }
+                // While the user has a finger on the slider, show exactly
+                // where they've dragged it to, not the live-ticking value —
+                // otherwise playback continuing during the drag would fight
+                // the user's own gesture.
+                val displayedPositionMs = if (isDraggingPosition) dragPositionMs else livePositionMs
+
+                Column(modifier = Modifier.fillMaxWidth(0.85f)) {
+                    Slider(
+                        value = displayedPositionMs.toFloat(),
+                        onValueChange = {
+                            isDraggingPosition = true
+                            dragPositionMs = it.toLong()
+                        },
+                        onValueChangeFinished = {
+                            onMediaCommand(uniffi.continuity_ffi.FfiMediaCommand.Seek(dragPositionMs.toULong()))
+                            isDraggingPosition = false
+                        },
+                        valueRange = 0f..durationMs.coerceAtLeast(1).toFloat(),
+                        enabled = durationMs > 0,
+                    )
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text(
+                            formatDuration(displayedPositionMs),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Text(
+                            formatDuration(durationMs),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+
+                Spacer(Modifier.height(24.dp))
 
                 Row(horizontalArrangement = Arrangement.spacedBy(24.dp), verticalAlignment = Alignment.CenterVertically) {
-                    IconButton(onClick = { onMediaCommand(uniffi.continuity_ffi.FfiMediaCommand.PREVIOUS) }, modifier = Modifier.size(56.dp)) {
+                    IconButton(onClick = { onMediaCommand(uniffi.continuity_ffi.FfiMediaCommand.Previous) }, modifier = Modifier.size(56.dp)) {
                         Icon(Icons.Default.SkipPrevious, contentDescription = "Previous", modifier = Modifier.size(36.dp))
                     }
                     val isPlaying = info?.isPlaying == true
-                    FilledIconButton(onClick = { onMediaCommand(uniffi.continuity_ffi.FfiMediaCommand.PLAY_PAUSE) }, modifier = Modifier.size(72.dp)) {
+                    FilledIconButton(onClick = { onMediaCommand(uniffi.continuity_ffi.FfiMediaCommand.PlayPause) }, modifier = Modifier.size(72.dp)) {
                         Icon(
                             if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
                             contentDescription = if (isPlaying) "Pause" else "Play",
                             modifier = Modifier.size(40.dp),
                         )
                     }
-                    IconButton(onClick = { onMediaCommand(uniffi.continuity_ffi.FfiMediaCommand.NEXT) }, modifier = Modifier.size(56.dp)) {
+                    IconButton(onClick = { onMediaCommand(uniffi.continuity_ffi.FfiMediaCommand.Next) }, modifier = Modifier.size(56.dp)) {
                         Icon(Icons.Default.SkipNext, contentDescription = "Next", modifier = Modifier.size(36.dp))
                     }
                 }
 
                 Spacer(Modifier.height(32.dp))
 
+                // `volumePercent == null` means this peer's platform
+                // doesn't report a readable level (see
+                // FfiNowPlayingInfo.volumePercent) — the +/- buttons still
+                // work either way (they don't depend on knowing the
+                // current level), just without a bar to show alongside
+                // them.
+                val volumePercent = info?.volumePercent
                 Row(
-                    modifier = Modifier.fillMaxWidth(0.7f),
-                    horizontalArrangement = Arrangement.SpaceBetween,
+                    modifier = Modifier.fillMaxWidth(0.85f),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    IconButton(onClick = { onMediaCommand(uniffi.continuity_ffi.FfiMediaCommand.VOLUME_DOWN) }) {
+                    IconButton(onClick = { onMediaCommand(uniffi.continuity_ffi.FfiMediaCommand.VolumeDown) }) {
                         Icon(Icons.AutoMirrored.Filled.VolumeDown, contentDescription = "Volume down")
                     }
-                    Text("Volume", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    IconButton(onClick = { onMediaCommand(uniffi.continuity_ffi.FfiMediaCommand.VOLUME_UP) }) {
+                    if (volumePercent != null) {
+                        // Disabled, not draggable — this reflects the
+                        // actual output level (read back from the host,
+                        // see MediaCommand::VolumeUp/VolumeDown in
+                        // continuity-proto), it isn't itself a control.
+                        // Dragging it wouldn't do anything since there's no
+                        // "set absolute volume" command, which would be
+                        // confusing on a slider that otherwise looks
+                        // interactive.
+                        Slider(
+                            value = volumePercent,
+                            onValueChange = {},
+                            enabled = false,
+                            valueRange = 0f..1f,
+                            modifier = Modifier.weight(1f),
+                        )
+                        Text(
+                            "${(volumePercent * 100).toInt()}%",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.widthIn(min = 36.dp),
+                        )
+                    } else {
+                        Text(
+                            "Volume",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.weight(1f),
+                            textAlign = TextAlign.Center,
+                        )
+                    }
+                    IconButton(onClick = { onMediaCommand(uniffi.continuity_ffi.FfiMediaCommand.VolumeUp) }) {
                         Icon(Icons.AutoMirrored.Filled.VolumeUp, contentDescription = "Volume up")
                     }
                 }
@@ -869,6 +1119,13 @@ private fun FullScreenNowPlayingDialog(
             }
         }
     }
+}
+
+private fun formatDuration(ms: Long): String {
+    val totalSeconds = (ms / 1000).coerceAtLeast(0)
+    val minutes = totalSeconds / 60
+    val seconds = totalSeconds % 60
+    return "%d:%02d".format(minutes, seconds)
 }
 
 @Composable
