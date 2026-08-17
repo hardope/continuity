@@ -49,6 +49,13 @@ pub enum SyncEvent {
     /// address to dial). May fire more than once for the same device as
     /// mDNS re-announces it; a shell should upsert by id, not append.
     PeerDiscovered { device: DeviceInfo },
+    /// A connection health heartbeat for a connected peer, so a shell can
+    /// show something like "active just now" / "idle 2m" instead of just a
+    /// binary connected/disconnected dot. Piggybacks on the connection's
+    /// own internal keepalive ping tick (see `PING_INTERVAL` in
+    /// `engine.rs`), so it fires at that same bounded rate per peer — no
+    /// separate timer, no risk of flooding a host UI.
+    PeerActivity { peer_id: String, seconds_since_activity: u64 },
 }
 
 /// Requests a shell makes of the engine. Sent over the channel returned by
@@ -92,4 +99,14 @@ pub enum EngineCommand {
     /// broadcast/multicast hiccup, not something this can diagnose or fix
     /// on its own, just retry sooner than the automatic interval would).
     RefreshDiscovery,
+    /// Sent internally by the network-interface watcher when the host's
+    /// set of local IP addresses changes (Wi-Fi network switch, VPN
+    /// connect/disconnect, cable plugged/unplugged) — the same signal
+    /// `RefreshDiscovery` gives a user-initiated button for, but firing on
+    /// its own instead of waiting for either the user or the periodic
+    /// reconnect ticker to notice. Also prompts the mDNS browse task to
+    /// recreate its `ServiceDaemon`, since a `ServiceDaemon` created before
+    /// a network change can keep multicasting on an interface that no
+    /// longer exists instead of the new one.
+    NetworkChanged,
 }

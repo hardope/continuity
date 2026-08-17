@@ -1570,6 +1570,8 @@ public enum FfiSyncEvent {
     )
     case peerDiscovered(device: FfiDeviceInfo
     )
+    case peerActivity(peerId: String, secondsSinceActivity: UInt64
+    )
 }
 
 
@@ -1634,6 +1636,9 @@ public struct FfiConverterTypeFfiSyncEvent: FfiConverterRustBuffer {
         )
         
         case 18: return .peerDiscovered(device: try FfiConverterTypeFfiDeviceInfo.read(from: &buf)
+        )
+        
+        case 19: return .peerActivity(peerId: try FfiConverterString.read(from: &buf), secondsSinceActivity: try FfiConverterUInt64.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -1743,6 +1748,12 @@ public struct FfiConverterTypeFfiSyncEvent: FfiConverterRustBuffer {
         case let .peerDiscovered(device):
             writeInt(&buf, Int32(18))
             FfiConverterTypeFfiDeviceInfo.write(device, into: &buf)
+            
+        
+        case let .peerActivity(peerId,secondsSinceActivity):
+            writeInt(&buf, Int32(19))
+            FfiConverterString.write(peerId, into: &buf)
+            FfiConverterUInt64.write(secondsSinceActivity, into: &buf)
             
         }
     }

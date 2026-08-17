@@ -5,9 +5,35 @@ use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{client::TlsStream as ClientTlsStream, server::TlsStream as ServerTlsStream};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+/// Applied to every socket, both directions — `TCP_NODELAY` because this
+/// protocol is almost entirely small, latency-sensitive messages (control
+/// messages, individual framed chunks) where Nagle's algorithm buffering
+/// them to coalesce with "more data soon" would only add latency for no
+/// bandwidth benefit; `SO_KEEPALIVE` as an OS-level safety net *underneath*
+/// the application-level ping/pong in `continuity-daemon`'s connection
+/// loop — the two are complementary, not redundant: the app-level ping
+/// shares a single ordered message stream with everything else this
+/// connection carries (so something backed up behind a large queued send
+/// could in principle still delay it, even with the send-side activity
+/// tracking that mitigates the worst of that), while `SO_KEEPALIVE`
+/// probes operate entirely at the OS/TCP level, immune to anything
+/// happening in this process's own message queue.
+fn tune_socket(stream: &TcpStream) {
+    if let Err(e) = stream.set_nodelay(true) {
+        tracing::debug!("couldn't set TCP_NODELAY: {e}");
+    }
+    let keepalive = socket2::TcpKeepalive::new().with_time(Duration::from_secs(60)).with_interval(Duration::from_secs(15));
+    #[cfg(not(target_os = "windows"))]
+    let keepalive = keepalive.with_retries(4);
+    if let Err(e) = socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive) {
+        tracing::debug!("couldn't set SO_KEEPALIVE: {e}");
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectionError {
@@ -281,6 +307,7 @@ impl Listener {
 
     pub async fn accept(&self) -> Result<(Connection, SocketAddr), ConnectionError> {
         let (tcp_stream, peer_addr) = self.tcp.accept().await?;
+        tune_socket(&tcp_stream);
         let tls_stream = self.acceptor.accept(tcp_stream).await?;
         Ok((Connection::Server(tls_stream), peer_addr))
     }
@@ -291,6 +318,7 @@ impl Listener {
 pub async fn connect(addr: SocketAddr, identity: &TlsIdentity) -> Result<Connection, ConnectionError> {
     let connector = TlsConnector::from(Arc::new(client_config(identity)?));
     let tcp_stream = TcpStream::connect(addr).await?;
+    tune_socket(&tcp_stream);
     // Server name is unused for verification (see AcceptAnyServerCert) but
     // still required by the rustls API shape; any well-formed name works.
     let server_name = ServerName::try_from("continuity.local")

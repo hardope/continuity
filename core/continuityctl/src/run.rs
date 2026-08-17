@@ -113,6 +113,10 @@ fn handle_event(event: SyncEvent, cli_state: &CliState) {
         SyncEvent::PeerDiscovered { device } => {
             println!("nearby (not paired): '{}' ({})", device.name, device.id);
         }
+        // Fires once per connection per ping interval (30s) — routine
+        // health telemetry, not worth printing on every tick in a CLI
+        // that otherwise logs real events.
+        SyncEvent::PeerActivity { .. } => {}
     }
 }
 

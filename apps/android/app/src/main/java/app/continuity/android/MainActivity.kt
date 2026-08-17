@@ -90,6 +90,7 @@ import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import kotlinx.coroutines.delay
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -155,8 +156,20 @@ private data class ActivityEntry(val icon: ImageVector, val text: String, val ti
 
 /** A device this session has seen connect at least once — stays in the
  * list (marked disconnected) after dropping so it can be reconnected,
- * rather than disappearing the moment it's no longer active. */
-private data class DeviceStatus(val name: String, val connected: Boolean, val platform: String)
+ * rather than disappearing the moment it's no longer active.
+ *
+ * [lastActivityAtMillis] is a wall-clock anchor derived from
+ * `FfiSyncEvent.PeerActivity.secondsSinceActivity` (`now - secondsAgo *
+ * 1000` at the moment the event arrived) rather than storing the raw
+ * seconds-ago figure — that number is only accurate the instant the event
+ * arrives and goes stale as time passes, whereas an anchor timestamp lets
+ * the UI recompute "how long ago" fresh on every recomposition. */
+private data class DeviceStatus(
+    val name: String,
+    val connected: Boolean,
+    val platform: String,
+    val lastActivityAtMillis: Long? = null,
+)
 
 /** Who a "Send File" action targets, chosen via the device picker when
  * more than one device is connected. */
@@ -180,6 +193,16 @@ private fun ContinuityScreen(onFilePickerRequested: ((Uri) -> Unit) -> Unit) {
     var activityExpanded by remember { mutableStateOf(false) }
     var fullScreenPlayerPeerId by remember { mutableStateOf<String?>(null) }
     val activity = remember { mutableStateListOf<ActivityEntry>() }
+    // Drives the "active Ns ago" labels in DeviceListCard — they're
+    // computed from a stored timestamp, not pushed on every tick, so
+    // nothing else causes them to recompose on their own as time passes.
+    var nowMillis by remember { mutableStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(15_000)
+            nowMillis = System.currentTimeMillis()
+        }
+    }
 
     val successColor = if (isSystemDark()) SuccessGreenDark else SuccessGreen
     val warningColor = if (isSystemDark()) WarningAmberDark else WarningAmber
@@ -250,6 +273,13 @@ private fun ContinuityScreen(onFilePickerRequested: ((Uri) -> Unit) -> Unit) {
                 }
                 is FfiSyncEvent.NowPlayingChanged -> {
                     nowPlaying[event.peerId] = event.info
+                }
+                is FfiSyncEvent.PeerActivity -> {
+                    devices[event.peerId]?.let {
+                        devices[event.peerId] = it.copy(
+                            lastActivityAtMillis = System.currentTimeMillis() - event.secondsSinceActivity.toLong() * 1000,
+                        )
+                    }
                 }
                 else -> {}
             }
@@ -337,6 +367,7 @@ private fun ContinuityScreen(onFilePickerRequested: ((Uri) -> Unit) -> Unit) {
             DeviceListCard(
                 devices = devices,
                 nowPlaying = nowPlaying,
+                nowMillis = nowMillis,
                 successColor = successColor,
                 onDisconnect = { peerId -> EngineHolder.engine?.disconnectPeer(peerId) },
                 onReconnect = { peerId -> EngineHolder.engine?.reconnectPeer(peerId) },
@@ -550,10 +581,26 @@ private fun NearbyDevicesCard(nearby: Map<String, String>, onConnect: (String) -
     }
 }
 
+/** `lastActivityAtMillis == null` means no `PeerActivity` heartbeat has
+ * arrived yet for this peer (e.g. it just connected, and the first one
+ * only fires on the connection's own ping-interval tick) — "Connected" is
+ * the honest label for that, not a fabricated "just now". */
+private fun activityLabel(lastActivityAtMillis: Long?, nowMillis: Long): String {
+    val anchor = lastActivityAtMillis ?: return "Connected"
+    val secondsAgo = ((nowMillis - anchor) / 1000).coerceAtLeast(0)
+    return when {
+        secondsAgo < 20 -> "Active just now"
+        secondsAgo < 60 -> "Active ${secondsAgo}s ago"
+        secondsAgo < 3600 -> "Active ${secondsAgo / 60}m ago"
+        else -> "Active ${secondsAgo / 3600}h ago"
+    }
+}
+
 @Composable
 private fun DeviceListCard(
     devices: Map<String, DeviceStatus>,
     nowPlaying: Map<String, uniffi.continuity_ffi.FfiNowPlayingInfo>,
+    nowMillis: Long,
     successColor: Color,
     onDisconnect: (String) -> Unit,
     onReconnect: (String) -> Unit,
@@ -594,7 +641,7 @@ private fun DeviceListCard(
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(status.name, style = MaterialTheme.typography.titleMedium)
                                 Text(
-                                    if (status.connected) "Connected" else "Disconnected",
+                                    if (status.connected) activityLabel(status.lastActivityAtMillis, nowMillis) else "Disconnected",
                                     style = MaterialTheme.typography.labelSmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )

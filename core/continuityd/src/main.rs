@@ -261,6 +261,10 @@ fn handle_sync_event(
             // app displaying a peer's.
             tracing::debug!("'{peer_name}' now playing: {info:?}");
         }
+        // No tray UI surface for this yet (see task #44 — Android-only so
+        // far); fires once per connection per ping interval (30s), too
+        // frequent to be worth a debug log line on its own.
+        SyncEvent::PeerActivity { .. } => {}
     }
 }
 

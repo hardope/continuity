@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::task::JoinHandle;
 
 const CHUNK_SIZE: usize = 64 * 1024;
@@ -68,7 +68,6 @@ pub struct EngineHandle {
     pub events: mpsc::UnboundedReceiver<SyncEvent>,
     commands_tx: mpsc::UnboundedSender<EngineCommand>,
     tasks: Vec<JoinHandle<()>>,
-    discovery: Discovery,
     state: Arc<SharedState>,
 }
 
@@ -85,6 +84,14 @@ impl EngineHandle {
     }
 
     pub fn shutdown(self) {
+        // Must happen before the aborts below: `task.abort()` can't
+        // preempt the clipboard/now-playing watchers, since they run on
+        // tokio's blocking thread pool and are already executing their
+        // loop bodies on a dedicated OS thread by the time shutdown is
+        // called — abort only stops a blocking task that hasn't started
+        // yet. Setting this flag lets them notice and exit on their own
+        // right after their next `std::thread::sleep` wakes up.
+        self.state.shutting_down.store(true, Ordering::Relaxed);
         for task in &self.tasks {
             task.abort();
         }
@@ -100,18 +107,51 @@ impl EngineHandle {
         for handle in self.state.connection_handles.lock().unwrap().values() {
             handle.abort();
         }
-        let _ = self.discovery.shutdown();
+        let _ = self.state.discovery.lock().unwrap().shutdown();
     }
 }
 
 struct SharedState {
     my_device: DeviceInfo,
     tls_identity: TlsIdentity,
+    /// Behind a `Mutex` (not just owned by `EngineHandle` like it used to
+    /// be) so the browse task can swap in a freshly recreated `Discovery`
+    /// after the mDNS daemon dies — see the recovery loop around the
+    /// browse task below. `shutdown()` reaches it through `state` now
+    /// instead of `EngineHandle` holding its own copy.
+    discovery: Mutex<Discovery>,
+    /// Notified by the network-change watcher (and by the mDNS
+    /// channel-death recovery path reusing the same signal) whenever the
+    /// browse task should tear down and recreate its `Discovery` early
+    /// instead of waiting for the channel to actually die. See the browse
+    /// task below.
+    discovery_recreate: Notify,
     trust_store: Mutex<TrustStore>,
     /// Cryptographic peer ids with an active connection — the authoritative
     /// dedup point (see `continuity-net`'s pairing docs for why this can't
     /// just be the pre-handshake mDNS-advertised id).
     connected: Mutex<HashSet<String>>,
+    /// Peer ids with an outbound dial currently in flight (from `connect()`
+    /// starting through `handle_connection` finishing, success or failure)
+    /// — see `try_claim_dial`. **Real bug fixed here**: without this,
+    /// nothing stopped several *redundant* outbound dials to the same peer
+    /// from starting concurrently, since the only earlier guard
+    /// (`!connected.contains(id)`) doesn't become true until a dial's TLS
+    /// handshake actually finishes — a window easily wide enough for
+    /// mdns-sd's `ServiceResolved` events (which arrive in rapid bursts,
+    /// often a dozen-plus within single-digit milliseconds — one per
+    /// resolved address/interface for the same peer) to each independently
+    /// see "not connected yet" and spawn their own dial. Each side (the
+    /// dialer and the accepter) then resolves which of the redundant
+    /// attempts "wins" *completely independently*, with no correlation
+    /// between the two — so it was entirely possible for this side to
+    /// settle on attempt #1 while the peer settled on the inbound
+    /// connection matching attempt #2, leaving both sides holding a
+    /// connection object the other had already abandoned and closed. That
+    /// read as an immediate, inexplicable disconnect with no relation to
+    /// file transfers or the keepalive timeout — a "connections are
+    /// randomly dropping" report even at total idle, right after pairing.
+    dialing: Mutex<HashSet<String>>,
     /// Abort handles for each active connection's task, keyed by peer
     /// crypto id — the only way to forcibly drop a connection from outside
     /// its own task, since it's normally just blocked reading. Populated
@@ -140,12 +180,52 @@ struct SharedState {
     /// dial loop, the clipboard watcher, and inbound clipboard-update
     /// handling — everywhere new syncing activity could start.
     paused: AtomicBool,
+    /// **Real bug fixed here**: `EngineHandle::shutdown()`'s `task.abort()`
+    /// calls are no-ops against `spawn_clipboard_watcher` and `spawn_
+    /// now_playing_watcher` specifically — both run on tokio's blocking
+    /// thread pool (`spawn_blocking`, needed since they call synchronous
+    /// host/FFI code), and `abort()` only prevents a *queued* blocking
+    /// task from starting; once one is actually running its closure on its
+    /// own OS thread, cancellation can't preempt it — it just keeps
+    /// looping forever, since neither watcher's `loop` had any exit
+    /// condition. That thread staying alive is exactly what a `tokio::
+    /// Runtime` waits on when it's dropped, so any caller relying on the
+    /// process/runtime actually exiting after `shutdown()` (this crate's
+    /// own integration tests included — that's how this was caught: a
+    /// test hung well past its own internal deadline) would hang
+    /// indefinitely. Checked by both watchers right after they wake from
+    /// each sleep; set by `shutdown()` before it aborts anything else, so
+    /// they notice and exit within one sleep interval instead of never.
+    shutting_down: AtomicBool,
 }
 
 impl SharedState {
     fn emit(&self, event: SyncEvent) {
         let _ = self.events_tx.send(event);
     }
+}
+
+/// Claims the right to start a single outbound dial to `peer_id` — `true`
+/// means proceed, `false` means skip (already connected, or another dial
+/// to the same peer is already in flight). The caller **must** eventually
+/// pair a successful claim with `release_dial_claim`, on every exit path
+/// (`connect()` failing included, not just a completed `handle_connection`).
+/// `HashSet::insert`'s own return value is the actual source of truth for
+/// who wins a race between concurrent callers — the `connected` check
+/// above it is just a cheap, non-atomic fast path to skip dialing a peer
+/// that's obviously already connected; a stale read there costs nothing
+/// beyond one wasted `dialing` entry that `handle_connection`'s own
+/// "already connected" bail-out (and this same release path) cleans up
+/// immediately.
+fn try_claim_dial(state: &Arc<SharedState>, peer_id: &str) -> bool {
+    if state.connected.lock().unwrap().contains(peer_id) {
+        return false;
+    }
+    state.dialing.lock().unwrap().insert(peer_id.to_string())
+}
+
+fn release_dial_claim(state: &Arc<SharedState>, peer_id: &str) {
+    state.dialing.lock().unwrap().remove(peer_id);
 }
 
 pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
@@ -172,8 +252,11 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
     let state = Arc::new(SharedState {
         my_device: my_device.clone(),
         tls_identity,
+        discovery: Mutex::new(discovery),
+        discovery_recreate: Notify::new(),
         trust_store: Mutex::new(config.trust_store),
         connected: Mutex::new(HashSet::new()),
+        dialing: Mutex::new(HashSet::new()),
         connection_handles: Mutex::new(HashMap::new()),
         manually_disconnected: Mutex::new(HashSet::new()),
         known_addresses: Mutex::new(HashMap::new()),
@@ -186,6 +269,7 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
         events_tx,
         received_files_dir: config.received_files_dir,
         paused: AtomicBool::new(false),
+        shutting_down: AtomicBool::new(false),
     });
 
     state.emit(SyncEvent::Listening { port });
@@ -227,7 +311,19 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                             .unwrap()
                             .insert(id_for_registry, join.abort_handle());
                     }
-                    Err(e) => tracing::warn!("accept error: {e}"),
+                    Err(e) => {
+                        tracing::warn!("accept error: {e}");
+                        // A transient per-connection error (a reset before
+                        // the handshake, say) should just retry on the next
+                        // iteration — but some accept errors (the process
+                        // hitting its file descriptor limit, most notably)
+                        // recur on *every* immediate retry with nothing to
+                        // wait on, which without this would spin this loop
+                        // at 100% CPU on one core forever. A short, fixed
+                        // backoff is cheap insurance against that either
+                        // way, and invisible in the one-shot-error case.
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
                 }
             }
         })
@@ -236,7 +332,22 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
     tasks.push({
         let state = state.clone();
         tokio::spawn(async move {
-            while let Ok(event) = browse_rx.recv_async().await {
+            let mut browse_rx = browse_rx;
+            'recover: loop {
+            loop {
+                let event = tokio::select! {
+                    biased;
+                    // Checked first: an explicit recreate request (network
+                    // change, or this same signal reused by the recovery
+                    // loop below after a failed attempt) should win over a
+                    // stale event that happened to be queued on the old
+                    // receiver at the same moment.
+                    _ = state.discovery_recreate.notified() => break,
+                    result = browse_rx.recv_async() => match result {
+                        Ok(event) => event,
+                        Err(_) => break,
+                    },
+                };
                 tracing::debug!("mdns event: {event:?}");
                 let ServiceEvent::ServiceResolved(info) = event else {
                     continue;
@@ -291,10 +402,10 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                 if state.paused.load(Ordering::Relaxed) {
                     continue;
                 }
-                if state.connected.lock().unwrap().contains(&peer.device.id) {
+                if state.manually_disconnected.lock().unwrap().contains(&peer.device.id) {
                     continue;
                 }
-                if state.manually_disconnected.lock().unwrap().contains(&peer.device.id) {
+                if !try_claim_dial(&state, &peer.device.id) {
                     continue;
                 }
 
@@ -309,7 +420,10 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                                 tracing::debug!("outbound connection to {peer_addr} ended: {e}");
                             }
                         }
-                        Err(e) => tracing::debug!("failed to dial {peer_addr}: {e}"),
+                        Err(e) => {
+                            tracing::debug!("failed to dial {peer_addr}: {e}");
+                            release_dial_claim(&conn_state, &peer_id);
+                        }
                     }
                 });
                 state
@@ -317,6 +431,44 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                     .lock()
                     .unwrap()
                     .insert(id_for_registry, join.abort_handle());
+            }
+            // Got here either because `recv_async` returned `Err` (mdns-sd's
+            // daemon thread shut its sending half down for good — a crash
+            // or unexpected internal exit) or because `discovery_recreate`
+            // was notified (an explicit ask, currently only the network
+            // watcher below). Either way: tear down and recreate the whole
+            // `Discovery` (a fresh `ServiceDaemon`, re-advertised,
+            // re-browsed), swap it into `state.discovery` so `shutdown()`
+            // still reaches the current one, and resume browsing on the new
+            // receiver. Retries with a backoff if the daemon can't even be
+            // recreated yet (e.g. the network stack is mid-flap). Without
+            // this, a dead daemon thread left discovery — new devices *and*
+            // rediscovery-triggered reconnects — silently dead for the rest
+            // of the process's life.
+            tracing::warn!("mDNS browse loop stopped — recovering discovery");
+            loop {
+                if state.shutting_down.load(Ordering::Relaxed) {
+                    break 'recover;
+                }
+                let recreated = Discovery::new().and_then(|d| {
+                    d.advertise(&state.my_device, port)?;
+                    let rx = d.browse()?;
+                    Ok((d, rx))
+                });
+                match recreated {
+                    Ok((new_discovery, new_rx)) => {
+                        let old = std::mem::replace(&mut *state.discovery.lock().unwrap(), new_discovery);
+                        let _ = old.shutdown();
+                        browse_rx = new_rx;
+                        tracing::info!("mDNS discovery recovered");
+                        continue 'recover;
+                    }
+                    Err(e) => {
+                        tracing::error!("failed to recover mDNS discovery, retrying: {e}");
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
+                }
+            }
             }
         })
     });
@@ -349,6 +501,14 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                             handle.abort();
                         }
                         state.connected.lock().unwrap().clear();
+                        // A dial aborted mid-flight (its task dropped by
+                        // the `handle.abort()` calls just above, before it
+                        // could reach either `handle_connection` or its own
+                        // `Err` branch) never gets to release its own
+                        // claim — same reasoning as the `connected`/
+                        // `peer_senders` clears right here, just for
+                        // `dialing`.
+                        state.dialing.lock().unwrap().clear();
                         state.peer_senders.lock().unwrap().clear();
                         if let Err(e) = state.trust_store.lock().unwrap().clear() {
                             tracing::warn!("failed to clear trust store during reset: {e}");
@@ -373,6 +533,11 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                             handle.abort();
                         }
                         state.connected.lock().unwrap().remove(&peer_crypto_id);
+                        // Same reasoning as `Reset`'s clear — if `peer_crypto_id`
+                        // happened to be mid-dial (not yet connected) at the
+                        // moment of the abort above, its task never got to
+                        // release its own claim.
+                        release_dial_claim(&state, &peer_crypto_id);
                         state.peer_senders.lock().unwrap().remove(&peer_crypto_id);
 
                         // Aborting the connection task skips its own normal
@@ -390,7 +555,7 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                             state.emit(SyncEvent::ReconnectFailed { peer_id: peer_crypto_id });
                             continue;
                         };
-                        if state.connected.lock().unwrap().contains(&peer_crypto_id) {
+                        if !try_claim_dial(&state, &peer_crypto_id) {
                             continue;
                         }
 
@@ -403,7 +568,10 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                                         tracing::debug!("reconnect to {addr} ended: {e}");
                                     }
                                 }
-                                Err(e) => tracing::debug!("failed to reconnect to {addr}: {e}"),
+                                Err(e) => {
+                                    tracing::debug!("failed to reconnect to {addr}: {e}");
+                                    release_dial_claim(&conn_state, &peer_crypto_id);
+                                }
                             }
                         });
                         state.connection_handles.lock().unwrap().insert(id_for_registry, join.abort_handle());
@@ -413,51 +581,11 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                             let _ = tx.send(Message::MediaCommand { command });
                         }
                     }
-                    EngineCommand::RefreshDiscovery => {
-                        // *Not* an mDNS re-query — `mdns_sd::ServiceDaemon::
-                        // browse()` unconditionally overwrites its single
-                        // registered listener for a service type ("if there
-                        // is already a listener, it will be updated, i.e.
-                        // overwritten" — straight from its own doc comment),
-                        // so calling it a second time silently orphans the
-                        // receiver this engine's whole browse loop actually
-                        // reads from: real bug, shipped and caught after the
-                        // fact — it killed all further discovery (new
-                        // devices *and* rediscovery-triggered reconnects)
-                        // after the first refresh, whether from this timer
-                        // or the user's own Refresh click. mdns-sd already
-                        // re-queries on its own via retransmission using the
-                        // *original* listener, so nothing external is needed
-                        // for that half. What's actually useful here instead:
-                        // retry dialing every trusted peer with a cached
-                        // address that isn't currently connected — doesn't
-                        // touch mDNS at all, so it can't repeat that mistake.
-                        let targets: Vec<(String, SocketAddr)> = {
-                            let trust_store = state.trust_store.lock().unwrap();
-                            let connected = state.connected.lock().unwrap();
-                            let manually_disconnected = state.manually_disconnected.lock().unwrap();
-                            let known_addresses = state.known_addresses.lock().unwrap();
-                            trust_store
-                                .list()
-                                .filter(|d| !connected.contains(&d.id) && !manually_disconnected.contains(&d.id))
-                                .filter_map(|d| known_addresses.get(&d.id).copied().map(|addr| (d.id.clone(), addr)))
-                                .collect()
-                        };
-                        for (peer_crypto_id, addr) in targets {
-                            let conn_state = state.clone();
-                            let id_for_registry = peer_crypto_id.clone();
-                            let join = tokio::spawn(async move {
-                                match connect(addr, &conn_state.tls_identity).await {
-                                    Ok(conn) => {
-                                        if let Err(e) = handle_connection(conn, conn_state, peer_crypto_id).await {
-                                            tracing::debug!("refresh-triggered reconnect to {addr} ended: {e}");
-                                        }
-                                    }
-                                    Err(e) => tracing::debug!("refresh-triggered reconnect to {addr} failed: {e}"),
-                                }
-                            });
-                            state.connection_handles.lock().unwrap().insert(id_for_registry, join.abort_handle());
-                        }
+                    EngineCommand::RefreshDiscovery => redial_disconnected_trusted_peers(&state),
+                    EngineCommand::NetworkChanged => {
+                        tracing::info!("network change detected — refreshing discovery and retrying disconnected peers");
+                        state.discovery_recreate.notify_one();
+                        redial_disconnected_trusted_peers(&state);
                     }
                 }
             }
@@ -466,12 +594,13 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
 
     tasks.push(spawn_clipboard_watcher(state.clone()));
     tasks.push(spawn_now_playing_watcher(state.clone()));
+    tasks.push(spawn_reconnect_ticker(state.clone()));
+    tasks.push(spawn_network_watcher(commands_tx.clone()));
 
     Ok(EngineHandle {
         events: events_rx,
         commands_tx,
         tasks,
-        discovery,
         state,
     })
 }
@@ -481,6 +610,13 @@ async fn handle_connection(
     state: Arc<SharedState>,
     peer_crypto_id: String,
 ) -> anyhow::Result<()> {
+    // No-op for an inbound connection (never claimed a dial in the first
+    // place — `remove` on an absent key just returns `false`). For an
+    // outbound one, the dial phase this claim was guarding is over now
+    // that a `Connection` exists — release it before, not after, the
+    // `connected` check right below so a peer whose connection later
+    // drops can be freely redialed without waiting on this one.
+    release_dial_claim(&state, &peer_crypto_id);
     {
         let mut connected = state.connected.lock().unwrap();
         if connected.contains(&peer_crypto_id) {
@@ -560,113 +696,156 @@ async fn handle_connection_inner(
         .unwrap()
         .insert(peer_crypto_id.to_string(), tx.clone());
 
-    let writer_task = tokio::spawn(async move {
+    // Tracks time since the last *activity* — a successful read OR write,
+    // shared between the reader and writer loops below. Two real bugs
+    // found post-release here:
+    //
+    // 1. A large/slow file transfer enqueues every chunk into the same
+    //    unbounded FIFO `tx`/`rx` channel a `Ping` also goes through, with
+    //    no priority between them. A ping queued behind a big backlog of
+    //    chunks doesn't actually reach the wire until the writer works
+    //    through that backlog, so the peer never gets it to reply to in
+    //    time — and tracking only *incoming* messages meant the sending
+    //    side (mostly writing, not reading, during a one-way transfer)
+    //    could hit `CONNECTION_READ_TIMEOUT` and disconnect itself
+    //    mid-transfer even though the connection was actively,
+    //    successfully carrying data the whole time. A successful write is
+    //    just as much proof of a live connection as a successful read (a
+    //    truly dead connection's writes eventually fail/block once the OS
+    //    send buffer and retries are exhausted) — tracked from both sides
+    //    now, this can't happen.
+    //
+    // 2. The writer used to run as its own separately `tokio::spawn`ed
+    //    task, holding `write_half`. `tokio::io::split` keeps the
+    //    underlying stream alive (via a shared `Arc`) as long as *either*
+    //    half is still referenced — so aborting only this connection's own
+    //    task from outside (`DisconnectPeer`, `Reset`,
+    //    `EngineHandle::shutdown`, the only abort handle ever tracked
+    //    anywhere) dropped `read_half` but left the writer task — and
+    //    `write_half`, and the underlying socket — running untouched,
+    //    forever. A real leak on every non-organic disconnect. Racing the
+    //    reader and writer as two futures *within this one task* instead
+    //    (rather than a second spawned task) means dropping this task
+    //    drops both halves together, every time.
+    let last_activity = Arc::new(Mutex::new(std::time::Instant::now()));
+
+    let mut receiving: HashMap<String, ReceivingFile> = HashMap::new();
+    let mut ping_ticker = tokio::time::interval(PING_INTERVAL);
+    ping_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    let reader = async {
+        loop {
+            let read_result = tokio::select! {
+                _ = ping_ticker.tick() => {
+                    let elapsed = last_activity.lock().unwrap().elapsed();
+                    if elapsed > CONNECTION_READ_TIMEOUT {
+                        tracing::debug!(
+                            "no activity with '{}' in over {CONNECTION_READ_TIMEOUT:?} — treating as disconnected",
+                            peer.name
+                        );
+                        break;
+                    }
+                    // Piggybacks on this same tick rather than a separate
+                    // timer — a shell's device list can show "active Ns
+                    // ago" instead of a bare connected/disconnected dot,
+                    // at the same bounded per-connection rate as the ping
+                    // itself.
+                    state.emit(SyncEvent::PeerActivity {
+                        peer_id: peer.id.clone(),
+                        seconds_since_activity: elapsed.as_secs(),
+                    });
+                    if tx.send(Message::Ping).is_err() {
+                        break; // writer side is gone — connection is already dead
+                    }
+                    continue;
+                }
+                result = read_message(&mut read_half) => result,
+            };
+            *last_activity.lock().unwrap() = std::time::Instant::now();
+            match read_result {
+                Ok(Message::Ping) => {
+                    let _ = tx.send(Message::Pong);
+                }
+                Ok(Message::Pong) => {}
+                Ok(Message::MediaCommand { command }) => {
+                    state.media.handle(command);
+                }
+                Ok(Message::NowPlayingUpdate { info }) => {
+                    if state.paused.load(Ordering::Relaxed) {
+                        continue;
+                    }
+                    state.emit(SyncEvent::NowPlayingChanged {
+                        peer_id: peer.id.clone(),
+                        peer_name: peer.name.clone(),
+                        info,
+                    });
+                }
+                Ok(Message::ClipboardUpdate {
+                    origin_device,
+                    content_hash: hash,
+                    mime,
+                    data,
+                }) => {
+                    if state.paused.load(Ordering::Relaxed) {
+                        tracing::debug!("ignoring clipboard update from {origin_device}: paused");
+                        continue;
+                    }
+                    if mime != "text/plain" {
+                        tracing::debug!("ignoring non-text clipboard update from {origin_device}");
+                        continue;
+                    }
+                    if content_hash(&data) != hash {
+                        tracing::warn!("clipboard update from {origin_device} failed its integrity check, ignoring");
+                        continue;
+                    }
+                    apply_remote_clipboard(state, hash, data).await;
+                    state.emit(SyncEvent::ClipboardReceived {
+                        from_name: peer.name.clone(),
+                    });
+                }
+                Ok(Message::FileOffer {
+                    transfer_id,
+                    origin_device: _,
+                    file_name,
+                    size_bytes,
+                    mime: _,
+                }) => {
+                    handle_file_offer(state, &tx, &peer, &mut receiving, transfer_id, file_name, size_bytes).await;
+                }
+                Ok(Message::FileAccept { transfer_id, accepted }) => {
+                    if let Some(waiter) = state.pending_file_accepts.lock().unwrap().remove(&transfer_id) {
+                        let _ = waiter.send(accepted);
+                    }
+                }
+                Ok(Message::FileChunk { transfer_id, seq: _, data }) => {
+                    handle_file_chunk(state, &mut receiving, &transfer_id, data).await;
+                }
+                Ok(Message::FileComplete { transfer_id, content_hash: expected_hash }) => {
+                    handle_file_complete(state, &mut receiving, &transfer_id, expected_hash).await;
+                }
+                Ok(other) => tracing::debug!("ignoring unhandled message from '{}': {other:?}", peer.name),
+                Err(_) => break,
+            }
+        }
+    };
+
+    let writer = async {
         while let Some(msg) = rx.recv().await {
             if write_message(&mut write_half, &msg).await.is_err() {
                 break;
             }
+            *last_activity.lock().unwrap() = std::time::Instant::now();
         }
-    });
+    };
 
-    let mut receiving: HashMap<String, ReceivingFile> = HashMap::new();
-
-    let mut ping_ticker = tokio::time::interval(PING_INTERVAL);
-    ping_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // Tracks time since the last *received* message (any message, not just
-    // Pong — anything arriving proves the connection is alive). Deliberately
-    // NOT a `timeout()` wrapped fresh around `read_message` each iteration:
-    // since PING_INTERVAL < CONNECTION_READ_TIMEOUT, the ping branch would
-    // win the select every cycle and recreate that timeout from scratch
-    // before it could ever elapse, so a truly dead connection would never
-    // be detected. Checking elapsed-since-`last_activity` on each ping tick
-    // instead means sending a ping can't reset a clock it doesn't own.
-    let mut last_activity = std::time::Instant::now();
-
-    loop {
-        let read_result = tokio::select! {
-            _ = ping_ticker.tick() => {
-                if last_activity.elapsed() > CONNECTION_READ_TIMEOUT {
-                    tracing::debug!(
-                        "no message from '{}' in over {CONNECTION_READ_TIMEOUT:?} — treating as disconnected",
-                        peer.name
-                    );
-                    break;
-                }
-                if tx.send(Message::Ping).is_err() {
-                    break; // writer task is gone — connection is already dead
-                }
-                continue;
-            }
-            result = read_message(&mut read_half) => result,
-        };
-        last_activity = std::time::Instant::now();
-        match read_result {
-            Ok(Message::Ping) => {
-                let _ = tx.send(Message::Pong);
-            }
-            Ok(Message::Pong) => {}
-            Ok(Message::MediaCommand { command }) => {
-                state.media.handle(command);
-            }
-            Ok(Message::NowPlayingUpdate { info }) => {
-                if state.paused.load(Ordering::Relaxed) {
-                    continue;
-                }
-                state.emit(SyncEvent::NowPlayingChanged {
-                    peer_id: peer.id.clone(),
-                    peer_name: peer.name.clone(),
-                    info,
-                });
-            }
-            Ok(Message::ClipboardUpdate {
-                origin_device,
-                content_hash: hash,
-                mime,
-                data,
-            }) => {
-                if state.paused.load(Ordering::Relaxed) {
-                    tracing::debug!("ignoring clipboard update from {origin_device}: paused");
-                    continue;
-                }
-                if mime != "text/plain" {
-                    tracing::debug!("ignoring non-text clipboard update from {origin_device}");
-                    continue;
-                }
-                if content_hash(&data) != hash {
-                    tracing::warn!("clipboard update from {origin_device} failed its integrity check, ignoring");
-                    continue;
-                }
-                apply_remote_clipboard(state, hash, data).await;
-                state.emit(SyncEvent::ClipboardReceived {
-                    from_name: peer.name.clone(),
-                });
-            }
-            Ok(Message::FileOffer {
-                transfer_id,
-                origin_device: _,
-                file_name,
-                size_bytes,
-                mime: _,
-            }) => {
-                handle_file_offer(state, &tx, &peer, &mut receiving, transfer_id, file_name, size_bytes).await;
-            }
-            Ok(Message::FileAccept { transfer_id, accepted }) => {
-                if let Some(waiter) = state.pending_file_accepts.lock().unwrap().remove(&transfer_id) {
-                    let _ = waiter.send(accepted);
-                }
-            }
-            Ok(Message::FileChunk { transfer_id, seq: _, data }) => {
-                handle_file_chunk(state, &mut receiving, &transfer_id, data).await;
-            }
-            Ok(Message::FileComplete { transfer_id, content_hash: expected_hash }) => {
-                handle_file_complete(state, &mut receiving, &transfer_id, expected_hash).await;
-            }
-            Ok(other) => tracing::debug!("ignoring unhandled message from '{}': {other:?}", peer.name),
-            Err(_) => break,
-        }
+    // Whichever finishes first — the reader deciding the connection is
+    // dead, or the writer hitting a write error — the other is dropped
+    // right along with it, taking its half of the split stream with it.
+    tokio::select! {
+        _ = reader => {}
+        _ = writer => {}
     }
 
-    writer_task.abort();
     state.emit(SyncEvent::Disconnected {
         peer_id: peer.id.clone(),
         peer_name: peer.name.clone(),
@@ -834,7 +1013,31 @@ async fn send_file(state: &Arc<SharedState>, peer_crypto_id: &str, path: PathBuf
         }
     };
     let size_bytes = data.len() as u64;
-    let hash = content_hash(&data);
+    // SHA-256 over the whole file, synchronously, used to run directly on
+    // this tokio worker thread — for a large file that's real, CPU-bound
+    // work blocking that thread from polling anything else scheduled on
+    // it for as long as the hash takes (a debug build's unoptimized SHA-256
+    // is dramatically slower than a release build's; this showed up as a
+    // ~15s stall before the very first message of a 150MB transfer even
+    // reached the wire, when testing the keepalive fix below). `spawn_
+    // blocking` moves it to tokio's dedicated blocking-task thread pool
+    // instead, matching every other CPU/host-bound call in this codebase
+    // (the clipboard and now-playing watchers, for the same reason).
+    let (data, hash) = match tokio::task::spawn_blocking(move || {
+        let hash = content_hash(&data);
+        (data, hash)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            state.emit(SyncEvent::FileTransferFailed {
+                transfer_id,
+                reason: format!("hashing task panicked: {e}"),
+            });
+            return;
+        }
+    };
 
     let Some(tx) = state
         .peer_senders
@@ -931,6 +1134,10 @@ fn spawn_clipboard_watcher(state: Arc<SharedState>) -> JoinHandle<()> {
         loop {
             std::thread::sleep(Duration::from_millis(500));
 
+            if state.shutting_down.load(Ordering::Relaxed) {
+                break;
+            }
+
             if state.paused.load(Ordering::Relaxed) {
                 continue;
             }
@@ -997,6 +1204,10 @@ fn spawn_now_playing_watcher(state: Arc<SharedState>) -> JoinHandle<()> {
         loop {
             std::thread::sleep(Duration::from_millis(1500));
 
+            if state.shutting_down.load(Ordering::Relaxed) {
+                break;
+            }
+
             if state.paused.load(Ordering::Relaxed) {
                 continue;
             }
@@ -1027,6 +1238,137 @@ fn spawn_now_playing_watcher(state: Arc<SharedState>) -> JoinHandle<()> {
             for tx in senders {
                 let _ = tx.send(msg.clone());
             }
+        }
+    })
+}
+
+/// Retries dialing every trusted peer with a cached address that isn't
+/// currently connected (and wasn't deliberately disconnected — that stays
+/// respected). Shared by the manual `RefreshDiscovery` command and
+/// `spawn_reconnect_ticker` below.
+///
+/// **Deliberately does not touch mDNS.** `mdns_sd::ServiceDaemon::browse()`
+/// unconditionally overwrites its single registered listener for a service
+/// type ("if there is already a listener, it will be updated, i.e.
+/// overwritten" — straight from its own doc comment), so calling it a
+/// second time silently orphans the receiver this engine's whole browse
+/// loop actually reads from: a real bug, shipped and caught after the
+/// fact — it killed all further discovery (new devices *and*
+/// rediscovery-triggered reconnects) after the first refresh, whether from
+/// a timer or the user's own Refresh click. mdns-sd already re-queries on
+/// its own via retransmission using the *original* listener, so nothing
+/// external is needed for that half — this only needs to redial peers
+/// whose address is already cached in `known_addresses`.
+fn redial_disconnected_trusted_peers(state: &Arc<SharedState>) {
+    let targets: Vec<(String, SocketAddr)> = {
+        let trust_store = state.trust_store.lock().unwrap();
+        let connected = state.connected.lock().unwrap();
+        let dialing = state.dialing.lock().unwrap();
+        let manually_disconnected = state.manually_disconnected.lock().unwrap();
+        let known_addresses = state.known_addresses.lock().unwrap();
+        trust_store
+            .list()
+            .filter(|d| !connected.contains(&d.id) && !dialing.contains(&d.id) && !manually_disconnected.contains(&d.id))
+            .filter_map(|d| known_addresses.get(&d.id).copied().map(|addr| (d.id.clone(), addr)))
+            .collect()
+    };
+    for (peer_crypto_id, addr) in targets {
+        // This runs from both a periodic ticker and the manual Refresh
+        // command — two independent tasks that could both reach this same
+        // peer in the same tick — on top of racing the mDNS auto-dial
+        // loop's own attempts at any moment. Same claim as everywhere else
+        // that starts a dial, for the same reason.
+        if !try_claim_dial(state, &peer_crypto_id) {
+            continue;
+        }
+        let conn_state = state.clone();
+        let id_for_registry = peer_crypto_id.clone();
+        let join = tokio::spawn(async move {
+            match connect(addr, &conn_state.tls_identity).await {
+                Ok(conn) => {
+                    if let Err(e) = handle_connection(conn, conn_state, peer_crypto_id).await {
+                        tracing::debug!("reconnect to {addr} ended: {e}");
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("reconnect to {addr} failed: {e}");
+                    release_dial_claim(&conn_state, &peer_crypto_id);
+                }
+            }
+        });
+        state.connection_handles.lock().unwrap().insert(id_for_registry, join.abort_handle());
+    }
+}
+
+/// Self-heals a disconnected-but-trusted peer without the user needing to
+/// notice and hit the manual Refresh action. Real motivation: after
+/// `mdns_sd`'s own retransmission for a long-running query backs off (up
+/// to a 60-minute max delay — see its retransmission scheduling), waiting
+/// on rediscovery alone to trigger a reconnect could take a very long
+/// time. This doesn't wait on discovery at all — see
+/// `redial_disconnected_trusted_peers`.
+const RECONNECT_RETRY_INTERVAL: Duration = Duration::from_secs(45);
+
+fn spawn_reconnect_ticker(state: Arc<SharedState>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(RECONNECT_RETRY_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            if state.paused.load(Ordering::Relaxed) {
+                continue;
+            }
+            redial_disconnected_trusted_peers(&state);
+        }
+    })
+}
+
+/// How often to check the host's local IP addresses for changes. This is a
+/// plain poll rather than a native OS push notification (macOS's
+/// `NWPathMonitor`, Android's `ConnectivityManager.NetworkCallback`, an
+/// equivalent on Windows/Linux) specifically because a poll is portable,
+/// cross-platform code that lives in this crate and is testable here —
+/// separate native FFI per platform would need real Windows/Android
+/// hardware or emulators to verify, neither available in this dev
+/// environment. 10s is frequent enough that a Wi-Fi switch or VPN
+/// connect/disconnect is noticed well within the time a user would
+/// consider the app "just stuck", without polling so often it shows up in
+/// battery/CPU profiling on mobile.
+const NETWORK_CHECK_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Notices when the host's local IP addresses change and prompts a
+/// rediscovery + reconnect pass — the whole reason this exists is that
+/// otherwise nothing reacts to a network change at all until either the
+/// user manually hits refresh or the periodic reconnect ticker's own timer
+/// happens to fire, which could be tens of seconds after a Wi-Fi switch
+/// most users would expect to "just work" immediately.
+fn spawn_network_watcher(commands_tx: mpsc::UnboundedSender<EngineCommand>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut last_addrs: Option<HashSet<std::net::IpAddr>> = None;
+        loop {
+            tokio::time::sleep(NETWORK_CHECK_INTERVAL).await;
+
+            let current: HashSet<std::net::IpAddr> = match if_addrs::get_if_addrs() {
+                Ok(interfaces) => interfaces
+                    .into_iter()
+                    .filter(|iface| !iface.is_loopback())
+                    .map(|iface| iface.ip())
+                    .collect(),
+                Err(e) => {
+                    tracing::debug!("couldn't enumerate network interfaces: {e}");
+                    continue;
+                }
+            };
+
+            // `None` only on the very first check — skip notifying then,
+            // since discovery was just freshly set up by `start()` and
+            // there's nothing to react to yet.
+            if let Some(previous) = &last_addrs {
+                if *previous != current {
+                    let _ = commands_tx.send(EngineCommand::NetworkChanged);
+                }
+            }
+            last_addrs = Some(current);
         }
     })
 }

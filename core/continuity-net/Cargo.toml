@@ -20,3 +20,9 @@ anyhow.workspace = true
 tracing.workspace = true
 bytes = "1"
 x509-parser = "0.16"
+# TCP_NODELAY and SO_KEEPALIVE — tokio's TcpStream exposes the former
+# directly but not the latter. Already in the dependency tree transitively
+# (tokio itself uses it internally on some platforms), so this adds
+# essentially no extra compile time or binary size, just a direct API to
+# what's already being built.
+socket2 = "0.5"

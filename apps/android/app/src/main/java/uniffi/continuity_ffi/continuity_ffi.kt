@@ -2675,6 +2675,12 @@ sealed class FfiSyncEvent {
         companion object
     }
     
+    data class PeerActivity(
+        val `peerId`: kotlin.String, 
+        val `secondsSinceActivity`: kotlin.ULong) : FfiSyncEvent() {
+        companion object
+    }
+    
 
     
     companion object
@@ -2749,6 +2755,10 @@ public object FfiConverterTypeFfiSyncEvent : FfiConverterRustBuffer<FfiSyncEvent
                 )
             18 -> FfiSyncEvent.PeerDiscovered(
                 FfiConverterTypeFfiDeviceInfo.read(buf),
+                )
+            19 -> FfiSyncEvent.PeerActivity(
+                FfiConverterString.read(buf),
+                FfiConverterULong.read(buf),
                 )
             else -> throw RuntimeException("invalid enum value, something is very wrong!!")
         }
@@ -2892,6 +2902,14 @@ public object FfiConverterTypeFfiSyncEvent : FfiConverterRustBuffer<FfiSyncEvent
                 + FfiConverterTypeFfiDeviceInfo.allocationSize(value.`device`)
             )
         }
+        is FfiSyncEvent.PeerActivity -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`peerId`)
+                + FfiConverterULong.allocationSize(value.`secondsSinceActivity`)
+            )
+        }
     }
 
     override fun write(value: FfiSyncEvent, buf: ByteBuffer) {
@@ -2995,6 +3013,12 @@ public object FfiConverterTypeFfiSyncEvent : FfiConverterRustBuffer<FfiSyncEvent
             is FfiSyncEvent.PeerDiscovered -> {
                 buf.putInt(18)
                 FfiConverterTypeFfiDeviceInfo.write(value.`device`, buf)
+                Unit
+            }
+            is FfiSyncEvent.PeerActivity -> {
+                buf.putInt(19)
+                FfiConverterString.write(value.`peerId`, buf)
+                FfiConverterULong.write(value.`secondsSinceActivity`, buf)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }

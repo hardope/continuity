@@ -165,6 +165,7 @@ class ContinuityForegroundService : Service() {
             is FfiSyncEvent.ReconnectFailed,
             is FfiSyncEvent.NowPlayingChanged,
             is FfiSyncEvent.PeerDiscovered,
+            is FfiSyncEvent.PeerActivity,
             -> return
         }
 

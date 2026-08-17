@@ -18,4 +18,8 @@ thiserror.workspace = true
 anyhow.workspace = true
 rand = "0.8"
 hostname = "0.4"
+# Already transitively present via mdns-sd; promoted to a direct dependency
+# for the network-change watcher (polls the local interface/address list to
+# react to Wi-Fi switches, VPN connects, cable plug/unplug).
+if-addrs = "0.13"
 arboard = { version = "3", optional = true }

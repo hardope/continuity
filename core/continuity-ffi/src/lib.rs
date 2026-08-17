@@ -142,6 +142,7 @@ pub enum FfiSyncEvent {
     ReconnectFailed { peer_id: String },
     NowPlayingChanged { peer_id: String, peer_name: String, info: FfiNowPlayingInfo },
     PeerDiscovered { device: FfiDeviceInfo },
+    PeerActivity { peer_id: String, seconds_since_activity: u64 },
 }
 
 impl From<continuity_daemon::SyncEvent> for FfiSyncEvent {
@@ -176,6 +177,9 @@ impl From<continuity_daemon::SyncEvent> for FfiSyncEvent {
                 FfiSyncEvent::NowPlayingChanged { peer_id, peer_name, info: info.into() }
             }
             E::PeerDiscovered { device } => FfiSyncEvent::PeerDiscovered { device: device.into() },
+            E::PeerActivity { peer_id, seconds_since_activity } => {
+                FfiSyncEvent::PeerActivity { peer_id, seconds_since_activity }
+            }
         }
     }
 }
