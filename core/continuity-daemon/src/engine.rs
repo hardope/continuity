@@ -992,8 +992,37 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                         };
 
                         let Some(addr) = state.known_addresses.lock().unwrap().get(&peer_crypto_id).copied() else {
-                            let _ = tx.send(Message::RemoteControlResponse { session_id, accepted: false });
+                            let _ = tx.send(Message::RemoteControlResponse { session_id: session_id.clone(), accepted: false });
                             state.remote_control.stop_capture();
+                            // Same silent-failure shape as the
+                            // `already_controlled` decline above, and
+                            // just as real: `known_addresses` only ever
+                            // gets populated by mDNS discovery, not by
+                            // the mesh connection this very request
+                            // arrived over (deliberately — an inbound
+                            // connection's remote port is the peer's
+                            // *ephemeral* one, not one that would ever
+                            // accept a dial-back; see the accept loop's
+                            // own comment for the bug that taught us
+                            // that). If mDNS never delivered this peer's
+                            // real address here — most plausibly a
+                            // firewall dropping inbound multicast on this
+                            // machine — accepting would only ever end up
+                            // right back here with nothing to actually
+                            // dial, so this declines instead of accepting
+                            // into a session that can never send a frame.
+                            state.emit(SyncEvent::RemoteControlSessionEnded {
+                                peer_id: peer_crypto_id.clone(),
+                                peer_name: state
+                                    .trust_store
+                                    .lock()
+                                    .unwrap()
+                                    .get(&peer_crypto_id)
+                                    .map(|d| d.name.clone())
+                                    .unwrap_or_else(|| peer_crypto_id.clone()),
+                                session_id,
+                                reason: Some("couldn't find a network address to reach this device back on".to_string()),
+                            });
                             continue;
                         };
 

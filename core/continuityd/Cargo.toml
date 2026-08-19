@@ -97,6 +97,14 @@ objc2-foundation = "0.3"
 block2 = "0.6"
 dispatch2 = "0.3"
 libc = "0.2"
+# For AXIsProcessTrustedWithOptions's CFDictionary argument (see
+# media_mac.rs::ensure_accessibility_trust) — already pulled in
+# transitively by other macOS dependencies, just not previously used
+# directly. A purpose-built, safe wrapper around exactly this
+# build-a-CFDictionary-and-call-a-C-API pattern, rather than hand-rolling
+# raw CFDictionaryRef construction or press-ganging a toll-free-bridged
+# NSDictionary into service for it.
+core-foundation = "0.10"
 
 # Global media-key injection (SendInput) and now-playing metadata reads
 # (the WinRT GlobalSystemMediaTransportControlsSessionManager API) — see

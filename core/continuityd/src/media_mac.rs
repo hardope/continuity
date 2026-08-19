@@ -22,6 +22,7 @@ use std::time::Duration;
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
     fn AXIsProcessTrusted() -> u8;
+    fn AXIsProcessTrustedWithOptions(options: core_foundation::dictionary::CFDictionaryRef) -> u8;
 }
 
 /// `CGEventPost`ing a synthetic media key — unlike the CoreAudio volume
@@ -49,6 +50,31 @@ pub(crate) fn ensure_accessibility_trust() {
         if unsafe { AXIsProcessTrusted() } != 0 {
             return;
         }
+
+        // `AXIsProcessTrusted()` alone only ever *checks* — it never
+        // registers this process in System Settings' Accessibility list
+        // at all, so a user sent to that pane (via the `open` call below)
+        // found no entry there to even check, no matter how carefully
+        // they looked. This was the real bug behind "granted permission
+        // and it still doesn't work": there was nothing to grant yet.
+        // `AXIsProcessTrustedWithOptions` with the prompt option is the
+        // API that actually adds the app to the list and pops the
+        // system's own permission dialog — same shape as
+        // `remote_control_mac.rs::ensure_screen_recording_trust`'s
+        // `CGRequestScreenCaptureAccess` for the same reason.
+        {
+            use core_foundation::base::TCFType;
+            use core_foundation::boolean::CFBoolean;
+            use core_foundation::dictionary::CFDictionary;
+            use core_foundation::string::CFString;
+
+            let options =
+                CFDictionary::from_CFType_pairs(&[(CFString::new("AXTrustedCheckOptionPrompt"), CFBoolean::true_value())]);
+            if unsafe { AXIsProcessTrustedWithOptions(options.as_concrete_TypeRef()) } != 0 {
+                return;
+            }
+        }
+
         tracing::warn!(
             "Continuity isn't trusted for Accessibility — remote play/pause/next/previous will silently do nothing until it's granted in System Settings > Privacy & Security > Accessibility"
         );
