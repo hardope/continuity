@@ -1,13 +1,14 @@
 use crate::clipboard::ClipboardBackend;
-use crate::events::{EngineCommand, SyncEvent};
+use crate::events::{EngineCommand, RemoteControlRole, SyncEvent};
 use crate::media::MediaController;
+use crate::remote_control::RemoteControlHost;
 use continuity_crypto::{
     content_hash, generate_self_signed, Identity, IncrementalHash, TlsIdentity, TrustStore,
     TrustedDevice,
 };
 use continuity_net::{
-    announce_and_identify, connect, peer_from_service_info, read_message, start_pairing,
-    write_message, Connection, Discovery, Listener, ServiceEvent,
+    announce_and_identify, connect, peer_from_service_info, read_frame, read_message,
+    start_pairing, write_frame, write_message, Connection, Discovery, Listener, ServiceEvent,
 };
 use continuity_proto::{DeviceInfo, Message, NowPlayingInfo, Platform, PROTOCOL_VERSION};
 use std::collections::{HashMap, HashSet};
@@ -58,6 +59,7 @@ pub struct EngineConfig {
     pub trust_store: TrustStore,
     pub clipboard: Arc<dyn ClipboardBackend>,
     pub media: Arc<dyn MediaController>,
+    pub remote_control: Arc<dyn RemoteControlHost>,
     pub received_files_dir: PathBuf,
 }
 
@@ -109,6 +111,19 @@ impl EngineHandle {
         }
         let _ = self.state.discovery.lock().unwrap().shutdown();
     }
+}
+
+#[derive(Clone)]
+struct RemoteControlSession {
+    session_id: String,
+    role: RemoteControlRole,
+    /// `false` for the controlling side between sending `RequestRemoteControl`
+    /// and hearing back — `SendInputEvent` and the accept-loop screen-stream
+    /// routing both only act once this flips to `true`, so an event fired
+    /// in that brief window (or a session that gets declined) can't leak
+    /// through. Always `true` for the controlled side, since that entry
+    /// is only ever created *after* the local user has already accepted.
+    active: bool,
 }
 
 struct SharedState {
@@ -174,6 +189,37 @@ struct SharedState {
     pending_file_accepts: Mutex<HashMap<String, oneshot::Sender<bool>>>,
     clipboard: Arc<dyn ClipboardBackend>,
     media: Arc<dyn MediaController>,
+    remote_control: Arc<dyn RemoteControlHost>,
+    /// One entry per peer with a remote-control session in flight or
+    /// active — a peer can only ever be in *one* session (either role) at
+    /// a time, so keying by `peer_crypto_id` (rather than `session_id`) is
+    /// enough and keeps every lookup a single hash-map access instead of
+    /// a scan.
+    remote_control_sessions: Mutex<HashMap<String, RemoteControlSession>>,
+    /// Inbound `RemoteControlRequest`s awaiting a local answer via
+    /// `EngineCommand::RespondToRemoteControlRequest` — mirrors
+    /// `pending_pairings`'s shape, but doesn't need that one's `oneshot`
+    /// channel: answering a pairing code resumes a suspended `.await` in
+    /// the middle of the handshake, while answering a remote-control
+    /// request is just "look up the session id, send a reply" entirely
+    /// within the command loop, nothing paused waiting on it.
+    pending_remote_control_requests: Mutex<HashMap<String, String>>,
+    /// Peer ids the accept loop should route to `handle_screen_stream_connection`
+    /// instead of the normal pairing/mesh path for their *next* inbound
+    /// connection — populated right when this side becomes the
+    /// controlling party of a newly-accepted session (see
+    /// `RemoteControlResponse { accepted: true }` handling), so the
+    /// controlled peer's incoming screen-stream connection is recognized
+    /// immediately by identity alone, no message-peeking or added
+    /// latency on the far more common case of a normal reconnect.
+    pending_screen_stream_peers: Mutex<HashSet<String>>,
+    /// Abort handle for the screen-stream connection's task, keyed by
+    /// peer id — the controlled side's frame-push loop, or the
+    /// controlling side's frame-receive loop, whichever role this device
+    /// is playing in the session. Aborted on `EndRemoteControlSession`
+    /// and on the underlying mesh connection dropping, so a session never
+    /// outlives the connection that authorized it.
+    remote_control_stream_handles: Mutex<HashMap<String, tokio::task::AbortHandle>>,
     events_tx: mpsc::UnboundedSender<SyncEvent>,
     received_files_dir: PathBuf,
     /// See `EngineCommand::SetPaused`. Checked by the accept loop, the
@@ -203,6 +249,131 @@ impl SharedState {
     fn emit(&self, event: SyncEvent) {
         let _ = self.events_tx.send(event);
     }
+}
+
+/// Tears down whatever's left of an active/pending remote-control session
+/// with `peer_crypto_id` — stops local capture if this device was the
+/// controlled side, aborts the screen-stream task, and emits
+/// `SyncEvent::RemoteControlSessionEnded`. Idempotent: a no-op (no emit)
+/// if there's no session for that peer at all, since every caller below
+/// can race another — a connection dying and an explicit `EndRemoteControlSession`
+/// arriving at nearly the same moment, say — and only the first should
+/// actually report anything.
+fn end_remote_control_session(state: &Arc<SharedState>, peer_crypto_id: &str, reason: Option<String>, notify_peer: bool) {
+    let Some(session) = state.remote_control_sessions.lock().unwrap().remove(peer_crypto_id) else {
+        return;
+    };
+    state.pending_screen_stream_peers.lock().unwrap().remove(peer_crypto_id);
+    if let Some(handle) = state.remote_control_stream_handles.lock().unwrap().remove(peer_crypto_id) {
+        handle.abort();
+    }
+    if session.role == RemoteControlRole::Controlled {
+        state.remote_control.stop_capture();
+    }
+    if notify_peer {
+        if let Some(tx) = state.peer_senders.lock().unwrap().get(peer_crypto_id) {
+            let _ = tx.send(Message::RemoteControlEnded { session_id: session.session_id.clone() });
+        }
+    }
+    let peer_name = state
+        .trust_store
+        .lock()
+        .unwrap()
+        .get(peer_crypto_id)
+        .map(|d| d.name.clone())
+        .unwrap_or_else(|| peer_crypto_id.to_string());
+    state.emit(SyncEvent::RemoteControlSessionEnded {
+        peer_id: peer_crypto_id.to_string(),
+        peer_name,
+        session_id: session.session_id,
+        reason,
+    });
+}
+
+/// Handles the *separate*, dedicated connection opened for one session's
+/// screen stream — never the normal mesh connection, and never carries
+/// anything but this one session's frames. Skips the usual `announce_and_
+/// identify` handshake entirely: identity here is already fully proven by
+/// the TLS client certificate alone (`Connection::peer_device_id()`,
+/// exactly what `announce_and_identify` itself cross-checks against), and
+/// this connection is only ever routed here in the first place because
+/// the accept loop already confirmed this exact peer id was expected
+/// (see `pending_screen_stream_peers`) — a second identity round-trip
+/// would confirm nothing a redundant read wouldn't already need to pay
+/// for.
+async fn handle_screen_stream_connection(mut conn: Connection, state: Arc<SharedState>, peer_crypto_id: String) -> anyhow::Result<()> {
+    let Message::ScreenStreamHandshake { session_id } = read_message(&mut conn).await? else {
+        anyhow::bail!("expected ScreenStreamHandshake as the first message on a screen-stream connection");
+    };
+
+    let valid = {
+        let sessions = state.remote_control_sessions.lock().unwrap();
+        sessions
+            .get(&peer_crypto_id)
+            .is_some_and(|s| s.role == RemoteControlRole::Controlling && s.active && s.session_id == session_id)
+    };
+    if !valid {
+        anyhow::bail!("no active controlling session for {peer_crypto_id} matching session {session_id}");
+    }
+
+    let result = async {
+        loop {
+            let frame = read_frame(&mut conn).await?;
+            state.emit(SyncEvent::ScreenFrameReceived {
+                peer_id: peer_crypto_id.clone(),
+                session_id: session_id.clone(),
+                frame,
+            });
+        }
+        #[allow(unreachable_code)]
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    // Reaches here on a real error (peer closed the stream, network died)
+    // — an *intentional* end (either side's `EndRemoteControlSession`)
+    // aborts this whole task from outside instead, so execution never
+    // gets this far in that case. `end_remote_control_session` is
+    // idempotent, so this is still safe to call even if something else
+    // already did.
+    end_remote_control_session(&state, &peer_crypto_id, Some("screen stream ended unexpectedly".to_string()), true);
+    result
+}
+
+/// The controlled side's half of the screen stream: dials a fresh
+/// connection to the controlling peer, identifies it with
+/// `ScreenStreamHandshake`, then pushes every frame `start_capture`
+/// produces until the channel closes (the engine dropped its capture
+/// handle — see `end_remote_control_session`'s `stop_capture` call) or a
+/// write fails (the connection died). Always ends by tearing the session
+/// down — there's no path back to "idle but still accepted," a stream
+/// that stops is a session that's over.
+async fn push_screen_stream(
+    state: Arc<SharedState>,
+    peer_crypto_id: String,
+    session_id: String,
+    addr: SocketAddr,
+    mut frames: mpsc::Receiver<Vec<u8>>,
+) {
+    let mut conn = match connect(addr, &state.tls_identity).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::debug!("couldn't dial screen-stream connection to {addr}: {e}");
+            end_remote_control_session(&state, &peer_crypto_id, Some(format!("couldn't open screen stream: {e}")), true);
+            return;
+        }
+    };
+    if let Err(e) = write_message(&mut conn, &Message::ScreenStreamHandshake { session_id }).await {
+        tracing::debug!("couldn't send screen-stream handshake to {addr}: {e}");
+        end_remote_control_session(&state, &peer_crypto_id, Some(format!("couldn't start screen stream: {e}")), true);
+        return;
+    }
+    while let Some(frame) = frames.recv().await {
+        if write_frame(&mut conn, &frame).await.is_err() {
+            break;
+        }
+    }
+    end_remote_control_session(&state, &peer_crypto_id, None, false);
 }
 
 /// Claims the right to start a single outbound dial to `peer_id` — `true`
@@ -266,6 +437,11 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
         pending_file_accepts: Mutex::new(HashMap::new()),
         clipboard: config.clipboard,
         media: config.media,
+        remote_control: config.remote_control,
+        remote_control_sessions: Mutex::new(HashMap::new()),
+        pending_remote_control_requests: Mutex::new(HashMap::new()),
+        pending_screen_stream_peers: Mutex::new(HashSet::new()),
+        remote_control_stream_handles: Mutex::new(HashMap::new()),
         events_tx,
         received_files_dir: config.received_files_dir,
         paused: AtomicBool::new(false),
@@ -293,9 +469,64 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                                 continue;
                             }
                         };
-                        state.known_addresses.lock().unwrap().insert(peer_crypto_id.clone(), addr);
+                        // **Real bug found and fixed while adding the
+                        // remote-control screen stream**: this used to
+                        // cache `addr` into `known_addresses` here, but
+                        // `addr` is the *remote ephemeral port* of this
+                        // specific inbound TCP connection (straight from
+                        // `TcpListener::accept()`), never the peer's
+                        // actual listening port — dialing it back later
+                        // would connect to nothing, or nothing useful.
+                        // Mostly silently harmless before now: the mDNS
+                        // browse loop below writes the *correct*
+                        // (listening-port) address for every peer it
+                        // sees regardless of connection direction, and
+                        // usually re-writes it again soon after,
+                        // papering over the bad entry in practice. It
+                        // stopped being harmless once something needed
+                        // to reliably dial a peer *immediately* after
+                        // accepting a connection from them, before
+                        // mDNS's next natural re-announce had a chance
+                        // to overwrite the bad value again —
+                        // `push_screen_stream` dialing back to open the
+                        // dedicated screen-stream connection right after
+                        // accepting a remote-control request does
+                        // exactly that. Caught by
+                        // `core/continuity-daemon/tests/remote_control.rs`
+                        // flaking under real concurrent mDNS activity
+                        // (multiple engine pairs in one test binary) —
+                        // reliable in isolation, where there was more
+                        // incidental time for mDNS to have already
+                        // fixed the entry. Fixed by simply not writing
+                        // here at all — mDNS discovery (see below) is
+                        // the only source that's ever actually correct
+                        // for this map.
                         if state.manually_disconnected.lock().unwrap().contains(&peer_crypto_id) {
                             tracing::debug!("rejecting inbound connection from {addr}: manually disconnected");
+                            continue;
+                        }
+                        // A screen-stream connection is recognized purely
+                        // by identity, not by peeking at anything it
+                        // sends — this device already knows it's
+                        // expecting exactly one more inbound connection
+                        // from this specific, TLS-cert-proven peer id
+                        // (see `pending_screen_stream_peers`'s doc
+                        // comment), so there's nothing to read-and-decide
+                        // here, no added latency on the far more common
+                        // plain-reconnect case.
+                        if state.pending_screen_stream_peers.lock().unwrap().remove(&peer_crypto_id) {
+                            let conn_state = state.clone();
+                            let id_for_registry = peer_crypto_id.clone();
+                            let join = tokio::spawn(async move {
+                                if let Err(e) = handle_screen_stream_connection(conn, conn_state, peer_crypto_id).await {
+                                    tracing::debug!("screen-stream connection from {addr} ended: {e}");
+                                }
+                            });
+                            state
+                                .remote_control_stream_handles
+                                .lock()
+                                .unwrap()
+                                .insert(id_for_registry, join.abort_handle());
                             continue;
                         }
                         let conn_state = state.clone();
@@ -510,6 +741,16 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                         // `dialing`.
                         state.dialing.lock().unwrap().clear();
                         state.peer_senders.lock().unwrap().clear();
+                        // Same "abort skips the normal cleanup tail"
+                        // reasoning as everywhere else here — every
+                        // active/pending remote-control session needs
+                        // tearing down explicitly since the connections
+                        // that would have done it themselves were just
+                        // aborted out from under them.
+                        let session_peers: Vec<String> = state.remote_control_sessions.lock().unwrap().keys().cloned().collect();
+                        for peer_id in session_peers {
+                            end_remote_control_session(&state, &peer_id, None, false);
+                        }
                         if let Err(e) = state.trust_store.lock().unwrap().clear() {
                             tracing::warn!("failed to clear trust store during reset: {e}");
                         }
@@ -539,6 +780,7 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                         // release its own claim.
                         release_dial_claim(&state, &peer_crypto_id);
                         state.peer_senders.lock().unwrap().remove(&peer_crypto_id);
+                        end_remote_control_session(&state, &peer_crypto_id, None, false);
 
                         // Aborting the connection task skips its own normal
                         // exit-path `Disconnected` emit (abort cancels
@@ -610,6 +852,7 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                             state.connected.lock().unwrap().remove(&peer_crypto_id);
                             release_dial_claim(&state, &peer_crypto_id);
                             state.peer_senders.lock().unwrap().remove(&peer_crypto_id);
+                            end_remote_control_session(&state, &peer_crypto_id, None, false);
                         });
                     }
                     EngineCommand::ReconnectPeer { peer_crypto_id } => {
@@ -649,6 +892,131 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                         tracing::info!("network change detected — refreshing discovery and retrying disconnected peers");
                         state.discovery_recreate.notify_one();
                         redial_disconnected_trusted_peers(&state);
+                    }
+                    EngineCommand::RequestRemoteControl { peer_crypto_id } => {
+                        // One session per peer at a time — a second
+                        // request while one's already pending/active with
+                        // the same peer would just confuse which
+                        // `session_id` the eventual response belongs to.
+                        if state.remote_control_sessions.lock().unwrap().contains_key(&peer_crypto_id) {
+                            continue;
+                        }
+                        let Some(tx) = state.peer_senders.lock().unwrap().get(&peer_crypto_id).cloned() else {
+                            continue;
+                        };
+                        let session_id = format!("{:016x}", rand::random::<u64>());
+                        state.remote_control_sessions.lock().unwrap().insert(
+                            peer_crypto_id.clone(),
+                            RemoteControlSession { session_id: session_id.clone(), role: RemoteControlRole::Controlling, active: false },
+                        );
+                        let _ = tx.send(Message::RemoteControlRequest { session_id });
+                    }
+                    EngineCommand::RespondToRemoteControlRequest { peer_crypto_id, accept } => {
+                        let Some(session_id) = state.pending_remote_control_requests.lock().unwrap().remove(&peer_crypto_id) else {
+                            continue;
+                        };
+                        let Some(tx) = state.peer_senders.lock().unwrap().get(&peer_crypto_id).cloned() else {
+                            continue;
+                        };
+
+                        if !accept {
+                            let _ = tx.send(Message::RemoteControlResponse { session_id, accepted: false });
+                            continue;
+                        }
+
+                        // This device's keyboard/mouse/screen are one
+                        // shared physical resource — two different peers
+                        // controlling it at once would mean both fighting
+                        // over the same cursor, and `RemoteControlHost`'s
+                        // capture start/stop isn't session-scoped, just a
+                        // single on/off switch. Accepting a second
+                        // Controlled-role session while one's already
+                        // active would silently corrupt that shared
+                        // state (the first session's eventual
+                        // `stop_capture` would kill the second one's
+                        // stream too) — declined outright instead.
+                        let already_controlled = state
+                            .remote_control_sessions
+                            .lock()
+                            .unwrap()
+                            .values()
+                            .any(|s| s.role == RemoteControlRole::Controlled);
+                        if already_controlled {
+                            let _ = tx.send(Message::RemoteControlResponse { session_id, accepted: false });
+                            continue;
+                        }
+
+                        // Accepting starts capture *before* telling the
+                        // peer it succeeded — if it fails (no Screen
+                        // Recording permission, say), the peer hears
+                        // about a session that never really started
+                        // instead of one that silently never sends any
+                        // frames.
+                        let Some(frames) = state.remote_control.start_capture() else {
+                            let _ = tx.send(Message::RemoteControlResponse { session_id: session_id.clone(), accepted: false });
+                            state.emit(SyncEvent::RemoteControlSessionEnded {
+                                peer_id: peer_crypto_id.clone(),
+                                peer_name: state
+                                    .trust_store
+                                    .lock()
+                                    .unwrap()
+                                    .get(&peer_crypto_id)
+                                    .map(|d| d.name.clone())
+                                    .unwrap_or_else(|| peer_crypto_id.clone()),
+                                session_id,
+                                reason: Some("couldn't start screen capture".to_string()),
+                            });
+                            continue;
+                        };
+
+                        let Some(addr) = state.known_addresses.lock().unwrap().get(&peer_crypto_id).copied() else {
+                            let _ = tx.send(Message::RemoteControlResponse { session_id, accepted: false });
+                            state.remote_control.stop_capture();
+                            continue;
+                        };
+
+                        state.remote_control_sessions.lock().unwrap().insert(
+                            peer_crypto_id.clone(),
+                            RemoteControlSession { session_id: session_id.clone(), role: RemoteControlRole::Controlled, active: true },
+                        );
+                        let _ = tx.send(Message::RemoteControlResponse { session_id: session_id.clone(), accepted: true });
+                        state.emit(SyncEvent::RemoteControlSessionStarted {
+                            peer_id: peer_crypto_id.clone(),
+                            peer_name: state
+                                .trust_store
+                                .lock()
+                                .unwrap()
+                                .get(&peer_crypto_id)
+                                .map(|d| d.name.clone())
+                                .unwrap_or_else(|| peer_crypto_id.clone()),
+                            session_id: session_id.clone(),
+                            role: RemoteControlRole::Controlled,
+                        });
+
+                        let push_state = state.clone();
+                        let push_peer_id = peer_crypto_id.clone();
+                        let join = tokio::spawn(async move {
+                            push_screen_stream(push_state, push_peer_id, session_id, addr, frames).await;
+                        });
+                        state.remote_control_stream_handles.lock().unwrap().insert(peer_crypto_id, join.abort_handle());
+                    }
+                    EngineCommand::SendInputEvent { peer_crypto_id, event } => {
+                        let valid_controlling_session = state
+                            .remote_control_sessions
+                            .lock()
+                            .unwrap()
+                            .get(&peer_crypto_id)
+                            .filter(|s| s.role == RemoteControlRole::Controlling && s.active)
+                            .map(|s| s.session_id.clone());
+                        let Some(session_id) = valid_controlling_session else {
+                            continue;
+                        };
+                        if let Some(tx) = state.peer_senders.lock().unwrap().get(&peer_crypto_id) {
+                            let _ = tx.send(Message::InputEvent { session_id, event });
+                        }
+                    }
+                    EngineCommand::EndRemoteControlSession { peer_crypto_id } => {
+                        end_remote_control_session(&state, &peer_crypto_id, None, true);
                     }
                 }
             }
@@ -697,6 +1065,13 @@ async fn handle_connection(
     // the time this cleanup runs (aborting a task doesn't let it finish
     // this line).
     state.connection_handles.lock().unwrap().remove(&peer_crypto_id);
+    // A remote-control session has no reason to survive the mesh
+    // connection that authorized it — input events and the screen stream
+    // both depend on this same peer relationship staying intact.
+    // `notify_peer: false` since there's no live connection left to send
+    // `RemoteControlEnded` over anyway (idempotent either way if some
+    // other path already cleaned this up).
+    end_remote_control_session(&state, &peer_crypto_id, Some("connection ended".to_string()), false);
     result
 }
 
@@ -898,6 +1273,82 @@ async fn handle_connection_inner(
                     // isn't left hanging on a socket the peer no longer
                     // wants open.
                     break;
+                }
+                Ok(Message::RemoteControlRequest { session_id }) => {
+                    if !state.remote_control.is_available() {
+                        // Nothing for the local user to decide — this
+                        // device genuinely can't be remotely controlled
+                        // (Android/iOS, Linux, or a "lite" build), so
+                        // auto-decline instead of surfacing a prompt for
+                        // a capability that doesn't exist.
+                        if let Some(tx) = state.peer_senders.lock().unwrap().get(&peer.id) {
+                            let _ = tx.send(Message::RemoteControlResponse { session_id, accepted: false });
+                        }
+                        continue;
+                    }
+                    state.pending_remote_control_requests.lock().unwrap().insert(peer.id.clone(), session_id.clone());
+                    state.emit(SyncEvent::RemoteControlRequested {
+                        peer_id: peer.id.clone(),
+                        peer_name: peer.name.clone(),
+                        session_id,
+                    });
+                }
+                Ok(Message::RemoteControlResponse { session_id, accepted }) => {
+                    let matches_pending = state
+                        .remote_control_sessions
+                        .lock()
+                        .unwrap()
+                        .get(&peer.id)
+                        .is_some_and(|s| s.role == RemoteControlRole::Controlling && !s.active && s.session_id == session_id);
+                    if !matches_pending {
+                        continue;
+                    }
+                    if !accepted {
+                        state.remote_control_sessions.lock().unwrap().remove(&peer.id);
+                        state.emit(SyncEvent::RemoteControlDeclined { peer_id: peer.id.clone(), peer_name: peer.name.clone() });
+                        continue;
+                    }
+                    if let Some(s) = state.remote_control_sessions.lock().unwrap().get_mut(&peer.id) {
+                        s.active = true;
+                    }
+                    // The peer is about to dial back with the screen
+                    // stream — recognized by identity alone once it
+                    // arrives, see the accept loop above.
+                    state.pending_screen_stream_peers.lock().unwrap().insert(peer.id.clone());
+                    state.emit(SyncEvent::RemoteControlSessionStarted {
+                        peer_id: peer.id.clone(),
+                        peer_name: peer.name.clone(),
+                        session_id,
+                        role: RemoteControlRole::Controlling,
+                    });
+                }
+                Ok(Message::RemoteControlEnded { session_id }) => {
+                    let matches_active =
+                        state.remote_control_sessions.lock().unwrap().get(&peer.id).is_some_and(|s| s.session_id == session_id);
+                    if matches_active {
+                        end_remote_control_session(state, &peer.id, None, false);
+                    }
+                }
+                Ok(Message::InputEvent { session_id, event }) => {
+                    let valid = state
+                        .remote_control_sessions
+                        .lock()
+                        .unwrap()
+                        .get(&peer.id)
+                        .is_some_and(|s| s.role == RemoteControlRole::Controlled && s.active && s.session_id == session_id);
+                    if valid {
+                        state.remote_control.inject(event);
+                    }
+                }
+                Ok(Message::ScreenStreamHandshake { .. }) => {
+                    // Only ever expected as the very first (and only)
+                    // message on a *separate*, dedicated screen-stream
+                    // connection (see `handle_screen_stream_connection`)
+                    // — arriving here, on the normal mesh connection,
+                    // means either a bug or a confused/malicious peer.
+                    // Ignored like any other unexpected message rather
+                    // than treated as fatal.
+                    tracing::debug!("ignoring ScreenStreamHandshake on the mesh connection from '{}'", peer.name);
                 }
                 Ok(other) => tracing::debug!("ignoring unhandled message from '{}': {other:?}", peer.name),
                 Err(_) => break,

@@ -34,7 +34,16 @@ unsafe extern "C" {
 /// once per command, to avoid spamming a notification on every remote tap)
 /// and, if untrusted, tells the user and jumps them straight to the
 /// System Settings pane that grants it.
-fn ensure_accessibility_trust() {
+///
+/// `pub(crate)` so `remote_control_mac.rs`'s input injection — the exact
+/// same `CGEventPost` mechanism, just building fuller keyboard/mouse
+/// events instead of the three fixed media-key constants — can call this
+/// too, rather than assuming media control already triggered the prompt
+/// at some earlier point. A user who only ever tries remote control and
+/// never touches media keys would otherwise hit the identical silent
+/// no-op this was written to fix in the first place, just on a different
+/// code path.
+pub(crate) fn ensure_accessibility_trust() {
     static CHECKED: Once = Once::new();
     CHECKED.call_once(|| {
         if unsafe { AXIsProcessTrusted() } != 0 {

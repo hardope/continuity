@@ -1,4 +1,15 @@
-use continuity_proto::{DeviceInfo, MediaCommand, NowPlayingInfo};
+use continuity_proto::{DeviceInfo, InputEventKind, MediaCommand, NowPlayingInfo};
+
+/// Which side of an active remote-control session this device is on —
+/// tells a shell which UI to show: `Controlling` gets the live screen
+/// view plus input controls to send, `Controlled` gets a "you're being
+/// controlled by X" indicator and an end button, nothing else (the
+/// controlled side doesn't need its own screen re-rendered to itself).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteControlRole {
+    Controlling,
+    Controlled,
+}
 
 /// Everything a shell (CLI, tray app, mobile UI) might want to react to.
 /// The engine never blocks waiting for a shell to notice one of these —
@@ -69,6 +80,44 @@ pub enum SyncEvent {
     /// and stopped reconnecting, rather than reading it as a network
     /// hiccup.
     RevokedByPeer { peer_id: String, peer_name: String },
+
+    /// A paired peer wants to remotely control this device's keyboard,
+    /// mouse, and screen. Distinct from `PairingRequested` — being
+    /// already paired only proves identity, this is a fresh, separate
+    /// consent step every time. Show a clear prompt (who's asking, what
+    /// they'd be able to do) and answer with `EngineCommand::
+    /// RespondToRemoteControlRequest`. If this device's `RemoteControlHost`
+    /// reports itself unavailable (`is_available() == false` — Android/
+    /// iOS, Linux, or a "lite" build), the engine auto-declines before
+    /// this event is ever emitted, so a shell only ever sees this when
+    /// accepting is actually possible.
+    RemoteControlRequested { peer_id: String, peer_name: String, session_id: String },
+    /// This device's own `EngineCommand::RequestRemoteControl` was
+    /// declined by the peer (or the peer has no remote-control capability
+    /// at all and auto-declined).
+    RemoteControlDeclined { peer_id: String, peer_name: String },
+    /// A session is now active — on the controlling side, once the peer
+    /// accepts; on the controlled side, immediately after the local user
+    /// approves (no need to wait on a round trip to know it's "really"
+    /// started, unlike the controlling side). A shell keys its remote-
+    /// control UI off this event, not off the click/accept that led to
+    /// it.
+    RemoteControlSessionStarted { peer_id: String, peer_name: String, session_id: String, role: RemoteControlRole },
+    /// A session ended — the peer explicitly ended it, this side ended
+    /// it, the connection dropped mid-session, or (controlled side only)
+    /// screen capture failed to start right after accepting. `reason` is
+    /// `None` for a clean, expected end (either side's own `EndSession`
+    /// command); `Some(...)` when it ended because something went wrong,
+    /// so a shell can distinguish "you clicked End" from "this broke."
+    RemoteControlSessionEnded { peer_id: String, peer_name: String, session_id: String, reason: Option<String> },
+    /// One still-JPEG-encoded frame of the controlled peer's screen, for
+    /// the controlling side's live view. Pushed as fast as the controlled
+    /// side's `RemoteControlHost::
+    /// start_capture` produces them — a shell decodes and displays each
+    /// one as it arrives; there's no buffering/ordering guarantee beyond
+    /// "arrives over one TCP connection," so a shell should just always
+    /// show the latest one, not queue a backlog.
+    ScreenFrameReceived { peer_id: String, session_id: String, frame: Vec<u8> },
 }
 
 /// Requests a shell makes of the engine. Sent over the channel returned by
@@ -132,4 +181,34 @@ pub enum EngineCommand {
     /// they're still nearby afterward, mDNS will surface them again as an
     /// untrusted `PeerDiscovered`, same as any other never-paired device.
     RevokeDevice { peer_crypto_id: String },
+
+    /// Asks a connected, trusted peer for permission to remotely control
+    /// its keyboard, mouse, and screen. The engine generates and tracks
+    /// the session id internally — a shell only ever deals with
+    /// `peer_crypto_id`, never the id itself, for every remote-control
+    /// command below too. Emits `SyncEvent::RemoteControlDeclined` if the
+    /// peer says no (or can't at all); `SyncEvent::
+    /// RemoteControlSessionStarted` once accepted.
+    RequestRemoteControl { peer_crypto_id: String },
+    /// Answers an inbound `SyncEvent::RemoteControlRequested` from
+    /// `peer_crypto_id`. Accepting starts local screen capture
+    /// immediately (via this device's `RemoteControlHost`) and dials the
+    /// peer back on a dedicated connection for the screen stream — if
+    /// capture fails to start, the session ends right away with a reason
+    /// rather than accepting into a session that can never actually send
+    /// frames.
+    RespondToRemoteControlRequest { peer_crypto_id: String, accept: bool },
+    /// Sends one input event to inject on `peer_crypto_id`, which must
+    /// have an active session with this device *in the `Controlling`
+    /// role* — silently dropped otherwise (there's nothing to inject
+    /// into, or this side isn't the one meant to be sending). Fire-and-
+    /// forget, like `SendMediaCommand` — a real-time input stream has no
+    /// use for a per-event acknowledgement.
+    SendInputEvent { peer_crypto_id: String, event: InputEventKind },
+    /// Ends whichever remote-control session is currently active with
+    /// `peer_crypto_id`, regardless of which role this device is playing
+    /// in it — the controlling side stopping cleanly and the controlled
+    /// side revoking access mid-session both go through this same
+    /// command. A no-op if no session is active with that peer.
+    EndRemoteControlSession { peer_crypto_id: String },
 }

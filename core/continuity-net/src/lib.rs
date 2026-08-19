@@ -11,7 +11,7 @@ mod pairing;
 
 pub use connection::{connect, Connection, ConnectionError, Listener};
 pub use discovery::{peer_from_service_info, DiscoveredPeer, Discovery, DiscoveryError, SERVICE_TYPE};
-pub use framing::{read_message, write_message, FramingError};
+pub use framing::{read_frame, read_message, write_frame, write_message, FramingError};
 pub use pairing::{announce_and_identify, start_pairing, PairingError, PendingPairing};
 
 // Re-exported so downstream crates don't need a direct `mdns-sd` dependency

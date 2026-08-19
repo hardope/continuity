@@ -20,6 +20,10 @@ mod media_mac;
 mod media_windows;
 #[cfg(target_os = "linux")]
 mod media_linux;
+#[cfg(all(target_os = "macos", feature = "remote-control"))]
+mod remote_control_mac;
+#[cfg(all(target_os = "windows", feature = "remote-control"))]
+mod remote_control_windows;
 
 use continuity_crypto::{Identity, TrustStore};
 use continuity_daemon::{ArboardClipboard, EngineCommand, EngineConfig, SyncEvent};
@@ -309,6 +313,58 @@ fn handle_sync_event(
         // far); fires once per connection per ping interval (30s), too
         // frequent to be worth a debug log line on its own.
         SyncEvent::PeerActivity { .. } => {}
+        SyncEvent::RemoteControlRequested { peer_id, peer_name, .. } => {
+            // Same shape as the pairing-request dialog above — a fresh,
+            // explicit accept every time, deliberately not a "remember
+            // this device" checkbox (see `Message::RemoteControlRequest`'s
+            // doc comment in continuity-proto).
+            let result = rfd::MessageDialog::new()
+                .set_title("Continuity — Remote Control Request")
+                .set_description(format!(
+                    "'{peer_name}' wants to control this device's keyboard, mouse, and screen.\n\nAllow it?"
+                ))
+                .set_buttons(rfd::MessageButtons::YesNo)
+                .show();
+            let accept = matches!(result, rfd::MessageDialogResult::Yes);
+            let _ = commands.send(EngineCommand::RespondToRemoteControlRequest { peer_crypto_id: peer_id, accept });
+        }
+        SyncEvent::RemoteControlDeclined { peer_name, .. } => {
+            notify(&format!("'{peer_name}' declined the remote control request"));
+        }
+        SyncEvent::RemoteControlSessionStarted { peer_name, role, .. } => {
+            let text = match role {
+                continuity_daemon::RemoteControlRole::Controlled => {
+                    format!("'{peer_name}' is now controlling this device — click here or use the peer's app to end it")
+                }
+                // continuityd has no window/canvas to actually render a
+                // live remote view in yet (tray-only app, no rendering
+                // surface) — starting a *controlling* session from
+                // desktop isn't exposed in this UI at all right now (no
+                // menu action sends `RequestRemoteControl`), so this arm
+                // realistically only fires for a session another shell
+                // initiated against a peer that happens to route its
+                // events through here, which doesn't happen today. Kept
+                // for exhaustiveness and as a marker for that real,
+                // separate follow-up (a real viewer window, not a tray
+                // menu).
+                continuity_daemon::RemoteControlRole::Controlling => {
+                    format!("remote control session with '{peer_name}' started")
+                }
+            };
+            notify(&text);
+        }
+        SyncEvent::RemoteControlSessionEnded { peer_name, reason, .. } => {
+            let text = match reason {
+                Some(reason) => format!("Remote control session with '{peer_name}' ended: {reason}"),
+                None => format!("Remote control session with '{peer_name}' ended"),
+            };
+            notify(&text);
+        }
+        // No viewer surface on desktop (see `RemoteControlSessionStarted`
+        // above) — nothing to do with an incoming frame here yet.
+        SyncEvent::ScreenFrameReceived { frame, .. } => {
+            tracing::debug!("screen frame received ({} bytes) — no desktop viewer yet", frame.len());
+        }
     }
 }
 
@@ -516,12 +572,30 @@ fn start_engine_thread(
                 #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
                 let media: Arc<dyn continuity_daemon::MediaController> = Arc::new(continuity_daemon::NoopMediaController);
 
+                // Real remote-control hosts only exist behind the
+                // `remote-control` Cargo feature (see Cargo.toml) — off,
+                // and every platform (Linux included, which has no real
+                // implementation yet regardless) wires in the `Noop` host,
+                // which is how a "lite" build stays lite: the heavy
+                // platform capture/injection code and the permissions it
+                // triggers (Screen Recording, Accessibility/Input
+                // Monitoring) are compiled out entirely, not just hidden
+                // behind a disabled UI toggle.
+                #[cfg(all(target_os = "macos", feature = "remote-control"))]
+                let remote_control: Arc<dyn continuity_daemon::RemoteControlHost> = Arc::new(remote_control_mac::MacRemoteControlHost::new());
+                #[cfg(all(target_os = "windows", feature = "remote-control"))]
+                let remote_control: Arc<dyn continuity_daemon::RemoteControlHost> =
+                    Arc::new(remote_control_windows::WindowsRemoteControlHost::new());
+                #[cfg(not(all(feature = "remote-control", any(target_os = "macos", target_os = "windows"))))]
+                let remote_control: Arc<dyn continuity_daemon::RemoteControlHost> = Arc::new(continuity_daemon::NoopRemoteControlHost);
+
                 let config = EngineConfig {
                     identity,
                     device_name,
                     trust_store,
                     clipboard: Arc::new(ArboardClipboard),
                     media,
+                    remote_control,
                     received_files_dir: received_files_dir(&profile),
                 };
                 continuity_daemon::start(config).await

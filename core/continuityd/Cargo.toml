@@ -9,6 +9,17 @@ description = "Clipboard, file, and (eventually) keyboard continuity over LAN"
 name = "continuityd"
 path = "src/main.rs"
 
+[features]
+# Real remote-control (keyboard/mouse injection + screen capture) —
+# macOS and Windows only (see remote_control_mac.rs/remote_control_windows.rs).
+# On by default; a "lite" release build passes `--no-default-features` to
+# compile it out entirely rather than just hiding it behind a disabled UI
+# toggle — the heavy platform APIs and the Screen Recording/Accessibility/
+# Input Monitoring permission prompts they trigger never get linked in at
+# all, for anyone who doesn't want this capability on their machine.
+default = ["remote-control"]
+remote-control = []
+
 # Consumed by `cargo deb` (see the "linux" leg of .github/workflows/release.yml)
 # to build a .deb instead of shipping a bare binary that needs its shared-lib
 # runtime dependencies (libxdo3, libayatana-appindicator3-1, etc.) installed
@@ -76,7 +87,10 @@ libc = "0.2"
 
 # Global media-key injection (SendInput) and now-playing metadata reads
 # (the WinRT GlobalSystemMediaTransportControlsSessionManager API) — see
-# src/media_windows.rs.
+# src/media_windows.rs. Win32_Graphics_Gdi/Win32_UI_WindowsAndMessaging
+# are for remote_control_windows.rs's screen capture (classic BitBlt-based
+# GDI capture — see that file's doc comment for why GDI over the newer
+# Desktop Duplication API).
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.58", features = [
     "Media_Control",
@@ -87,7 +101,18 @@ windows = { version = "0.58", features = [
     "Win32_Media_Audio_Endpoints",
     "Win32_System_Com",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
 ] }
+# Pure-Rust JPEG encoding for the captured raw GDI pixel buffer —
+# deliberately not Windows' own WIC (Windows Imaging Component) COM API,
+# which would be more COM interop surface to get exactly right with no
+# way to test it on real Windows in this dev environment. `image` needs
+# no Windows-specific setup at all, just raw RGB bytes in, JPEG bytes out.
+[target.'cfg(target_os = "windows")'.dependencies.image]
+version = "0.25"
+default-features = false
+features = ["jpeg"]
 
 # MPRIS media control/reads over D-Bus — see src/media_linux.rs. Also
 # carries rfd's Linux dialog backend (see the non-Linux `rfd` entry above

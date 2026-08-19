@@ -796,6 +796,14 @@ internal open class UniffiVTableCallbackInterfaceEventListener(
 
 
 
+
+
+
+
+
+
+
+
 // A JNA Library to expose the extern-C FFI definitions.
 // This is an implementation detail which will be called internally by the public API.
 
@@ -837,15 +845,23 @@ internal interface UniffiLib : Library {
     ): Unit
     fun uniffi_continuity_ffi_fn_method_continuityengine_disconnect_peer(`ptr`: Pointer,`peerId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    fun uniffi_continuity_ffi_fn_method_continuityengine_end_remote_control_session(`ptr`: Pointer,`peerId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     fun uniffi_continuity_ffi_fn_method_continuityengine_reconnect_peer(`ptr`: Pointer,`peerId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_continuity_ffi_fn_method_continuityengine_refresh_discovery(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    fun uniffi_continuity_ffi_fn_method_continuityengine_request_remote_control(`ptr`: Pointer,`peerId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     fun uniffi_continuity_ffi_fn_method_continuityengine_reset(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_continuity_ffi_fn_method_continuityengine_respond_to_remote_control_request(`ptr`: Pointer,`peerId`: RustBuffer.ByValue,`accept`: Byte,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_continuity_ffi_fn_method_continuityengine_revoke_device(`ptr`: Pointer,`peerId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_continuity_ffi_fn_method_continuityengine_send_file(`ptr`: Pointer,`peerId`: RustBuffer.ByValue,`path`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_continuity_ffi_fn_method_continuityengine_send_input_event(`ptr`: Pointer,`peerId`: RustBuffer.ByValue,`event`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_continuity_ffi_fn_method_continuityengine_send_media_command(`ptr`: Pointer,`peerId`: RustBuffer.ByValue,`command`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
@@ -991,15 +1007,23 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_continuity_ffi_checksum_method_continuityengine_disconnect_peer(
     ): Short
+    fun uniffi_continuity_ffi_checksum_method_continuityengine_end_remote_control_session(
+    ): Short
     fun uniffi_continuity_ffi_checksum_method_continuityengine_reconnect_peer(
     ): Short
     fun uniffi_continuity_ffi_checksum_method_continuityengine_refresh_discovery(
     ): Short
+    fun uniffi_continuity_ffi_checksum_method_continuityengine_request_remote_control(
+    ): Short
     fun uniffi_continuity_ffi_checksum_method_continuityengine_reset(
+    ): Short
+    fun uniffi_continuity_ffi_checksum_method_continuityengine_respond_to_remote_control_request(
     ): Short
     fun uniffi_continuity_ffi_checksum_method_continuityengine_revoke_device(
     ): Short
     fun uniffi_continuity_ffi_checksum_method_continuityengine_send_file(
+    ): Short
+    fun uniffi_continuity_ffi_checksum_method_continuityengine_send_input_event(
     ): Short
     fun uniffi_continuity_ffi_checksum_method_continuityengine_send_media_command(
     ): Short
@@ -1047,19 +1071,31 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_continuity_ffi_checksum_method_continuityengine_disconnect_peer() != 59509.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_continuity_ffi_checksum_method_continuityengine_end_remote_control_session() != 39245.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_continuity_ffi_checksum_method_continuityengine_reconnect_peer() != 56890.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_continuity_ffi_checksum_method_continuityengine_refresh_discovery() != 59286.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_continuity_ffi_checksum_method_continuityengine_request_remote_control() != 15704.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_continuity_ffi_checksum_method_continuityengine_reset() != 40739.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_continuity_ffi_checksum_method_continuityengine_respond_to_remote_control_request() != 44318.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_continuity_ffi_checksum_method_continuityengine_revoke_device() != 18662.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_continuity_ffi_checksum_method_continuityengine_send_file() != 32648.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_continuity_ffi_checksum_method_continuityengine_send_input_event() != 11621.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_continuity_ffi_checksum_method_continuityengine_send_media_command() != 1860.toShort()) {
@@ -1210,6 +1246,29 @@ public object FfiConverterFloat: FfiConverter<Float, Float> {
 
     override fun write(value: Float, buf: ByteBuffer) {
         buf.putFloat(value)
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterDouble: FfiConverter<Double, Double> {
+    override fun lift(value: Double): Double {
+        return value
+    }
+
+    override fun read(buf: ByteBuffer): Double {
+        return buf.getDouble()
+    }
+
+    override fun lower(value: Double): Double {
+        return value
+    }
+
+    override fun allocationSize(value: Double) = 8UL
+
+    override fun write(value: Double, buf: ByteBuffer) {
+        buf.putDouble(value)
     }
 }
 
@@ -1827,6 +1886,13 @@ public interface ContinuityEngineInterface {
     fun `disconnectPeer`(`peerId`: kotlin.String)
     
     /**
+     * Ends whichever remote-control session is active with `peer_id`,
+     * regardless of which role this device is playing in it. A no-op if
+     * none is active.
+     */
+    fun `endRemoteControlSession`(`peerId`: kotlin.String)
+    
+    /**
      * Re-dials a peer previously dropped with `disconnect_peer`. Emits
      * `FfiSyncEvent::ReconnectFailed` (not an error return — this is
      * fire-and-forget like every other command) if the engine has no
@@ -1843,11 +1909,34 @@ public interface ContinuityEngineInterface {
     fun `refreshDiscovery`()
     
     /**
+     * Asks a connected, trusted peer for permission to control its
+     * keyboard, mouse, and screen. Only meaningful against a desktop
+     * peer (macOS/Windows) — Android/iOS peers always auto-decline
+     * (see `NoopRemoteControlHost` above). Emits
+     * `FfiSyncEvent::RemoteControlDeclined` if refused,
+     * `FfiSyncEvent::RemoteControlSessionStarted` once accepted, after
+     * which `FfiSyncEvent::ScreenFrameReceived` starts arriving and
+     * `send_input_event` starts having an effect.
+     */
+    fun `requestRemoteControl`(`peerId`: kotlin.String)
+    
+    /**
      * Clears every paired device and disconnects all active peers — the
      * host app should confirm with the user before calling this, there's
      * no undo.
      */
     fun `reset`()
+    
+    /**
+     * Answers an inbound `FfiSyncEvent::RemoteControlRequested` from
+     * `peer_id` — call this from whatever UI showed the user that
+     * request. Only relevant if this device itself has a real
+     * `RemoteControlHost` wired in, which today means never on
+     * Android/iOS (see `NoopRemoteControlHost` above) — exposed anyway
+     * for symmetry and because a shared UniFFI surface shouldn't assume
+     * which side of a session any given build is on.
+     */
+    fun `respondToRemoteControlRequest`(`peerId`: kotlin.String, `accept`: kotlin.Boolean)
     
     /**
      * Forgets one specific paired device and closes its connection now —
@@ -1858,6 +1947,16 @@ public interface ContinuityEngineInterface {
     fun `revokeDevice`(`peerId`: kotlin.String)
     
     fun `sendFile`(`peerId`: kotlin.String, `path`: kotlin.String)
+    
+    /**
+     * Sends one input event to `peer_id`, which must have an active
+     * session with this device in the controlling role — silently
+     * dropped otherwise. Fire-and-forget, like `send_media_command`; a
+     * live input stream has no use for a per-event acknowledgement, and
+     * waiting on one would only add latency to exactly the interaction
+     * "low latency" is supposed to mean.
+     */
+    fun `sendInputEvent`(`peerId`: kotlin.String, `event`: FfiInputEventKind)
     
     /**
      * Remote-controls a transport command on `peer_id`'s currently-playing
@@ -1994,6 +2093,22 @@ open class ContinuityEngine: Disposable, AutoCloseable, ContinuityEngineInterfac
 
     
     /**
+     * Ends whichever remote-control session is active with `peer_id`,
+     * regardless of which role this device is playing in it. A no-op if
+     * none is active.
+     */override fun `endRemoteControlSession`(`peerId`: kotlin.String)
+        = 
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_continuity_ffi_fn_method_continuityengine_end_remote_control_session(
+        it, FfiConverterString.lower(`peerId`),_status)
+}
+    }
+    
+    
+
+    
+    /**
      * Re-dials a peer previously dropped with `disconnect_peer`. Emits
      * `FfiSyncEvent::ReconnectFailed` (not an error return — this is
      * fire-and-forget like every other command) if the engine has no
@@ -2028,6 +2143,27 @@ open class ContinuityEngine: Disposable, AutoCloseable, ContinuityEngineInterfac
 
     
     /**
+     * Asks a connected, trusted peer for permission to control its
+     * keyboard, mouse, and screen. Only meaningful against a desktop
+     * peer (macOS/Windows) — Android/iOS peers always auto-decline
+     * (see `NoopRemoteControlHost` above). Emits
+     * `FfiSyncEvent::RemoteControlDeclined` if refused,
+     * `FfiSyncEvent::RemoteControlSessionStarted` once accepted, after
+     * which `FfiSyncEvent::ScreenFrameReceived` starts arriving and
+     * `send_input_event` starts having an effect.
+     */override fun `requestRemoteControl`(`peerId`: kotlin.String)
+        = 
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_continuity_ffi_fn_method_continuityengine_request_remote_control(
+        it, FfiConverterString.lower(`peerId`),_status)
+}
+    }
+    
+    
+
+    
+    /**
      * Clears every paired device and disconnects all active peers — the
      * host app should confirm with the user before calling this, there's
      * no undo.
@@ -2037,6 +2173,26 @@ open class ContinuityEngine: Disposable, AutoCloseable, ContinuityEngineInterfac
     uniffiRustCall() { _status ->
     UniffiLib.INSTANCE.uniffi_continuity_ffi_fn_method_continuityengine_reset(
         it, _status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Answers an inbound `FfiSyncEvent::RemoteControlRequested` from
+     * `peer_id` — call this from whatever UI showed the user that
+     * request. Only relevant if this device itself has a real
+     * `RemoteControlHost` wired in, which today means never on
+     * Android/iOS (see `NoopRemoteControlHost` above) — exposed anyway
+     * for symmetry and because a shared UniFFI surface shouldn't assume
+     * which side of a session any given build is on.
+     */override fun `respondToRemoteControlRequest`(`peerId`: kotlin.String, `accept`: kotlin.Boolean)
+        = 
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_continuity_ffi_fn_method_continuityengine_respond_to_remote_control_request(
+        it, FfiConverterString.lower(`peerId`),FfiConverterBoolean.lower(`accept`),_status)
 }
     }
     
@@ -2065,6 +2221,25 @@ open class ContinuityEngine: Disposable, AutoCloseable, ContinuityEngineInterfac
     uniffiRustCall() { _status ->
     UniffiLib.INSTANCE.uniffi_continuity_ffi_fn_method_continuityengine_send_file(
         it, FfiConverterString.lower(`peerId`),FfiConverterString.lower(`path`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Sends one input event to `peer_id`, which must have an active
+     * session with this device in the controlling role — silently
+     * dropped otherwise. Fire-and-forget, like `send_media_command`; a
+     * live input stream has no use for a per-event acknowledgement, and
+     * waiting on one would only add latency to exactly the interaction
+     * "low latency" is supposed to mean.
+     */override fun `sendInputEvent`(`peerId`: kotlin.String, `event`: FfiInputEventKind)
+        = 
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_continuity_ffi_fn_method_continuityengine_send_input_event(
+        it, FfiConverterString.lower(`peerId`),FfiConverterTypeFfiInputEventKind.lower(`event`),_status)
 }
     }
     
@@ -2627,6 +2802,153 @@ public object FfiConverterTypeFfiError : FfiConverterRustBuffer<FfiException> {
 
 
 /**
+ * Mirrors `continuity_proto::InputEventKind` — see its own doc comment
+ * for why key codes are the platform's own native codes, not a shared
+ * cross-platform enum.
+ */
+sealed class FfiInputEventKind {
+    
+    data class KeyDown(
+        val `code`: kotlin.UInt) : FfiInputEventKind() {
+        companion object
+    }
+    
+    data class KeyUp(
+        val `code`: kotlin.UInt) : FfiInputEventKind() {
+        companion object
+    }
+    
+    data class MouseMove(
+        val `x`: kotlin.Double, 
+        val `y`: kotlin.Double) : FfiInputEventKind() {
+        companion object
+    }
+    
+    data class MouseButton(
+        val `button`: FfiMouseButton, 
+        val `down`: kotlin.Boolean) : FfiInputEventKind() {
+        companion object
+    }
+    
+    data class MouseScroll(
+        val `deltaX`: kotlin.Double, 
+        val `deltaY`: kotlin.Double) : FfiInputEventKind() {
+        companion object
+    }
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiInputEventKind : FfiConverterRustBuffer<FfiInputEventKind>{
+    override fun read(buf: ByteBuffer): FfiInputEventKind {
+        return when(buf.getInt()) {
+            1 -> FfiInputEventKind.KeyDown(
+                FfiConverterUInt.read(buf),
+                )
+            2 -> FfiInputEventKind.KeyUp(
+                FfiConverterUInt.read(buf),
+                )
+            3 -> FfiInputEventKind.MouseMove(
+                FfiConverterDouble.read(buf),
+                FfiConverterDouble.read(buf),
+                )
+            4 -> FfiInputEventKind.MouseButton(
+                FfiConverterTypeFfiMouseButton.read(buf),
+                FfiConverterBoolean.read(buf),
+                )
+            5 -> FfiInputEventKind.MouseScroll(
+                FfiConverterDouble.read(buf),
+                FfiConverterDouble.read(buf),
+                )
+            else -> throw RuntimeException("invalid enum value, something is very wrong!!")
+        }
+    }
+
+    override fun allocationSize(value: FfiInputEventKind) = when(value) {
+        is FfiInputEventKind.KeyDown -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterUInt.allocationSize(value.`code`)
+            )
+        }
+        is FfiInputEventKind.KeyUp -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterUInt.allocationSize(value.`code`)
+            )
+        }
+        is FfiInputEventKind.MouseMove -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterDouble.allocationSize(value.`x`)
+                + FfiConverterDouble.allocationSize(value.`y`)
+            )
+        }
+        is FfiInputEventKind.MouseButton -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterTypeFfiMouseButton.allocationSize(value.`button`)
+                + FfiConverterBoolean.allocationSize(value.`down`)
+            )
+        }
+        is FfiInputEventKind.MouseScroll -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterDouble.allocationSize(value.`deltaX`)
+                + FfiConverterDouble.allocationSize(value.`deltaY`)
+            )
+        }
+    }
+
+    override fun write(value: FfiInputEventKind, buf: ByteBuffer) {
+        when(value) {
+            is FfiInputEventKind.KeyDown -> {
+                buf.putInt(1)
+                FfiConverterUInt.write(value.`code`, buf)
+                Unit
+            }
+            is FfiInputEventKind.KeyUp -> {
+                buf.putInt(2)
+                FfiConverterUInt.write(value.`code`, buf)
+                Unit
+            }
+            is FfiInputEventKind.MouseMove -> {
+                buf.putInt(3)
+                FfiConverterDouble.write(value.`x`, buf)
+                FfiConverterDouble.write(value.`y`, buf)
+                Unit
+            }
+            is FfiInputEventKind.MouseButton -> {
+                buf.putInt(4)
+                FfiConverterTypeFfiMouseButton.write(value.`button`, buf)
+                FfiConverterBoolean.write(value.`down`, buf)
+                Unit
+            }
+            is FfiInputEventKind.MouseScroll -> {
+                buf.putInt(5)
+                FfiConverterDouble.write(value.`deltaX`, buf)
+                FfiConverterDouble.write(value.`deltaY`, buf)
+                Unit
+            }
+        }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
+    }
+}
+
+
+
+
+
+/**
  * Mirrors `continuity_proto::MediaCommand` — see
  * `ContinuityEngine::send_media_command` for where the host language uses
  * this.
@@ -2755,6 +3077,67 @@ public object FfiConverterTypeFfiMediaCommand : FfiConverterRustBuffer<FfiMediaC
 
 
 
+
+enum class FfiMouseButton {
+    
+    LEFT,
+    RIGHT,
+    MIDDLE;
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiMouseButton: FfiConverterRustBuffer<FfiMouseButton> {
+    override fun read(buf: ByteBuffer) = try {
+        FfiMouseButton.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: FfiMouseButton) = 4UL
+
+    override fun write(value: FfiMouseButton, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+
+enum class FfiRemoteControlRole {
+    
+    CONTROLLING,
+    CONTROLLED;
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiRemoteControlRole: FfiConverterRustBuffer<FfiRemoteControlRole> {
+    override fun read(buf: ByteBuffer) = try {
+        FfiRemoteControlRole.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: FfiRemoteControlRole) = 4UL
+
+    override fun write(value: FfiRemoteControlRole, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
 sealed class FfiSyncEvent {
     
     data class Listening(
@@ -2875,6 +3258,38 @@ sealed class FfiSyncEvent {
         companion object
     }
     
+    data class RemoteControlRequested(
+        val `peerId`: kotlin.String, 
+        val `peerName`: kotlin.String) : FfiSyncEvent() {
+        companion object
+    }
+    
+    data class RemoteControlDeclined(
+        val `peerId`: kotlin.String, 
+        val `peerName`: kotlin.String) : FfiSyncEvent() {
+        companion object
+    }
+    
+    data class RemoteControlSessionStarted(
+        val `peerId`: kotlin.String, 
+        val `peerName`: kotlin.String, 
+        val `role`: FfiRemoteControlRole) : FfiSyncEvent() {
+        companion object
+    }
+    
+    data class RemoteControlSessionEnded(
+        val `peerId`: kotlin.String, 
+        val `peerName`: kotlin.String, 
+        val `reason`: kotlin.String?) : FfiSyncEvent() {
+        companion object
+    }
+    
+    data class ScreenFrameReceived(
+        val `peerId`: kotlin.String, 
+        val `frame`: kotlin.ByteArray) : FfiSyncEvent() {
+        companion object
+    }
+    
 
     
     companion object
@@ -2961,6 +3376,28 @@ public object FfiConverterTypeFfiSyncEvent : FfiConverterRustBuffer<FfiSyncEvent
             21 -> FfiSyncEvent.RevokedByPeer(
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
+                )
+            22 -> FfiSyncEvent.RemoteControlRequested(
+                FfiConverterString.read(buf),
+                FfiConverterString.read(buf),
+                )
+            23 -> FfiSyncEvent.RemoteControlDeclined(
+                FfiConverterString.read(buf),
+                FfiConverterString.read(buf),
+                )
+            24 -> FfiSyncEvent.RemoteControlSessionStarted(
+                FfiConverterString.read(buf),
+                FfiConverterString.read(buf),
+                FfiConverterTypeFfiRemoteControlRole.read(buf),
+                )
+            25 -> FfiSyncEvent.RemoteControlSessionEnded(
+                FfiConverterString.read(buf),
+                FfiConverterString.read(buf),
+                FfiConverterOptionalString.read(buf),
+                )
+            26 -> FfiSyncEvent.ScreenFrameReceived(
+                FfiConverterString.read(buf),
+                FfiConverterByteArray.read(buf),
                 )
             else -> throw RuntimeException("invalid enum value, something is very wrong!!")
         }
@@ -3128,6 +3565,48 @@ public object FfiConverterTypeFfiSyncEvent : FfiConverterRustBuffer<FfiSyncEvent
                 + FfiConverterString.allocationSize(value.`peerName`)
             )
         }
+        is FfiSyncEvent.RemoteControlRequested -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`peerId`)
+                + FfiConverterString.allocationSize(value.`peerName`)
+            )
+        }
+        is FfiSyncEvent.RemoteControlDeclined -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`peerId`)
+                + FfiConverterString.allocationSize(value.`peerName`)
+            )
+        }
+        is FfiSyncEvent.RemoteControlSessionStarted -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`peerId`)
+                + FfiConverterString.allocationSize(value.`peerName`)
+                + FfiConverterTypeFfiRemoteControlRole.allocationSize(value.`role`)
+            )
+        }
+        is FfiSyncEvent.RemoteControlSessionEnded -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`peerId`)
+                + FfiConverterString.allocationSize(value.`peerName`)
+                + FfiConverterOptionalString.allocationSize(value.`reason`)
+            )
+        }
+        is FfiSyncEvent.ScreenFrameReceived -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`peerId`)
+                + FfiConverterByteArray.allocationSize(value.`frame`)
+            )
+        }
     }
 
     override fun write(value: FfiSyncEvent, buf: ByteBuffer) {
@@ -3249,6 +3728,38 @@ public object FfiConverterTypeFfiSyncEvent : FfiConverterRustBuffer<FfiSyncEvent
                 buf.putInt(21)
                 FfiConverterString.write(value.`peerId`, buf)
                 FfiConverterString.write(value.`peerName`, buf)
+                Unit
+            }
+            is FfiSyncEvent.RemoteControlRequested -> {
+                buf.putInt(22)
+                FfiConverterString.write(value.`peerId`, buf)
+                FfiConverterString.write(value.`peerName`, buf)
+                Unit
+            }
+            is FfiSyncEvent.RemoteControlDeclined -> {
+                buf.putInt(23)
+                FfiConverterString.write(value.`peerId`, buf)
+                FfiConverterString.write(value.`peerName`, buf)
+                Unit
+            }
+            is FfiSyncEvent.RemoteControlSessionStarted -> {
+                buf.putInt(24)
+                FfiConverterString.write(value.`peerId`, buf)
+                FfiConverterString.write(value.`peerName`, buf)
+                FfiConverterTypeFfiRemoteControlRole.write(value.`role`, buf)
+                Unit
+            }
+            is FfiSyncEvent.RemoteControlSessionEnded -> {
+                buf.putInt(25)
+                FfiConverterString.write(value.`peerId`, buf)
+                FfiConverterString.write(value.`peerName`, buf)
+                FfiConverterOptionalString.write(value.`reason`, buf)
+                Unit
+            }
+            is FfiSyncEvent.ScreenFrameReceived -> {
+                buf.putInt(26)
+                FfiConverterString.write(value.`peerId`, buf)
+                FfiConverterByteArray.write(value.`frame`, buf)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }

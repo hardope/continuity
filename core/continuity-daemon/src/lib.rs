@@ -9,13 +9,15 @@ mod clipboard;
 mod engine;
 mod events;
 mod media;
+mod remote_control;
 
 pub use clipboard::ClipboardBackend;
 #[cfg(feature = "arboard-clipboard")]
 pub use clipboard::ArboardClipboard;
 pub use engine::{start, EngineConfig, EngineHandle};
-pub use events::{EngineCommand, SyncEvent};
+pub use events::{EngineCommand, RemoteControlRole, SyncEvent};
 pub use media::{MediaController, NoopMediaController};
+pub use remote_control::{NoopRemoteControlHost, RemoteControlHost};
 
 pub fn default_device_name() -> String {
     hostname::get()

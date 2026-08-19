@@ -171,6 +171,68 @@ pub enum FfiSyncEvent {
     PeerActivity { peer_id: String, seconds_since_activity: u64 },
     WasRevoked { peer_id: String, peer_name: String },
     RevokedByPeer { peer_id: String, peer_name: String },
+    RemoteControlRequested { peer_id: String, peer_name: String },
+    RemoteControlDeclined { peer_id: String, peer_name: String },
+    RemoteControlSessionStarted { peer_id: String, peer_name: String, role: FfiRemoteControlRole },
+    RemoteControlSessionEnded { peer_id: String, peer_name: String, reason: Option<String> },
+    ScreenFrameReceived { peer_id: String, frame: Vec<u8> },
+}
+
+#[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FfiRemoteControlRole {
+    Controlling,
+    Controlled,
+}
+
+impl From<continuity_daemon::RemoteControlRole> for FfiRemoteControlRole {
+    fn from(role: continuity_daemon::RemoteControlRole) -> Self {
+        match role {
+            continuity_daemon::RemoteControlRole::Controlling => FfiRemoteControlRole::Controlling,
+            continuity_daemon::RemoteControlRole::Controlled => FfiRemoteControlRole::Controlled,
+        }
+    }
+}
+
+/// Mirrors `continuity_proto::InputEventKind` — see its own doc comment
+/// for why key codes are the platform's own native codes, not a shared
+/// cross-platform enum.
+#[derive(uniffi::Enum, Debug, Clone, Copy)]
+pub enum FfiInputEventKind {
+    KeyDown { code: u32 },
+    KeyUp { code: u32 },
+    MouseMove { x: f64, y: f64 },
+    MouseButton { button: FfiMouseButton, down: bool },
+    MouseScroll { delta_x: f64, delta_y: f64 },
+}
+
+impl From<FfiInputEventKind> for continuity_proto::InputEventKind {
+    fn from(e: FfiInputEventKind) -> Self {
+        use continuity_proto::InputEventKind as I;
+        match e {
+            FfiInputEventKind::KeyDown { code } => I::KeyDown { code },
+            FfiInputEventKind::KeyUp { code } => I::KeyUp { code },
+            FfiInputEventKind::MouseMove { x, y } => I::MouseMove { x, y },
+            FfiInputEventKind::MouseButton { button, down } => I::MouseButton { button: button.into(), down },
+            FfiInputEventKind::MouseScroll { delta_x, delta_y } => I::MouseScroll { delta_x, delta_y },
+        }
+    }
+}
+
+#[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FfiMouseButton {
+    Left,
+    Right,
+    Middle,
+}
+
+impl From<FfiMouseButton> for continuity_proto::MouseButton {
+    fn from(b: FfiMouseButton) -> Self {
+        match b {
+            FfiMouseButton::Left => continuity_proto::MouseButton::Left,
+            FfiMouseButton::Right => continuity_proto::MouseButton::Right,
+            FfiMouseButton::Middle => continuity_proto::MouseButton::Middle,
+        }
+    }
 }
 
 impl From<continuity_daemon::SyncEvent> for FfiSyncEvent {
@@ -210,6 +272,15 @@ impl From<continuity_daemon::SyncEvent> for FfiSyncEvent {
             }
             E::WasRevoked { peer_id, peer_name } => FfiSyncEvent::WasRevoked { peer_id, peer_name },
             E::RevokedByPeer { peer_id, peer_name } => FfiSyncEvent::RevokedByPeer { peer_id, peer_name },
+            E::RemoteControlRequested { peer_id, peer_name, .. } => FfiSyncEvent::RemoteControlRequested { peer_id, peer_name },
+            E::RemoteControlDeclined { peer_id, peer_name } => FfiSyncEvent::RemoteControlDeclined { peer_id, peer_name },
+            E::RemoteControlSessionStarted { peer_id, peer_name, role, .. } => {
+                FfiSyncEvent::RemoteControlSessionStarted { peer_id, peer_name, role: role.into() }
+            }
+            E::RemoteControlSessionEnded { peer_id, peer_name, reason, .. } => {
+                FfiSyncEvent::RemoteControlSessionEnded { peer_id, peer_name, reason }
+            }
+            E::ScreenFrameReceived { peer_id, frame, .. } => FfiSyncEvent::ScreenFrameReceived { peer_id, frame },
         }
     }
 }
@@ -293,6 +364,16 @@ impl ContinuityEngine {
                     // ContinuityEngine::send_media_command below), it
                     // doesn't need to act on receiving one.
                     media: Arc::new(continuity_daemon::NoopMediaController),
+                    // Android/iOS are remote-control *controllers* only
+                    // (see `ContinuityEngine::request_remote_control`
+                    // etc. below) — never a controllable target. Wiring
+                    // in `NoopRemoteControlHost` here means an inbound
+                    // `RemoteControlRequest` against a phone gets
+                    // auto-declined by the engine itself, not just hidden
+                    // behind a missing UI button; there's no code path
+                    // that could accidentally expose a phone's screen or
+                    // inject input into it.
+                    remote_control: Arc::new(continuity_daemon::NoopRemoteControlHost),
                     received_files_dir: PathBuf::from(received_files_dir),
                 };
                 continuity_daemon::start(config).await.map_err(|e| e.to_string())
@@ -394,6 +475,46 @@ impl ContinuityEngine {
     /// this, same as `reset`.
     pub fn revoke_device(&self, peer_id: String) {
         let _ = self.commands.send(EngineCommand::RevokeDevice { peer_crypto_id: peer_id });
+    }
+
+    /// Asks a connected, trusted peer for permission to control its
+    /// keyboard, mouse, and screen. Only meaningful against a desktop
+    /// peer (macOS/Windows) — Android/iOS peers always auto-decline
+    /// (see `NoopRemoteControlHost` above). Emits
+    /// `FfiSyncEvent::RemoteControlDeclined` if refused,
+    /// `FfiSyncEvent::RemoteControlSessionStarted` once accepted, after
+    /// which `FfiSyncEvent::ScreenFrameReceived` starts arriving and
+    /// `send_input_event` starts having an effect.
+    pub fn request_remote_control(&self, peer_id: String) {
+        let _ = self.commands.send(EngineCommand::RequestRemoteControl { peer_crypto_id: peer_id });
+    }
+
+    /// Answers an inbound `FfiSyncEvent::RemoteControlRequested` from
+    /// `peer_id` — call this from whatever UI showed the user that
+    /// request. Only relevant if this device itself has a real
+    /// `RemoteControlHost` wired in, which today means never on
+    /// Android/iOS (see `NoopRemoteControlHost` above) — exposed anyway
+    /// for symmetry and because a shared UniFFI surface shouldn't assume
+    /// which side of a session any given build is on.
+    pub fn respond_to_remote_control_request(&self, peer_id: String, accept: bool) {
+        let _ = self.commands.send(EngineCommand::RespondToRemoteControlRequest { peer_crypto_id: peer_id, accept });
+    }
+
+    /// Sends one input event to `peer_id`, which must have an active
+    /// session with this device in the controlling role — silently
+    /// dropped otherwise. Fire-and-forget, like `send_media_command`; a
+    /// live input stream has no use for a per-event acknowledgement, and
+    /// waiting on one would only add latency to exactly the interaction
+    /// "low latency" is supposed to mean.
+    pub fn send_input_event(&self, peer_id: String, event: FfiInputEventKind) {
+        let _ = self.commands.send(EngineCommand::SendInputEvent { peer_crypto_id: peer_id, event: event.into() });
+    }
+
+    /// Ends whichever remote-control session is active with `peer_id`,
+    /// regardless of which role this device is playing in it. A no-op if
+    /// none is active.
+    pub fn end_remote_control_session(&self, peer_id: String) {
+        let _ = self.commands.send(EngineCommand::EndRemoteControlSession { peer_crypto_id: peer_id });
     }
 }
 

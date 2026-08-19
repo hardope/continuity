@@ -294,3 +294,11 @@ jobs:
         with:
           files: artifacts/*
           generate_release_notes: true
+          # Standard semver pre-release convention: a tag like
+          # `v0.1.5-beta.1` gets flagged as a GitHub pre-release (shown
+          # with a "Pre-release" badge, excluded from "Latest" and from
+          # what a plain `git clone`/update-checker treating "Latest"
+          # specially would pick up); a plain `v0.1.5` doesn't. Driven
+          # entirely by the tag name — nothing else to set by hand when
+          # cutting one.
+          prerelease: ${{ contains(github.ref_name, '-') }}

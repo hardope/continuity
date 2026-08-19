@@ -28,6 +28,7 @@ pub async fn run(profile: &str, name: Option<String>) -> anyhow::Result<()> {
         trust_store,
         clipboard: Arc::new(ArboardClipboard),
         media: Arc::new(continuity_daemon::NoopMediaController),
+        remote_control: Arc::new(continuity_daemon::NoopRemoteControlHost),
         received_files_dir: received_files_dir(profile),
     };
 
@@ -121,6 +122,25 @@ fn handle_event(event: SyncEvent, cli_state: &CliState) {
         SyncEvent::WasRevoked { peer_name, .. } => println!("forgot '{peer_name}'"),
         SyncEvent::RevokedByPeer { peer_name, .. } => {
             println!("'{peer_name}' removed this device — pair again to reconnect");
+        }
+        // continuityctl wires in `NoopRemoteControlHost`, so an inbound
+        // `RemoteControlRequest` is always auto-declined before this ever
+        // fires — kept here anyway for the same reason `handle_event`
+        // covers every variant rather than a wildcard, and so a future
+        // `remote <id>` test command has somewhere to print to.
+        SyncEvent::RemoteControlRequested { peer_name, .. } => {
+            println!("'{peer_name}' requested remote control (this CLI can't grant it)");
+        }
+        SyncEvent::RemoteControlDeclined { peer_name, .. } => println!("'{peer_name}' declined remote control"),
+        SyncEvent::RemoteControlSessionStarted { peer_name, role, .. } => {
+            println!("remote control session with '{peer_name}' started ({role:?})");
+        }
+        SyncEvent::RemoteControlSessionEnded { peer_name, reason, .. } => match reason {
+            Some(reason) => println!("remote control session with '{peer_name}' ended: {reason}"),
+            None => println!("remote control session with '{peer_name}' ended"),
+        },
+        SyncEvent::ScreenFrameReceived { frame, .. } => {
+            tracing::debug!("screen frame received ({} bytes)", frame.len());
         }
     }
 }

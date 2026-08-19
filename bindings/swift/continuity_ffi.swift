@@ -463,6 +463,22 @@ fileprivate struct FfiConverterFloat: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterDouble: FfiConverterPrimitive {
+    typealias FfiType = Double
+    typealias SwiftType = Double
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Double {
+        return try lift(readDouble(&buf))
+    }
+
+    public static func write(_ value: Double, into buf: inout [UInt8]) {
+        writeDouble(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterBool : FfiConverter {
     typealias FfiType = Int8
     typealias SwiftType = Bool
@@ -778,6 +794,13 @@ public protocol ContinuityEngineProtocol : AnyObject {
     func disconnectPeer(peerId: String) 
     
     /**
+     * Ends whichever remote-control session is active with `peer_id`,
+     * regardless of which role this device is playing in it. A no-op if
+     * none is active.
+     */
+    func endRemoteControlSession(peerId: String) 
+    
+    /**
      * Re-dials a peer previously dropped with `disconnect_peer`. Emits
      * `FfiSyncEvent::ReconnectFailed` (not an error return — this is
      * fire-and-forget like every other command) if the engine has no
@@ -794,11 +817,34 @@ public protocol ContinuityEngineProtocol : AnyObject {
     func refreshDiscovery() 
     
     /**
+     * Asks a connected, trusted peer for permission to control its
+     * keyboard, mouse, and screen. Only meaningful against a desktop
+     * peer (macOS/Windows) — Android/iOS peers always auto-decline
+     * (see `NoopRemoteControlHost` above). Emits
+     * `FfiSyncEvent::RemoteControlDeclined` if refused,
+     * `FfiSyncEvent::RemoteControlSessionStarted` once accepted, after
+     * which `FfiSyncEvent::ScreenFrameReceived` starts arriving and
+     * `send_input_event` starts having an effect.
+     */
+    func requestRemoteControl(peerId: String) 
+    
+    /**
      * Clears every paired device and disconnects all active peers — the
      * host app should confirm with the user before calling this, there's
      * no undo.
      */
     func reset() 
+    
+    /**
+     * Answers an inbound `FfiSyncEvent::RemoteControlRequested` from
+     * `peer_id` — call this from whatever UI showed the user that
+     * request. Only relevant if this device itself has a real
+     * `RemoteControlHost` wired in, which today means never on
+     * Android/iOS (see `NoopRemoteControlHost` above) — exposed anyway
+     * for symmetry and because a shared UniFFI surface shouldn't assume
+     * which side of a session any given build is on.
+     */
+    func respondToRemoteControlRequest(peerId: String, accept: Bool) 
     
     /**
      * Forgets one specific paired device and closes its connection now —
@@ -809,6 +855,16 @@ public protocol ContinuityEngineProtocol : AnyObject {
     func revokeDevice(peerId: String) 
     
     func sendFile(peerId: String, path: String) 
+    
+    /**
+     * Sends one input event to `peer_id`, which must have an active
+     * session with this device in the controlling role — silently
+     * dropped otherwise. Fire-and-forget, like `send_media_command`; a
+     * live input stream has no use for a per-event acknowledgement, and
+     * waiting on one would only add latency to exactly the interaction
+     * "low latency" is supposed to mean.
+     */
+    func sendInputEvent(peerId: String, event: FfiInputEventKind) 
     
     /**
      * Remote-controls a transport command on `peer_id`'s currently-playing
@@ -930,6 +986,18 @@ open func disconnectPeer(peerId: String) {try! rustCall() {
 }
     
     /**
+     * Ends whichever remote-control session is active with `peer_id`,
+     * regardless of which role this device is playing in it. A no-op if
+     * none is active.
+     */
+open func endRemoteControlSession(peerId: String) {try! rustCall() {
+    uniffi_continuity_ffi_fn_method_continuityengine_end_remote_control_session(self.uniffiClonePointer(),
+        FfiConverterString.lower(peerId),$0
+    )
+}
+}
+    
+    /**
      * Re-dials a peer previously dropped with `disconnect_peer`. Emits
      * `FfiSyncEvent::ReconnectFailed` (not an error return — this is
      * fire-and-forget like every other command) if the engine has no
@@ -955,12 +1023,46 @@ open func refreshDiscovery() {try! rustCall() {
 }
     
     /**
+     * Asks a connected, trusted peer for permission to control its
+     * keyboard, mouse, and screen. Only meaningful against a desktop
+     * peer (macOS/Windows) — Android/iOS peers always auto-decline
+     * (see `NoopRemoteControlHost` above). Emits
+     * `FfiSyncEvent::RemoteControlDeclined` if refused,
+     * `FfiSyncEvent::RemoteControlSessionStarted` once accepted, after
+     * which `FfiSyncEvent::ScreenFrameReceived` starts arriving and
+     * `send_input_event` starts having an effect.
+     */
+open func requestRemoteControl(peerId: String) {try! rustCall() {
+    uniffi_continuity_ffi_fn_method_continuityengine_request_remote_control(self.uniffiClonePointer(),
+        FfiConverterString.lower(peerId),$0
+    )
+}
+}
+    
+    /**
      * Clears every paired device and disconnects all active peers — the
      * host app should confirm with the user before calling this, there's
      * no undo.
      */
 open func reset() {try! rustCall() {
     uniffi_continuity_ffi_fn_method_continuityengine_reset(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
+    /**
+     * Answers an inbound `FfiSyncEvent::RemoteControlRequested` from
+     * `peer_id` — call this from whatever UI showed the user that
+     * request. Only relevant if this device itself has a real
+     * `RemoteControlHost` wired in, which today means never on
+     * Android/iOS (see `NoopRemoteControlHost` above) — exposed anyway
+     * for symmetry and because a shared UniFFI surface shouldn't assume
+     * which side of a session any given build is on.
+     */
+open func respondToRemoteControlRequest(peerId: String, accept: Bool) {try! rustCall() {
+    uniffi_continuity_ffi_fn_method_continuityengine_respond_to_remote_control_request(self.uniffiClonePointer(),
+        FfiConverterString.lower(peerId),
+        FfiConverterBool.lower(accept),$0
     )
 }
 }
@@ -982,6 +1084,22 @@ open func sendFile(peerId: String, path: String) {try! rustCall() {
     uniffi_continuity_ffi_fn_method_continuityengine_send_file(self.uniffiClonePointer(),
         FfiConverterString.lower(peerId),
         FfiConverterString.lower(path),$0
+    )
+}
+}
+    
+    /**
+     * Sends one input event to `peer_id`, which must have an active
+     * session with this device in the controlling role — silently
+     * dropped otherwise. Fire-and-forget, like `send_media_command`; a
+     * live input stream has no use for a per-event acknowledgement, and
+     * waiting on one would only add latency to exactly the interaction
+     * "low latency" is supposed to mean.
+     */
+open func sendInputEvent(peerId: String, event: FfiInputEventKind) {try! rustCall() {
+    uniffi_continuity_ffi_fn_method_continuityengine_send_input_event(self.uniffiClonePointer(),
+        FfiConverterString.lower(peerId),
+        FfiConverterTypeFfiInputEventKind.lower(event),$0
     )
 }
 }
@@ -1548,6 +1666,114 @@ extension FfiError: Foundation.LocalizedError {
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * Mirrors `continuity_proto::InputEventKind` — see its own doc comment
+ * for why key codes are the platform's own native codes, not a shared
+ * cross-platform enum.
+ */
+
+public enum FfiInputEventKind {
+    
+    case keyDown(code: UInt32
+    )
+    case keyUp(code: UInt32
+    )
+    case mouseMove(x: Double, y: Double
+    )
+    case mouseButton(button: FfiMouseButton, down: Bool
+    )
+    case mouseScroll(deltaX: Double, deltaY: Double
+    )
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiInputEventKind: FfiConverterRustBuffer {
+    typealias SwiftType = FfiInputEventKind
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiInputEventKind {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .keyDown(code: try FfiConverterUInt32.read(from: &buf)
+        )
+        
+        case 2: return .keyUp(code: try FfiConverterUInt32.read(from: &buf)
+        )
+        
+        case 3: return .mouseMove(x: try FfiConverterDouble.read(from: &buf), y: try FfiConverterDouble.read(from: &buf)
+        )
+        
+        case 4: return .mouseButton(button: try FfiConverterTypeFfiMouseButton.read(from: &buf), down: try FfiConverterBool.read(from: &buf)
+        )
+        
+        case 5: return .mouseScroll(deltaX: try FfiConverterDouble.read(from: &buf), deltaY: try FfiConverterDouble.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiInputEventKind, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .keyDown(code):
+            writeInt(&buf, Int32(1))
+            FfiConverterUInt32.write(code, into: &buf)
+            
+        
+        case let .keyUp(code):
+            writeInt(&buf, Int32(2))
+            FfiConverterUInt32.write(code, into: &buf)
+            
+        
+        case let .mouseMove(x,y):
+            writeInt(&buf, Int32(3))
+            FfiConverterDouble.write(x, into: &buf)
+            FfiConverterDouble.write(y, into: &buf)
+            
+        
+        case let .mouseButton(button,down):
+            writeInt(&buf, Int32(4))
+            FfiConverterTypeFfiMouseButton.write(button, into: &buf)
+            FfiConverterBool.write(down, into: &buf)
+            
+        
+        case let .mouseScroll(deltaX,deltaY):
+            writeInt(&buf, Int32(5))
+            FfiConverterDouble.write(deltaX, into: &buf)
+            FfiConverterDouble.write(deltaY, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiInputEventKind_lift(_ buf: RustBuffer) throws -> FfiInputEventKind {
+    return try FfiConverterTypeFfiInputEventKind.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiInputEventKind_lower(_ value: FfiInputEventKind) -> RustBuffer {
+    return FfiConverterTypeFfiInputEventKind.lower(value)
+}
+
+
+
+extension FfiInputEventKind: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * Mirrors `continuity_proto::MediaCommand` — see
  * `ContinuityEngine::send_media_command` for where the host language uses
  * this.
@@ -1652,6 +1878,141 @@ extension FfiMediaCommand: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
+public enum FfiMouseButton {
+    
+    case left
+    case right
+    case middle
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiMouseButton: FfiConverterRustBuffer {
+    typealias SwiftType = FfiMouseButton
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiMouseButton {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .left
+        
+        case 2: return .right
+        
+        case 3: return .middle
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiMouseButton, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .left:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .right:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .middle:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiMouseButton_lift(_ buf: RustBuffer) throws -> FfiMouseButton {
+    return try FfiConverterTypeFfiMouseButton.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiMouseButton_lower(_ value: FfiMouseButton) -> RustBuffer {
+    return FfiConverterTypeFfiMouseButton.lower(value)
+}
+
+
+
+extension FfiMouseButton: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum FfiRemoteControlRole {
+    
+    case controlling
+    case controlled
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiRemoteControlRole: FfiConverterRustBuffer {
+    typealias SwiftType = FfiRemoteControlRole
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiRemoteControlRole {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .controlling
+        
+        case 2: return .controlled
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiRemoteControlRole, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .controlling:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .controlled:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiRemoteControlRole_lift(_ buf: RustBuffer) throws -> FfiRemoteControlRole {
+    return try FfiConverterTypeFfiRemoteControlRole.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiRemoteControlRole_lower(_ value: FfiRemoteControlRole) -> RustBuffer {
+    return FfiConverterTypeFfiRemoteControlRole.lower(value)
+}
+
+
+
+extension FfiRemoteControlRole: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
 public enum FfiSyncEvent {
     
     case listening(port: UInt16
@@ -1694,6 +2055,16 @@ public enum FfiSyncEvent {
     case wasRevoked(peerId: String, peerName: String
     )
     case revokedByPeer(peerId: String, peerName: String
+    )
+    case remoteControlRequested(peerId: String, peerName: String
+    )
+    case remoteControlDeclined(peerId: String, peerName: String
+    )
+    case remoteControlSessionStarted(peerId: String, peerName: String, role: FfiRemoteControlRole
+    )
+    case remoteControlSessionEnded(peerId: String, peerName: String, reason: String?
+    )
+    case screenFrameReceived(peerId: String, frame: Data
     )
 }
 
@@ -1768,6 +2139,21 @@ public struct FfiConverterTypeFfiSyncEvent: FfiConverterRustBuffer {
         )
         
         case 21: return .revokedByPeer(peerId: try FfiConverterString.read(from: &buf), peerName: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 22: return .remoteControlRequested(peerId: try FfiConverterString.read(from: &buf), peerName: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 23: return .remoteControlDeclined(peerId: try FfiConverterString.read(from: &buf), peerName: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 24: return .remoteControlSessionStarted(peerId: try FfiConverterString.read(from: &buf), peerName: try FfiConverterString.read(from: &buf), role: try FfiConverterTypeFfiRemoteControlRole.read(from: &buf)
+        )
+        
+        case 25: return .remoteControlSessionEnded(peerId: try FfiConverterString.read(from: &buf), peerName: try FfiConverterString.read(from: &buf), reason: try FfiConverterOptionString.read(from: &buf)
+        )
+        
+        case 26: return .screenFrameReceived(peerId: try FfiConverterString.read(from: &buf), frame: try FfiConverterData.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -1895,6 +2281,38 @@ public struct FfiConverterTypeFfiSyncEvent: FfiConverterRustBuffer {
             writeInt(&buf, Int32(21))
             FfiConverterString.write(peerId, into: &buf)
             FfiConverterString.write(peerName, into: &buf)
+            
+        
+        case let .remoteControlRequested(peerId,peerName):
+            writeInt(&buf, Int32(22))
+            FfiConverterString.write(peerId, into: &buf)
+            FfiConverterString.write(peerName, into: &buf)
+            
+        
+        case let .remoteControlDeclined(peerId,peerName):
+            writeInt(&buf, Int32(23))
+            FfiConverterString.write(peerId, into: &buf)
+            FfiConverterString.write(peerName, into: &buf)
+            
+        
+        case let .remoteControlSessionStarted(peerId,peerName,role):
+            writeInt(&buf, Int32(24))
+            FfiConverterString.write(peerId, into: &buf)
+            FfiConverterString.write(peerName, into: &buf)
+            FfiConverterTypeFfiRemoteControlRole.write(role, into: &buf)
+            
+        
+        case let .remoteControlSessionEnded(peerId,peerName,reason):
+            writeInt(&buf, Int32(25))
+            FfiConverterString.write(peerId, into: &buf)
+            FfiConverterString.write(peerName, into: &buf)
+            FfiConverterOptionString.write(reason, into: &buf)
+            
+        
+        case let .screenFrameReceived(peerId,frame):
+            writeInt(&buf, Int32(26))
+            FfiConverterString.write(peerId, into: &buf)
+            FfiConverterData.write(frame, into: &buf)
             
         }
     }
@@ -2043,19 +2461,31 @@ private var initializationResult: InitializationResult = {
     if (uniffi_continuity_ffi_checksum_method_continuityengine_disconnect_peer() != 59509) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_continuity_ffi_checksum_method_continuityengine_end_remote_control_session() != 39245) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_continuity_ffi_checksum_method_continuityengine_reconnect_peer() != 56890) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_continuity_ffi_checksum_method_continuityengine_refresh_discovery() != 59286) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_continuity_ffi_checksum_method_continuityengine_request_remote_control() != 15704) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_continuity_ffi_checksum_method_continuityengine_reset() != 40739) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_continuity_ffi_checksum_method_continuityengine_respond_to_remote_control_request() != 44318) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_continuity_ffi_checksum_method_continuityengine_revoke_device() != 18662) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_continuity_ffi_checksum_method_continuityengine_send_file() != 32648) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_continuity_ffi_checksum_method_continuityengine_send_input_event() != 11621) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_continuity_ffi_checksum_method_continuityengine_send_media_command() != 1860) {

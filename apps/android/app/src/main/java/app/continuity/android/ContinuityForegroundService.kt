@@ -162,6 +162,11 @@ class ContinuityForegroundService : Service() {
             // WasReset below — there's no one who needs telling who isn't
             // already looking at the screen.
             is FfiSyncEvent.RevokedByPeer -> "'${event.peerName}' removed this device — pair again to reconnect"
+            // A peer saying no to a remote-control request is worth a
+            // notification for the same reason PairingDeclined is above
+            // — you might not be looking at the app when the answer
+            // comes back.
+            is FfiSyncEvent.RemoteControlDeclined -> "'${event.peerName}' declined the remote control request"
             is FfiSyncEvent.Paired,
             is FfiSyncEvent.Connected,
             is FfiSyncEvent.Disconnected,
@@ -175,6 +180,19 @@ class ContinuityForegroundService : Service() {
             is FfiSyncEvent.NowPlayingChanged,
             is FfiSyncEvent.PeerDiscovered,
             is FfiSyncEvent.PeerActivity,
+            // Android is a remote-control *controller* only (see
+            // EngineHolder's `NoopRemoteControlHost` wiring) — an
+            // inbound `RemoteControlRequested` against this device is
+            // auto-declined by the engine before it's ever emitted, so
+            // this arm exists only for exhaustiveness. Session
+            // started/ended and frame delivery are all tied to the
+            // interactive, foreground `RemoteControlScreen` in
+            // MainActivity — nothing background-notification-worthy
+            // about them.
+            is FfiSyncEvent.RemoteControlRequested,
+            is FfiSyncEvent.RemoteControlSessionStarted,
+            is FfiSyncEvent.RemoteControlSessionEnded,
+            is FfiSyncEvent.ScreenFrameReceived,
             -> return
         }
 

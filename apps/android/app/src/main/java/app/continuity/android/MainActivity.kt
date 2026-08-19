@@ -20,9 +20,13 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -41,6 +45,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Keyboard
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Error
 import androidx.compose.material.icons.filled.ExpandLess
@@ -57,6 +62,7 @@ import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PauseCircle
 import androidx.compose.material.icons.filled.PersonRemove
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.ScreenShare
 import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Sensors
@@ -74,6 +80,7 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledIconButton
+import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -100,7 +107,13 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.boundsInParent
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -209,6 +222,13 @@ private fun ContinuityScreen(onFilePickerRequested: ((Uri) -> Unit) -> Unit) {
     var pendingForget by remember { mutableStateOf<Pair<String, String>?>(null) }
     var activityExpanded by remember { mutableStateOf(false) }
     var fullScreenPlayerPeerId by remember { mutableStateOf<String?>(null) }
+    // Non-null only while this device is the *controlling* side of an
+    // active remote-control session — Android never itself gets
+    // controlled (see EngineHolder's `NoopRemoteControlHost` wiring), so
+    // there's no separate "being controlled" state to track here.
+    var remoteControlPeerId by remember { mutableStateOf<String?>(null) }
+    var remoteControlPeerName by remember { mutableStateOf<String?>(null) }
+    var latestRemoteFrame by remember { mutableStateOf<ByteArray?>(null) }
     val activity = remember { mutableStateListOf<ActivityEntry>() }
     // Drives the "active Ns ago" labels in DeviceListCard — they're
     // computed from a stored timestamp, not pushed on every tick, so
@@ -312,6 +332,38 @@ private fun ContinuityScreen(onFilePickerRequested: ((Uri) -> Unit) -> Unit) {
                     nowPlaying.remove(event.peerId)
                     activity.add(0, ActivityEntry(Icons.Default.PersonRemove, "'${event.peerName}' removed this device", warningColor))
                 }
+                is FfiSyncEvent.RemoteControlDeclined -> {
+                    activity.add(0, ActivityEntry(Icons.Default.Error, "'${event.peerName}' declined remote control", warningColor))
+                }
+                is FfiSyncEvent.RemoteControlSessionStarted -> {
+                    // Android is controller-only (see EngineHolder's
+                    // `NoopRemoteControlHost`) — a `Controlled`-role
+                    // start would mean this device itself was somehow
+                    // accepted as a target, which should never happen;
+                    // ignored defensively rather than opening a
+                    // nonsensical "you're controlling yourself" view.
+                    if (event.role == uniffi.continuity_ffi.FfiRemoteControlRole.CONTROLLING) {
+                        remoteControlPeerId = event.peerId
+                        remoteControlPeerName = event.peerName
+                        latestRemoteFrame = null
+                        activity.add(0, ActivityEntry(Icons.Default.VerifiedUser, "Controlling '${event.peerName}'", successColor))
+                    }
+                }
+                is FfiSyncEvent.RemoteControlSessionEnded -> {
+                    if (event.peerId == remoteControlPeerId) {
+                        remoteControlPeerId = null
+                        remoteControlPeerName = null
+                        latestRemoteFrame = null
+                    }
+                    val text = event.reason?.let { "Remote control of '${event.peerName}' ended: $it" }
+                        ?: "Remote control of '${event.peerName}' ended"
+                    activity.add(0, ActivityEntry(Icons.Default.LinkOff, text, if (event.reason != null) warningColor else null))
+                }
+                is FfiSyncEvent.ScreenFrameReceived -> {
+                    if (event.peerId == remoteControlPeerId) {
+                        latestRemoteFrame = event.frame
+                    }
+                }
                 else -> {}
             }
         }
@@ -407,6 +459,7 @@ private fun ContinuityScreen(onFilePickerRequested: ((Uri) -> Unit) -> Unit) {
                 onForget = { peerId, name -> pendingForget = peerId to name },
                 onMediaCommand = { peerId, command -> EngineHolder.engine?.sendMediaCommand(peerId, command) },
                 onOpenFullScreenPlayer = { peerId -> fullScreenPlayerPeerId = peerId },
+                onRequestRemoteControl = { peerId -> EngineHolder.engine?.requestRemoteControl(peerId) },
             )
             DeviceIdRow(deviceId = deviceId, onCopy = {
                 val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
@@ -614,6 +667,17 @@ private fun ContinuityScreen(onFilePickerRequested: ((Uri) -> Unit) -> Unit) {
             )
         }
     }
+
+    val remoteControlPeer = remoteControlPeerId
+    if (remoteControlPeer != null) {
+        RemoteControlScreen(
+            peerName = remoteControlPeerName ?: remoteControlPeer,
+            platform = devices[remoteControlPeer]?.platform ?: "mac_os",
+            frame = latestRemoteFrame,
+            onInputEvent = { event -> EngineHolder.engine?.sendInputEvent(remoteControlPeer, event) },
+            onEnd = { EngineHolder.engine?.endRemoteControlSession(remoteControlPeer) },
+        )
+    }
 }
 
 /// Untrusted devices seen on the network — the engine deliberately doesn't
@@ -700,6 +764,7 @@ private fun DeviceListCard(
     onForget: (peerId: String, name: String) -> Unit,
     onMediaCommand: (peerId: String, command: uniffi.continuity_ffi.FfiMediaCommand) -> Unit,
     onOpenFullScreenPlayer: (String) -> Unit,
+    onRequestRemoteControl: (peerId: String) -> Unit,
 ) {
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -795,6 +860,26 @@ private fun DeviceListCard(
                                     contentDescription = "Forget ${status.name}",
                                     tint = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
+                            }
+                        }
+                        // Remote control only has a real implementation on
+                        // macOS and Windows (see core/continuityd/src/
+                        // remote_control_*.rs) — Linux has no
+                        // implementation yet despite having one for media
+                        // control, and Android/iOS peers wire in
+                        // `NoopRemoteControlHost` and would just auto-decline,
+                        // so there's no point showing the button at all
+                        // for either.
+                        val remoteControlCapablePlatform = status.platform == "mac_os" || status.platform == "windows"
+                        if (status.connected && remoteControlCapablePlatform) {
+                            FilledTonalButton(
+                                onClick = { onRequestRemoteControl(peerId) },
+                                modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                            ) {
+                                @Suppress("DEPRECATION")
+                                Icon(Icons.Default.ScreenShare, contentDescription = null, modifier = Modifier.size(18.dp))
+                                Spacer(Modifier.width(8.dp))
+                                Text("Remote Control")
                             }
                         }
                         // Media control works against macOS, Windows, and Linux
@@ -1126,6 +1211,191 @@ private fun formatDuration(ms: Long): String {
     val minutes = totalSeconds / 60
     val seconds = totalSeconds % 60
     return "%d:%02d".format(minutes, seconds)
+}
+
+/// Live view of a remote-controlled peer's screen, plus touch-to-mouse
+/// and a basic on-screen-keyboard-to-remote-keystroke bridge. Tap = click
+/// at that point, drag = move the cursor there — a *direct* mapping
+/// (touch position maps straight to the equivalent point on the peer's
+/// screen), not a relative "trackpad" one. Simpler to get right and more
+/// immediately intuitive ("tap what you want to click") than tracking a
+/// virtual cursor position client-side would be, at the cost of precision
+/// on a small phone screen controlling a much larger desktop — a
+/// trackpad mode is a reasonable follow-up if that turns out to matter in
+/// practice.
+///
+/// Keyboard input is intentionally basic for v1: lowercase letters,
+/// digits, space, enter, and backspace only — see `macKeyCodeFor`/
+/// `windowsKeyCodeFor` below. No shift/uppercase/symbols/arrow keys yet;
+/// good enough for a URL or a quick search, not a substitute for a full
+/// keyboard.
+@Composable
+private fun RemoteControlScreen(
+    peerName: String,
+    platform: String,
+    frame: ByteArray?,
+    onInputEvent: (uniffi.continuity_ffi.FfiInputEventKind) -> Unit,
+    onEnd: () -> Unit,
+) {
+    Dialog(onDismissRequest = onEnd, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        Surface(modifier = Modifier.fillMaxSize(), color = androidx.compose.ui.graphics.Color.Black) {
+            Box(modifier = Modifier.fillMaxSize()) {
+                val bitmap = remember(frame) {
+                    frame?.let { BitmapFactory.decodeByteArray(it, 0, it.size)?.asImageBitmap() }
+                }
+                var imageBounds by remember { mutableStateOf<Rect?>(null) }
+
+                fun sendClickAt(offset: androidx.compose.ui.geometry.Offset) {
+                    val bounds = imageBounds ?: return
+                    if (bounds.width <= 0f || bounds.height <= 0f) return
+                    val nx = ((offset.x - bounds.left) / bounds.width).coerceIn(0f, 1f).toDouble()
+                    val ny = ((offset.y - bounds.top) / bounds.height).coerceIn(0f, 1f).toDouble()
+                    onInputEvent(uniffi.continuity_ffi.FfiInputEventKind.MouseMove(nx, ny))
+                }
+
+                if (bitmap != null) {
+                    Image(
+                        bitmap = bitmap,
+                        contentDescription = null,
+                        contentScale = ContentScale.Fit,
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .onGloballyPositioned { coords -> imageBounds = coords.boundsInParent() }
+                            .pointerInput(Unit) {
+                                detectTapGestures(
+                                    onTap = { offset ->
+                                        sendClickAt(offset)
+                                        onInputEvent(
+                                            uniffi.continuity_ffi.FfiInputEventKind.MouseButton(
+                                                uniffi.continuity_ffi.FfiMouseButton.LEFT,
+                                                true,
+                                            ),
+                                        )
+                                        onInputEvent(
+                                            uniffi.continuity_ffi.FfiInputEventKind.MouseButton(
+                                                uniffi.continuity_ffi.FfiMouseButton.LEFT,
+                                                false,
+                                            ),
+                                        )
+                                    },
+                                )
+                            }
+                            .pointerInput(Unit) {
+                                detectDragGestures(onDrag = { change, _ -> sendClickAt(change.position) })
+                            },
+                    )
+                } else {
+                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        CircularProgressIndicator(color = androidx.compose.ui.graphics.Color.White)
+                    }
+                }
+
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .align(Alignment.TopCenter)
+                        .background(androidx.compose.ui.graphics.Color.Black.copy(alpha = 0.6f))
+                        .padding(horizontal = 16.dp, vertical = 10.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        "Controlling '$peerName'",
+                        color = androidx.compose.ui.graphics.Color.White,
+                        style = MaterialTheme.typography.titleSmall,
+                    )
+                    IconButton(onClick = onEnd) {
+                        Icon(Icons.Default.Close, contentDescription = "End remote control", tint = androidx.compose.ui.graphics.Color.White)
+                    }
+                }
+
+                // A basic on-screen-keyboard bridge: a real, focusable
+                // text field the IME can type into, kept visually tiny
+                // rather than truly invisible (a zero-size field can get
+                // skipped by the IME on some keyboards/devices) and
+                // cleared back to empty after every keystroke so it never
+                // accumulates — this relays individual keystrokes to the
+                // peer, it isn't a text buffer of its own.
+                var keyboardVisible by remember { mutableStateOf(false) }
+                var fieldValue by remember { mutableStateOf("") }
+                val focusRequester = remember { FocusRequester() }
+                if (keyboardVisible) {
+                    BasicTextField(
+                        value = fieldValue,
+                        onValueChange = { new ->
+                            if (new.length > fieldValue.length) {
+                                for (ch in new.substring(fieldValue.length)) {
+                                    sendCharacter(ch, platform, onInputEvent)
+                                }
+                            } else if (new.length < fieldValue.length) {
+                                repeat(fieldValue.length - new.length) {
+                                    sendBackspace(platform, onInputEvent)
+                                }
+                            }
+                            fieldValue = new
+                        },
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .fillMaxWidth()
+                            .height(1.dp)
+                            .focusRequester(focusRequester),
+                        textStyle = androidx.compose.ui.text.TextStyle(color = androidx.compose.ui.graphics.Color.Transparent),
+                        cursorBrush = androidx.compose.ui.graphics.SolidColor(androidx.compose.ui.graphics.Color.Transparent),
+                    )
+                    LaunchedEffect(Unit) { focusRequester.requestFocus() }
+                }
+
+                FloatingActionButton(
+                    onClick = { keyboardVisible = !keyboardVisible },
+                    modifier = Modifier.align(Alignment.BottomEnd).padding(20.dp),
+                ) {
+                    Icon(Icons.Default.Keyboard, contentDescription = "Toggle keyboard")
+                }
+            }
+        }
+    }
+}
+
+private fun sendCharacter(ch: Char, platform: String, onInputEvent: (uniffi.continuity_ffi.FfiInputEventKind) -> Unit) {
+    val code = (if (platform == "windows") windowsKeyCodeFor(ch) else macKeyCodeFor(ch)) ?: return
+    onInputEvent(uniffi.continuity_ffi.FfiInputEventKind.KeyDown(code))
+    onInputEvent(uniffi.continuity_ffi.FfiInputEventKind.KeyUp(code))
+}
+
+private fun sendBackspace(platform: String, onInputEvent: (uniffi.continuity_ffi.FfiInputEventKind) -> Unit) {
+    val code = if (platform == "windows") 0x08u else 0x33u // VK_BACK vs kVK_Delete
+    onInputEvent(uniffi.continuity_ffi.FfiInputEventKind.KeyDown(code))
+    onInputEvent(uniffi.continuity_ffi.FfiInputEventKind.KeyUp(code))
+}
+
+/// macOS `kVK_ANSI_*` virtual key codes — arbitrary, non-sequential
+/// numbering from `IOKit/hidsystem`/`Events.h`, the same well-known
+/// constants `remote_control_mac.rs`'s manual verification tests
+/// reference directly. Lowercase letters/digits/space/enter only — see
+/// `RemoteControlScreen`'s doc comment for why.
+private fun macKeyCodeFor(ch: Char): UInt? = when (ch.lowercaseChar()) {
+    'a' -> 0x00u; 's' -> 0x01u; 'd' -> 0x02u; 'f' -> 0x03u; 'h' -> 0x04u; 'g' -> 0x05u
+    'z' -> 0x06u; 'x' -> 0x07u; 'c' -> 0x08u; 'v' -> 0x09u; 'b' -> 0x0Bu
+    'q' -> 0x0Cu; 'w' -> 0x0Du; 'e' -> 0x0Eu; 'r' -> 0x0Fu; 'y' -> 0x10u; 't' -> 0x11u
+    '1' -> 0x12u; '2' -> 0x13u; '3' -> 0x14u; '4' -> 0x15u; '6' -> 0x16u; '5' -> 0x17u
+    '9' -> 0x19u; '7' -> 0x1Au; '8' -> 0x1Cu; '0' -> 0x1Du
+    'o' -> 0x1Fu; 'u' -> 0x20u; 'i' -> 0x22u; 'p' -> 0x23u
+    'l' -> 0x25u; 'j' -> 0x26u; 'k' -> 0x28u; 'n' -> 0x2Du; 'm' -> 0x2Eu
+    ' ' -> 0x31u
+    '\n' -> 0x24u
+    else -> null
+}
+
+/// Windows virtual-key codes for the alphanumeric range are just the
+/// ASCII uppercase-letter/digit values themselves (`VK_A`..`VK_Z` =
+/// `'A'`..`'Z'`, `VK_0`..`VK_9` = `'0'`..`'9'`) — no lookup table needed,
+/// unlike macOS's arbitrarily-ordered `kVK_ANSI_*` constants above.
+private fun windowsKeyCodeFor(ch: Char): UInt? = when {
+    ch.isLetter() -> ch.uppercaseChar().code.toUInt()
+    ch.isDigit() -> ch.code.toUInt()
+    ch == ' ' -> 0x20u
+    ch == '\n' -> 0x0Du
+    else -> null
 }
 
 @Composable
