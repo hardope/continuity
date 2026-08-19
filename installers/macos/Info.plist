@@ -9,9 +9,9 @@
     <key>CFBundleIdentifier</key>
     <string>app.continuity.desktop</string>
     <key>CFBundleVersion</key>
-    <string>0.1.5-beta.1</string>
+    <string>0.1.5-beta.2</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.1.5-beta.1</string>
+    <string>0.1.5-beta.2</string>
     <key>CFBundleExecutable</key>
     <string>continuityd</string>
     <key>CFBundleIconFile</key>

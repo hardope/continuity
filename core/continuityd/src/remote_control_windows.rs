@@ -114,7 +114,7 @@ fn capture_jpeg() -> Option<Vec<u8>> {
         if screen_dc.is_invalid() {
             return None;
         }
-        let mem_dc = CreateCompatibleDC(Some(screen_dc));
+        let mem_dc = CreateCompatibleDC(screen_dc);
         let bitmap = CreateCompatibleBitmap(screen_dc, width, height);
         if mem_dc.is_invalid() || bitmap.is_invalid() {
             let _ = DeleteDC(mem_dc);
@@ -123,7 +123,7 @@ fn capture_jpeg() -> Option<Vec<u8>> {
         }
         let previous: HGDIOBJ = SelectObject(mem_dc, bitmap.into());
 
-        let blit_ok = BitBlt(mem_dc, 0, 0, width, height, Some(screen_dc), 0, 0, SRCCOPY).is_ok();
+        let blit_ok = BitBlt(mem_dc, 0, 0, width, height, screen_dc, 0, 0, SRCCOPY).is_ok();
 
         let mut pixels = vec![0u8; (width as usize) * (height as usize) * 4];
         let mut bitmap_info = BITMAPINFO {
