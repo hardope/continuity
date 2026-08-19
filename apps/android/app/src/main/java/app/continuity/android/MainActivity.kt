@@ -32,6 +32,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -66,6 +67,7 @@ import androidx.compose.material.icons.filled.ScreenShare
 import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Sensors
+import androidx.compose.material.icons.filled.TouchApp
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.filled.Sync
@@ -105,8 +107,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.graphics.vector.PathParser
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Rect
@@ -115,6 +119,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.boundsInParent
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -751,6 +756,45 @@ private fun activityColor(
     return if (secondsAgo < 60) successColor else warningColor
 }
 
+// Raw path data (24x24 viewBox) from Material Design Icons (Pictogrammers,
+// https://materialdesignicons.com — Apache 2.0 / Pictogrammers Free
+// License), not Google's own `material-icons-extended` — that library is
+// Google's own icon set and doesn't carry other companies' brand marks.
+// MDI's OS icons are a widely-used open source set built for exactly this
+// "show which platform" case (nominative use to indicate compatibility,
+// same as any dev tool's per-platform download badges), all in one
+// visually consistent style so mixing five platforms doesn't look like
+// five different icon sources bolted together.
+private const val WINDOWS_ICON_PATH = "M3,12V6.75L9,5.43V11.91L3,12M20,3V11.75L10,11.9V5.21L20,3M3,13L9,13.09V19.9L3,18.75V13M20,13.25V22L10,20.09V13.1L20,13.25Z"
+private const val APPLE_ICON_PATH =
+    "M18.71,19.5C17.88,20.74 17,21.95 15.66,21.97C14.32,22 13.89,21.18 12.37,21.18C10.84,21.18 10.37,21.95 9.1,22C7.79,22.05 6.8,20.68 5.96,19.47C4.25,17 2.94,12.45 4.7,9.39C5.57,7.87 7.13,6.91 8.82,6.88C10.1,6.86 11.32,7.75 12.11,7.75C12.89,7.75 14.37,6.68 15.92,6.84C16.57,6.87 18.39,7.1 19.56,8.82C19.47,8.88 17.39,10.1 17.41,12.63C17.44,15.65 20.06,16.66 20.09,16.67C20.06,16.74 19.67,18.11 18.71,19.5M13,3.5C13.73,2.67 14.94,2.04 15.94,2C16.07,3.17 15.6,4.35 14.9,5.19C14.21,6.04 13.07,6.7 11.95,6.61C11.8,5.46 12.36,4.26 13,3.5Z"
+private const val LINUX_ICON_PATH =
+    "M14.62,8.35C14.2,8.63 12.87,9.39 12.67,9.54C12.28,9.85 11.92,9.83 11.53,9.53C11.33,9.37 10,8.61 9.58,8.34C9.1,8.03 9.13,7.64 9.66,7.42C11.3,6.73 12.94,6.78 14.57,7.45C15.06,7.66 15.08,8.05 14.62,8.35M21.84,15.63C20.91,13.54 19.64,11.64 18,9.97C17.47,9.42 17.14,8.8 16.94,8.09C16.84,7.76 16.77,7.42 16.7,7.08C16.5,6.2 16.41,5.3 16,4.47C15.27,2.89 14,2.07 12.16,2C10.35,2.05 9,2.81 8.21,4.4C8,4.83 7.85,5.28 7.75,5.74C7.58,6.5 7.43,7.29 7.25,8.06C7.1,8.71 6.8,9.27 6.29,9.77C4.68,11.34 3.39,13.14 2.41,15.12C2.27,15.41 2.13,15.7 2.04,16C1.85,16.66 2.33,17.12 3.03,16.96C3.47,16.87 3.91,16.78 4.33,16.65C4.74,16.5 4.9,16.6 5,17C5.65,19.15 7.07,20.66 9.24,21.5C13.36,23.06 18.17,20.84 19.21,16.92C19.28,16.65 19.38,16.55 19.68,16.65C20.14,16.79 20.61,16.89 21.08,17C21.57,17.09 21.93,16.84 22,16.36C22.03,16.1 21.94,15.87 21.84,15.63"
+private const val ANDROID_ICON_PATH =
+    "M16.61 15.15C16.15 15.15 15.77 14.78 15.77 14.32S16.15 13.5 16.61 13.5H16.61C17.07 13.5 17.45 13.86 17.45 14.32C17.45 14.78 17.07 15.15 16.61 15.15M7.41 15.15C6.95 15.15 6.57 14.78 6.57 14.32C6.57 13.86 6.95 13.5 7.41 13.5H7.41C7.87 13.5 8.24 13.86 8.24 14.32C8.24 14.78 7.87 15.15 7.41 15.15M16.91 10.14L18.58 7.26C18.67 7.09 18.61 6.88 18.45 6.79C18.28 6.69 18.07 6.75 18 6.92L16.29 9.83C14.95 9.22 13.5 8.9 12 8.91C10.47 8.91 9 9.24 7.73 9.82L6.04 6.91C5.95 6.74 5.74 6.68 5.57 6.78C5.4 6.87 5.35 7.08 5.44 7.25L7.1 10.13C4.25 11.69 2.29 14.58 2 18H22C21.72 14.59 19.77 11.7 16.91 10.14H16.91Z"
+private const val IOS_ICON_PATH =
+    "M2.09 16.8H3.75V9.76H2.09M2.92 8.84C3.44 8.84 3.84 8.44 3.84 7.94C3.84 7.44 3.44 7.04 2.92 7.04C2.4 7.04 2 7.44 2 7.94C2 8.44 2.4 8.84 2.92 8.84M9.25 7.06C6.46 7.06 4.7 8.96 4.7 12C4.7 15.06 6.46 16.96 9.25 16.96C12.04 16.96 13.8 15.06 13.8 12C13.8 8.96 12.04 7.06 9.25 7.06M9.25 8.5C10.96 8.5 12.05 9.87 12.05 12C12.05 14.15 10.96 15.5 9.25 15.5C7.54 15.5 6.46 14.15 6.46 12C6.46 9.87 7.54 8.5 9.25 8.5M14.5 14.11C14.57 15.87 16 16.96 18.22 16.96C20.54 16.96 22 15.82 22 14C22 12.57 21.18 11.77 19.23 11.32L18.13 11.07C16.95 10.79 16.47 10.42 16.47 9.78C16.47 9 17.2 8.45 18.28 8.45C19.38 8.45 20.13 9 20.21 9.89H21.84C21.8 8.2 20.41 7.06 18.29 7.06C16.21 7.06 14.73 8.21 14.73 9.91C14.73 11.28 15.56 12.13 17.33 12.53L18.57 12.82C19.78 13.11 20.27 13.5 20.27 14.2C20.27 15 19.47 15.57 18.31 15.57C17.15 15.57 16.26 15 16.16 14.11H14.5Z"
+
+private fun platformIconPath(platform: String): String? = when (platform) {
+    "mac_os" -> APPLE_ICON_PATH
+    "windows" -> WINDOWS_ICON_PATH
+    "linux" -> LINUX_ICON_PATH
+    "android" -> ANDROID_ICON_PATH
+    "ios" -> IOS_ICON_PATH
+    else -> null
+}
+
+/** Builds a Compose `ImageVector` from raw MDI path data on demand —
+ * `remember`ed by the caller since parsing is wasted work to repeat on
+ * every recomposition for what's always the same handful of platform
+ * strings. The fill color baked in here doesn't matter in practice:
+ * `Icon`'s own `tint` parameter applies a color filter over the whole
+ * rendered vector, replacing it. */
+private fun buildPlatformIcon(pathData: String): ImageVector =
+    ImageVector.Builder(defaultWidth = 24.dp, defaultHeight = 24.dp, viewportWidth = 24f, viewportHeight = 24f)
+        .addPath(pathData = PathParser().parsePathString(pathData).toNodes(), fill = SolidColor(Color.Black))
+        .build()
+
 @Composable
 private fun DeviceListCard(
     devices: Map<String, DeviceStatus>,
@@ -838,7 +882,19 @@ private fun DeviceListCard(
                                 ),
                             )
                             Column(modifier = Modifier.weight(1f)) {
-                                Text(status.name, style = MaterialTheme.typography.titleMedium)
+                                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    val iconPath = platformIconPath(status.platform)
+                                    if (iconPath != null) {
+                                        val icon = remember(iconPath) { buildPlatformIcon(iconPath) }
+                                        Icon(
+                                            icon,
+                                            contentDescription = status.platform,
+                                            modifier = Modifier.size(18.dp),
+                                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                    }
+                                    Text(status.name, style = MaterialTheme.typography.titleMedium)
+                                }
                                 Text(
                                     if (status.connected) activityLabel(status.lastActivityAtMillis, nowMillis) else "Disconnected",
                                     style = MaterialTheme.typography.labelSmall,
@@ -1213,16 +1269,28 @@ private fun formatDuration(ms: Long): String {
     return "%d:%02d".format(minutes, seconds)
 }
 
-/// Live view of a remote-controlled peer's screen, plus touch-to-mouse
-/// and a basic on-screen-keyboard-to-remote-keystroke bridge. Tap = click
-/// at that point, drag = move the cursor there — a *direct* mapping
-/// (touch position maps straight to the equivalent point on the peer's
-/// screen), not a relative "trackpad" one. Simpler to get right and more
-/// immediately intuitive ("tap what you want to click") than tracking a
-/// virtual cursor position client-side would be, at the cost of precision
-/// on a small phone screen controlling a much larger desktop — a
-/// trackpad mode is a reasonable follow-up if that turns out to matter in
-/// practice.
+/// Live view of a remote-controlled peer's screen, plus two input modes,
+/// a keyboard bridge, and an end button.
+///
+/// **Direct mode**: tap = click at that point, drag = move the cursor
+/// there — touch position maps straight to the equivalent point on the
+/// peer's screen. Simple and immediately intuitive ("tap what you want to
+/// click"), at the cost of precision on a small phone screen controlling
+/// a much larger desktop.
+///
+/// **Trackpad mode**: the strip along the bottom behaves like a laptop
+/// trackpad instead of a map of the screen — a one-finger drag moves the
+/// cursor by the drag's *relative* distance, not to an absolute mapped
+/// point, which is what actually gives precise control on a small phone
+/// screen. There's no relative-move message in the wire protocol (`MouseMove`
+/// is always a normalized absolute position), so this is done entirely
+/// client-side: a virtual cursor position is tracked here and nudged by
+/// each drag delta (scaled against the trackpad surface's own size, not
+/// the remote screen's), then sent as an ordinary absolute `MouseMove` —
+/// the peer never knows the difference. A tap on the trackpad clicks left;
+/// the explicit Left/Right buttons below it cover right-click, which a
+/// touch gesture can't unambiguously express without adding a second
+/// finger to track.
 ///
 /// Keyboard input is intentionally basic for v1: lowercase letters,
 /// digits, space, enter, and backspace only — see `macKeyCodeFor`/
@@ -1244,6 +1312,7 @@ private fun RemoteControlScreen(
                     frame?.let { BitmapFactory.decodeByteArray(it, 0, it.size)?.asImageBitmap() }
                 }
                 var imageBounds by remember { mutableStateOf<Rect?>(null) }
+                var trackpadMode by remember { mutableStateOf(false) }
 
                 fun sendClickAt(offset: androidx.compose.ui.geometry.Offset) {
                     val bounds = imageBounds ?: return
@@ -1253,40 +1322,57 @@ private fun RemoteControlScreen(
                     onInputEvent(uniffi.continuity_ffi.FfiInputEventKind.MouseMove(nx, ny))
                 }
 
-                if (bitmap != null) {
-                    Image(
-                        bitmap = bitmap,
-                        contentDescription = null,
-                        contentScale = ContentScale.Fit,
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .onGloballyPositioned { coords -> imageBounds = coords.boundsInParent() }
-                            .pointerInput(Unit) {
-                                detectTapGestures(
-                                    onTap = { offset ->
-                                        sendClickAt(offset)
-                                        onInputEvent(
-                                            uniffi.continuity_ffi.FfiInputEventKind.MouseButton(
-                                                uniffi.continuity_ffi.FfiMouseButton.LEFT,
-                                                true,
-                                            ),
-                                        )
-                                        onInputEvent(
-                                            uniffi.continuity_ffi.FfiInputEventKind.MouseButton(
-                                                uniffi.continuity_ffi.FfiMouseButton.LEFT,
-                                                false,
-                                            ),
-                                        )
+                fun sendClick(button: uniffi.continuity_ffi.FfiMouseButton) {
+                    onInputEvent(uniffi.continuity_ffi.FfiInputEventKind.MouseButton(button, true))
+                    onInputEvent(uniffi.continuity_ffi.FfiInputEventKind.MouseButton(button, false))
+                }
+
+                Column(modifier = Modifier.fillMaxSize()) {
+                    Box(modifier = Modifier.weight(1f)) {
+                        if (bitmap != null) {
+                            Image(
+                                bitmap = bitmap,
+                                contentDescription = null,
+                                contentScale = ContentScale.Fit,
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .onGloballyPositioned { coords -> imageBounds = coords.boundsInParent() }
+                                    .let { base ->
+                                        // Direct-mode tap/drag only applies
+                                        // to the image itself — in trackpad
+                                        // mode this area is view-only, all
+                                        // input comes from the strip below.
+                                        if (trackpadMode) {
+                                            base
+                                        } else {
+                                            base
+                                                .pointerInput(Unit) {
+                                                    detectTapGestures(
+                                                        onTap = { offset ->
+                                                            sendClickAt(offset)
+                                                            sendClick(uniffi.continuity_ffi.FfiMouseButton.LEFT)
+                                                        },
+                                                    )
+                                                }
+                                                .pointerInput(Unit) {
+                                                    detectDragGestures(onDrag = { change, _ -> sendClickAt(change.position) })
+                                                }
+                                        }
                                     },
-                                )
+                            )
+                        } else {
+                            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                CircularProgressIndicator(color = androidx.compose.ui.graphics.Color.White)
                             }
-                            .pointerInput(Unit) {
-                                detectDragGestures(onDrag = { change, _ -> sendClickAt(change.position) })
-                            },
-                    )
-                } else {
-                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        CircularProgressIndicator(color = androidx.compose.ui.graphics.Color.White)
+                        }
+                    }
+
+                    if (trackpadMode) {
+                        TrackpadSurface(
+                            onMove = { nx, ny -> onInputEvent(uniffi.continuity_ffi.FfiInputEventKind.MouseMove(nx, ny)) },
+                            onLeftClick = { sendClick(uniffi.continuity_ffi.FfiMouseButton.LEFT) },
+                            onRightClick = { sendClick(uniffi.continuity_ffi.FfiMouseButton.RIGHT) },
+                        )
                     }
                 }
 
@@ -1304,8 +1390,17 @@ private fun RemoteControlScreen(
                         color = androidx.compose.ui.graphics.Color.White,
                         style = MaterialTheme.typography.titleSmall,
                     )
-                    IconButton(onClick = onEnd) {
-                        Icon(Icons.Default.Close, contentDescription = "End remote control", tint = androidx.compose.ui.graphics.Color.White)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        IconButton(onClick = { trackpadMode = !trackpadMode }) {
+                            Icon(
+                                Icons.Default.TouchApp,
+                                contentDescription = if (trackpadMode) "Switch to direct touch" else "Switch to trackpad",
+                                tint = if (trackpadMode) MaterialTheme.colorScheme.primary else androidx.compose.ui.graphics.Color.White,
+                            )
+                        }
+                        IconButton(onClick = onEnd) {
+                            Icon(Icons.Default.Close, contentDescription = "End remote control", tint = androidx.compose.ui.graphics.Color.White)
+                        }
                     }
                 }
 
@@ -1319,6 +1414,7 @@ private fun RemoteControlScreen(
                 var keyboardVisible by remember { mutableStateOf(false) }
                 var fieldValue by remember { mutableStateOf("") }
                 val focusRequester = remember { FocusRequester() }
+                val keyboardController = LocalSoftwareKeyboardController.current
                 if (keyboardVisible) {
                     BasicTextField(
                         value = fieldValue,
@@ -1342,16 +1438,114 @@ private fun RemoteControlScreen(
                         textStyle = androidx.compose.ui.text.TextStyle(color = androidx.compose.ui.graphics.Color.Transparent),
                         cursorBrush = androidx.compose.ui.graphics.SolidColor(androidx.compose.ui.graphics.Color.Transparent),
                     )
-                    LaunchedEffect(Unit) { focusRequester.requestFocus() }
+                    LaunchedEffect(Unit) {
+                        // `requestFocus()` alone doesn't reliably bring up
+                        // the IME — it can silently gain focus with the
+                        // on-screen keyboard never actually appearing,
+                        // which is exactly what made this look like
+                        // "keyboard input does nothing." Explicitly
+                        // telling the keyboard controller to show is the
+                        // documented, reliable way to open it on demand.
+                        focusRequester.requestFocus()
+                        keyboardController?.show()
+                    }
+                } else {
+                    // Dismiss explicitly rather than just letting the
+                    // field leave composition — otherwise the IME can
+                    // linger open with nothing focused underneath it.
+                    LaunchedEffect(Unit) { keyboardController?.hide() }
                 }
 
                 FloatingActionButton(
                     onClick = { keyboardVisible = !keyboardVisible },
-                    modifier = Modifier.align(Alignment.BottomEnd).padding(20.dp),
+                    modifier = Modifier
+                        .align(Alignment.BottomEnd)
+                        // Floats above the trackpad strip instead of on
+                        // top of its Left/Right click buttons when
+                        // trackpad mode is showing that strip along the
+                        // bottom.
+                        .padding(bottom = if (trackpadMode) 269.dp else 20.dp, end = 20.dp),
                 ) {
                     Icon(Icons.Default.Keyboard, contentDescription = "Toggle keyboard")
                 }
             }
+        }
+    }
+}
+
+/// A relative-movement trackpad surface: drag nudges a virtual cursor
+/// position by the drag delta (scaled against this surface's own pixel
+/// size, not the remote screen's, so drag distance feels consistent
+/// regardless of the peer's actual resolution), tap clicks left, and two
+/// explicit buttons below cover left/right click without depending on a
+/// gesture (a second-finger tap for "right click" is easy to fumble on a
+/// small trackpad strip; a labeled button isn't).
+@Composable
+private fun TrackpadSurface(
+    onMove: (nx: Double, ny: Double) -> Unit,
+    onLeftClick: () -> Unit,
+    onRightClick: () -> Unit,
+) {
+    // Starts centered — there's no way to know where the peer's real
+    // cursor already is, so this is a fresh virtual reference point each
+    // time trackpad mode is turned on, not synced to the actual remote
+    // cursor position.
+    var virtualX by remember { mutableStateOf(0.5f) }
+    var virtualY by remember { mutableStateOf(0.5f) }
+    var surfaceWidthPx by remember { mutableStateOf(1f) }
+    var surfaceHeightPx by remember { mutableStateOf(1f) }
+    // >1 so a full swipe across the strip covers more than just that same
+    // fraction of the remote screen — a literal 1:1 mapping would need an
+    // uncomfortably large swipe to cross the whole desktop.
+    val sensitivity = 2.5f
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(androidx.compose.ui.graphics.Color(0xFF1C1C1E)),
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(200.dp)
+                .onGloballyPositioned { coords ->
+                    surfaceWidthPx = coords.size.width.toFloat().coerceAtLeast(1f)
+                    surfaceHeightPx = coords.size.height.toFloat().coerceAtLeast(1f)
+                }
+                .pointerInput(Unit) {
+                    detectDragGestures(onDrag = { change, dragAmount ->
+                        change.consume()
+                        virtualX = (virtualX + dragAmount.x / surfaceWidthPx * sensitivity).coerceIn(0f, 1f)
+                        virtualY = (virtualY + dragAmount.y / surfaceHeightPx * sensitivity).coerceIn(0f, 1f)
+                        onMove(virtualX.toDouble(), virtualY.toDouble())
+                    })
+                }
+                .pointerInput(Unit) {
+                    detectTapGestures(onTap = { onLeftClick() })
+                },
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                "Trackpad",
+                color = androidx.compose.ui.graphics.Color.White.copy(alpha = 0.35f),
+                style = MaterialTheme.typography.labelSmall,
+            )
+        }
+        HorizontalDivider(color = androidx.compose.ui.graphics.Color.White.copy(alpha = 0.15f))
+        Row(modifier = Modifier.fillMaxWidth().height(48.dp)) {
+            TextButton(
+                onClick = onLeftClick,
+                modifier = Modifier.weight(1f).fillMaxHeight(),
+                colors = androidx.compose.material3.ButtonDefaults.textButtonColors(contentColor = androidx.compose.ui.graphics.Color.White),
+            ) { Text("Left") }
+            Box(
+                modifier = Modifier.width(1.dp).fillMaxHeight().background(androidx.compose.ui.graphics.Color.White.copy(alpha = 0.15f)),
+            )
+            TextButton(
+                onClick = onRightClick,
+                modifier = Modifier.weight(1f).fillMaxHeight(),
+                colors = androidx.compose.material3.ButtonDefaults.textButtonColors(contentColor = androidx.compose.ui.graphics.Color.White),
+            ) { Text("Right") }
         }
     }
 }

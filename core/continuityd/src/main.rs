@@ -24,9 +24,17 @@ mod media_linux;
 mod remote_control_mac;
 #[cfg(all(target_os = "windows", feature = "remote-control"))]
 mod remote_control_windows;
+// The *viewer* (rendering a peer's screen + forwarding local input) is
+// cross-platform — any desktop OS can initiate and view a session, not
+// just the two that can be captured/injected into (see that module's own
+// doc comment) — so it's gated only on the feature, not target_os.
+#[cfg(feature = "remote-control")]
+mod remote_viewer;
 
 use continuity_crypto::{Identity, TrustStore};
 use continuity_daemon::{ArboardClipboard, EngineCommand, EngineConfig, SyncEvent};
+#[cfg(feature = "remote-control")]
+use continuity_proto::Platform;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -56,6 +64,22 @@ fn main() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
+    // Without declaring DPI awareness, Windows silently DPI-virtualizes
+    // this whole process on any scaled display (the large majority of
+    // real machines) — `GetSystemMetrics`/`GetDC`/`BitBlt` in
+    // `remote_control_windows.rs`'s screen capture all see a scaled,
+    // virtualized view of the screen rather than the real one, which is
+    // a well-documented source of GDI capture behaving inconsistently or
+    // failing outright depending on the exact scale factor. Best set as
+    // early as possible, before any window or device context is created.
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
+        if let Err(e) = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) } {
+            tracing::debug!("couldn't set per-monitor DPI awareness: {e}");
+        }
+    }
+
     let event_loop = EventLoopBuilder::<SyncEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
 
@@ -66,6 +90,8 @@ fn main() -> anyhow::Result<()> {
     let refresh_item = MenuItem::new("Refresh Nearby Devices", true, None);
     let send_submenu = Submenu::new("Send File", true);
     let forget_submenu = Submenu::new("Forget Device", true);
+    #[cfg(feature = "remote-control")]
+    let remote_control_submenu = Submenu::new("Remote Control", true);
     let pause_item = MenuItem::new("Pause Syncing", true, None);
     let reset_item = MenuItem::new("Reset...", true, None);
     let quit_item = MenuItem::new("Quit", true, None);
@@ -87,6 +113,26 @@ fn main() -> anyhow::Result<()> {
     let forget_target_map: Arc<Mutex<HashMap<MenuId, String>>> = Arc::new(Mutex::new(HashMap::new()));
     rebuild_forget_menu(&forget_submenu, &connected_peers.lock().unwrap(), &forget_target_map);
 
+    // A connected peer's platform isn't tracked anywhere else on desktop
+    // (`connected_peers` above only keeps id->name) — needed both to
+    // gate which peers even get a "Remote Control" entry (any platform
+    // technically *can* be offered one; an Android/iOS/Linux peer just
+    // auto-declines via its `NoopRemoteControlHost`, so this is really
+    // about not offering a button that's guaranteed to do nothing) and,
+    // once a session's open, so the viewer knows which platform's key
+    // codes to translate into.
+    #[cfg(feature = "remote-control")]
+    let connected_peer_platforms: Arc<Mutex<HashMap<String, Platform>>> = Arc::new(Mutex::new(HashMap::new()));
+    #[cfg(feature = "remote-control")]
+    let remote_control_target_map: Arc<Mutex<HashMap<MenuId, String>>> = Arc::new(Mutex::new(HashMap::new()));
+    #[cfg(feature = "remote-control")]
+    rebuild_remote_control_menu(
+        &remote_control_submenu,
+        &connected_peers.lock().unwrap(),
+        &connected_peer_platforms.lock().unwrap(),
+        &remote_control_target_map,
+    );
+
     // Untrusted devices seen on the network (see SyncEvent::PeerDiscovered)
     // — the engine deliberately doesn't auto-dial these anymore (that used
     // to mean a pairing prompt for every Continuity install anyone ever
@@ -105,6 +151,8 @@ fn main() -> anyhow::Result<()> {
     menu.append(&refresh_item)?;
     menu.append(&send_submenu)?;
     menu.append(&forget_submenu)?;
+    #[cfg(feature = "remote-control")]
+    menu.append(&remote_control_submenu)?;
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&pause_item)?;
     menu.append(&reset_item)?;
@@ -114,19 +162,58 @@ fn main() -> anyhow::Result<()> {
     let tray_icon = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_tooltip("Continuity")
-        .with_icon(build_icon())
+        .with_icon(build_icon(false))
         .build()?;
 
     let commands = start_engine_thread(profile(), device_name, proxy)?;
     let is_paused: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+    // The open remote-control viewer window, if any — at most one at a
+    // time (mirrors the engine's own one-Controlled-session-device-wide
+    // rule; nothing stops *this* device from controlling several peers
+    // at once in principle, but one viewer window is enough for a first
+    // version and keeps the window/event bookkeeping here simple).
+    // `Rc<RefCell<_>>`, not `Arc<Mutex<_>>` — this only ever touches the
+    // tao event loop's own thread, same as everything else in `main()`.
+    #[cfg(feature = "remote-control")]
+    let viewer: std::rc::Rc<std::cell::RefCell<Option<remote_viewer::RemoteViewer>>> = std::rc::Rc::new(std::cell::RefCell::new(None));
 
-    event_loop.run(move |event, _target, control_flow| {
+    event_loop.run(move |event, target, control_flow| {
         // Keep the tray icon (and its menu) alive for the app's lifetime —
         // dropping it removes the icon from the menu bar.
         let _tray_icon = &tray_icon;
+        let _target = target;
         *control_flow = ControlFlow::Wait;
 
+        // These match on `&event` (reference) rather than `event` — the
+        // `UserEvent` handling below moves `event` by value to hand
+        // `sync_event` off to `handle_sync_event`, so anything needing
+        // `event` afterward has to run *before* that move, not after.
+        #[cfg(feature = "remote-control")]
+        if let tao::event::Event::WindowEvent { window_id, event: window_event, .. } = &event {
+            let mut should_close = false;
+            if let Some(v) = viewer.borrow_mut().as_mut() {
+                if v.window_id() == *window_id {
+                    if matches!(v.handle_window_event(window_event, &commands), remote_viewer::ViewerAction::Closed) {
+                        should_close = true;
+                    }
+                }
+            }
+            if should_close {
+                *viewer.borrow_mut() = None;
+            }
+        }
+        #[cfg(feature = "remote-control")]
+        if let tao::event::Event::RedrawRequested(window_id) = &event {
+            if let Some(v) = viewer.borrow_mut().as_mut() {
+                if v.window_id() == *window_id {
+                    v.redraw();
+                }
+            }
+        }
+
         if let tao::event::Event::UserEvent(sync_event) = event {
+            #[cfg(feature = "remote-control")]
+            handle_remote_control_sync_event(&sync_event, target, &viewer, &connected_peer_platforms, &commands);
             handle_sync_event(
                 sync_event,
                 &send_submenu,
@@ -140,6 +227,14 @@ fn main() -> anyhow::Result<()> {
                 &nearby_target_map,
                 &is_paused,
                 &commands,
+                &tray_icon,
+            );
+            #[cfg(feature = "remote-control")]
+            rebuild_remote_control_menu(
+                &remote_control_submenu,
+                &connected_peers.lock().unwrap(),
+                &connected_peer_platforms.lock().unwrap(),
+                &remote_control_target_map,
             );
         }
 
@@ -194,6 +289,11 @@ fn main() -> anyhow::Result<()> {
                 if matches!(result, rfd::MessageDialogResult::Yes) {
                     let _ = commands.send(EngineCommand::RevokeDevice { peer_crypto_id: peer_id });
                 }
+            } else {
+                #[cfg(feature = "remote-control")]
+                if let Some(peer_id) = remote_control_target_map.lock().unwrap().get(&event.id).cloned() {
+                    let _ = commands.send(EngineCommand::RequestRemoteControl { peer_crypto_id: peer_id });
+                }
             }
         }
 
@@ -217,6 +317,7 @@ fn handle_sync_event(
     nearby_target_map: &Arc<Mutex<HashMap<MenuId, String>>>,
     is_paused: &Arc<Mutex<bool>>,
     commands: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
+    tray_icon: &tray_icon::TrayIcon,
 ) {
     match event {
         SyncEvent::Listening { port } => tracing::info!("listening on port {port}"),
@@ -336,22 +437,19 @@ fn handle_sync_event(
                 continuity_daemon::RemoteControlRole::Controlled => {
                     format!("'{peer_name}' is now controlling this device — click here or use the peer's app to end it")
                 }
-                // continuityd has no window/canvas to actually render a
-                // live remote view in yet (tray-only app, no rendering
-                // surface) — starting a *controlling* session from
-                // desktop isn't exposed in this UI at all right now (no
-                // menu action sends `RequestRemoteControl`), so this arm
-                // realistically only fires for a session another shell
-                // initiated against a peer that happens to route its
-                // events through here, which doesn't happen today. Kept
-                // for exhaustiveness and as a marker for that real,
-                // separate follow-up (a real viewer window, not a tray
-                // menu).
                 continuity_daemon::RemoteControlRole::Controlling => {
                     format!("remote control session with '{peer_name}' started")
                 }
             };
             notify(&text);
+            // The tray icon/taskbar is the one place that's visible
+            // without hovering or opening the menu — a small red dot
+            // makes an active session (in either role) obvious at a
+            // glance, since it's easy to forget one's still running,
+            // especially the Controlled side where nothing else on this
+            // device changes at all.
+            let _ = tray_icon.set_icon(Some(build_icon(true)));
+            let _ = tray_icon.set_tooltip(Some(format!("Continuity — {text}")));
         }
         SyncEvent::RemoteControlSessionEnded { peer_name, reason, .. } => {
             let text = match reason {
@@ -359,6 +457,8 @@ fn handle_sync_event(
                 None => format!("Remote control session with '{peer_name}' ended"),
             };
             notify(&text);
+            let _ = tray_icon.set_icon(Some(build_icon(false)));
+            let _ = tray_icon.set_tooltip(Some("Continuity"));
         }
         // No viewer surface on desktop (see `RemoteControlSessionStarted`
         // above) — nothing to do with an incoming frame here yet.
@@ -452,6 +552,93 @@ fn rebuild_nearby_menu(
         let item = MenuItem::new(format!("Connect to {name}..."), true, None);
         map.insert(item.id().clone(), (*id).clone());
         let _ = submenu.append(&item);
+    }
+}
+
+/// Same rebuild-from-scratch approach as `rebuild_send_menu`, same
+/// currently-connected-only scope. Every connected peer gets an entry
+/// regardless of platform (not just macOS/Windows) — an Android/iOS/Linux
+/// peer's `NoopRemoteControlHost` auto-declines with a normal
+/// `RemoteControlDeclined` notification rather than needing to be
+/// filtered out here, and platform isn't even known for certain until a
+/// peer's first `Connected` event carries it in.
+#[cfg(feature = "remote-control")]
+fn rebuild_remote_control_menu(
+    submenu: &Submenu,
+    connected: &HashMap<String, String>,
+    _platforms: &HashMap<String, Platform>,
+    target_map: &Arc<Mutex<HashMap<MenuId, String>>>,
+) {
+    while submenu.remove_at(0).is_some() {}
+    let mut map = target_map.lock().unwrap();
+    map.clear();
+
+    if connected.is_empty() {
+        let _ = submenu.append(&MenuItem::new("No device connected", false, None));
+        return;
+    }
+
+    let mut peers: Vec<(&String, &String)> = connected.iter().collect();
+    peers.sort_by(|a, b| a.1.cmp(b.1));
+    for (id, name) in &peers {
+        let item = MenuItem::new(format!("Remote Control {name}..."), true, None);
+        map.insert(item.id().clone(), (*id).clone());
+        let _ = submenu.append(&item);
+    }
+}
+
+/// The subset of `SyncEvent` handling specific to the viewer window —
+/// kept separate from `handle_sync_event` (which every build compiles,
+/// remote-control or not) rather than threading `#[cfg]` through that
+/// function's existing match arms.
+#[cfg(feature = "remote-control")]
+fn handle_remote_control_sync_event(
+    event: &SyncEvent,
+    target: &tao::event_loop::EventLoopWindowTarget<SyncEvent>,
+    viewer: &std::rc::Rc<std::cell::RefCell<Option<remote_viewer::RemoteViewer>>>,
+    connected_peer_platforms: &Arc<Mutex<HashMap<String, Platform>>>,
+    commands: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
+) {
+    match event {
+        SyncEvent::Connected { peer } => {
+            connected_peer_platforms.lock().unwrap().insert(peer.id.clone(), peer.platform);
+        }
+        SyncEvent::Disconnected { peer_id, .. } => {
+            connected_peer_platforms.lock().unwrap().remove(peer_id);
+        }
+        SyncEvent::WasRevoked { peer_id, .. } => {
+            connected_peer_platforms.lock().unwrap().remove(peer_id);
+        }
+        SyncEvent::WasReset => {
+            connected_peer_platforms.lock().unwrap().clear();
+        }
+        SyncEvent::RemoteControlSessionStarted { peer_id, peer_name, role, .. } => {
+            if *role != continuity_daemon::RemoteControlRole::Controlling {
+                return;
+            }
+            let platform = connected_peer_platforms.lock().unwrap().get(peer_id).copied().unwrap_or(Platform::MacOs);
+            match remote_viewer::RemoteViewer::open(target, peer_id.clone(), peer_name, platform) {
+                Ok(new_viewer) => *viewer.borrow_mut() = Some(new_viewer),
+                Err(e) => {
+                    tracing::warn!("couldn't open remote control viewer window: {e}");
+                    let _ = commands.send(EngineCommand::EndRemoteControlSession { peer_crypto_id: peer_id.clone() });
+                }
+            }
+        }
+        SyncEvent::RemoteControlSessionEnded { peer_id, .. } => {
+            let matches = viewer.borrow().as_ref().is_some_and(|v| v.peer_id() == peer_id);
+            if matches {
+                *viewer.borrow_mut() = None;
+            }
+        }
+        SyncEvent::ScreenFrameReceived { peer_id, frame, .. } => {
+            if let Some(v) = viewer.borrow_mut().as_mut() {
+                if v.peer_id() == peer_id {
+                    v.handle_frame(frame);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -650,10 +837,40 @@ fn received_files_dir(profile: &str) -> PathBuf {
 /// the SVG/VectorDrawables. 4x supersampling anti-aliases the edges —
 /// without it this is visibly jaggy at menu-bar sizes, since the OS
 /// doesn't smooth a raw RGBA buffer the way it smooths a vector drawable.
-fn build_icon() -> Icon {
+fn build_icon(remote_control_active: bool) -> Icon {
     let size: u32 = 64;
-    let rgba = render_icon_rgba(size);
+    let mut rgba = render_icon_rgba(size);
+    if remote_control_active {
+        overlay_active_dot(&mut rgba, size);
+    }
     Icon::from_rgba(rgba, size, size).expect("generated icon buffer is well-formed")
+}
+
+/// A solid red dot in the bottom-right corner — the "remote control is
+/// live" indicator asked for on the tray icon, since neither Windows'
+/// taskbar nor macOS's menu bar has any other always-visible (not
+/// requiring a hover or a click) place to show that without it. Drawn as
+/// a post-processing pass over the already-rendered base icon rather than
+/// threading an `active` flag through `render_icon_rgba`'s own
+/// supersampling math — simpler, and the two concerns (draw the mark,
+/// decide whether to show it) don't need to be tangled together.
+fn overlay_active_dot(rgba: &mut [u8], size: u32) {
+    let cx = size as f32 * 0.82;
+    let cy = size as f32 * 0.82;
+    let radius = size as f32 * 0.16;
+    for y in 0..size {
+        for x in 0..size {
+            let dx = x as f32 + 0.5 - cx;
+            let dy = y as f32 + 0.5 - cy;
+            if (dx * dx + dy * dy).sqrt() <= radius {
+                let i = ((y * size + x) * 4) as usize;
+                rgba[i] = 0xef;
+                rgba[i + 1] = 0x44;
+                rgba[i + 2] = 0x44;
+                rgba[i + 3] = 0xff;
+            }
+        }
+    }
 }
 
 fn render_icon_rgba(size: u32) -> Vec<u8> {

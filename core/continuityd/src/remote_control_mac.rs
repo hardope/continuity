@@ -39,13 +39,59 @@ use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep};
 use objc2_core_foundation::CGPoint;
 use objc2_core_graphics::{
     CGDisplayBounds, CGDisplayPixelsHigh, CGDisplayPixelsWide, CGEvent, CGEventTapLocation, CGEventType, CGMainDisplayID, CGMouseButton,
-    CGScrollEventUnit,
+    CGPreflightScreenCaptureAccess, CGRequestScreenCaptureAccess, CGScrollEventUnit,
 };
 use objc2_foundation::NSDictionary;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 use std::time::Duration;
 use tokio::sync::mpsc;
+
+/// Mirrors `media_mac::ensure_accessibility_trust` exactly, just for the
+/// Screen Recording permission `capture_jpeg` needs instead of the
+/// Accessibility one `inject_event` needs. Without this, nothing ever
+/// asked the OS for the permission at all: `CGDisplayCreateImage` doesn't
+/// fail outright when it's missing, it silently composites a *degraded*
+/// image instead (desktop wallpaper and this process's own windows —
+/// which is why the tray menu itself was visible — but every other app's
+/// window content blanked out), which is a much more confusing failure
+/// mode than an outright capture error would have been: capture appeared
+/// to "work" (real JPEG bytes, real dimensions) while showing nothing
+/// useful. `CGRequestScreenCaptureAccess` is the documented way to
+/// actively trigger the system's one-time permission prompt; once it's
+/// been answered (either way), calling it again is a silent no-op, so
+/// this only really does anything the first time — same shape as the
+/// Accessibility flow, which also can't re-prompt after an initial denial
+/// and falls back to pointing the user at System Settings instead.
+fn ensure_screen_recording_trust() {
+    static CHECKED: Once = Once::new();
+    CHECKED.call_once(|| {
+        if CGPreflightScreenCaptureAccess() {
+            return;
+        }
+        // Triggers the native one-time system prompt if this is the
+        // first time this app's ever asked; a no-op returning `false`
+        // if the user already denied it previously.
+        if CGRequestScreenCaptureAccess() {
+            return;
+        }
+        tracing::warn!(
+            "Continuity isn't trusted for Screen Recording — remote screen sharing will show a blank desktop (only this app's own windows visible) until it's granted in System Settings > Privacy & Security > Screen Recording"
+        );
+        if let Err(e) = notify_rust::Notification::new()
+            .summary("Continuity")
+            .body("Grant Screen Recording permission for remote control to show the real screen, not a blank desktop.")
+            .show()
+        {
+            tracing::debug!("screen recording notification not shown: {e}");
+        }
+        if let Err(e) =
+            std::process::Command::new("open").arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture").spawn()
+        {
+            tracing::debug!("couldn't open System Settings: {e}");
+        }
+    });
+}
 
 /// Frames per second for the capture loop — deliberately modest. This is
 /// JPEG-over-TCP, not a hardware-encoded video codec (see the crate-level
@@ -83,6 +129,7 @@ impl RemoteControlHost for MacRemoteControlHost {
     }
 
     fn start_capture(&self) -> Option<mpsc::Receiver<Vec<u8>>> {
+        ensure_screen_recording_trust();
         let display_id = CGMainDisplayID();
         // Probed once, synchronously, before spinning up the capture
         // thread at all — `CGDisplayCreateImage` returning `None` means

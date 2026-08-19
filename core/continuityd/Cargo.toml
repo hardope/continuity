@@ -18,7 +18,7 @@ path = "src/main.rs"
 # Input Monitoring permission prompts they trigger never get linked in at
 # all, for anyone who doesn't want this capability on their machine.
 default = ["remote-control"]
-remote-control = []
+remote-control = ["dep:softbuffer", "dep:image"]
 
 # Consumed by `cargo deb` (see the "linux" leg of .github/workflows/release.yml)
 # to build a .deb instead of shipping a bare binary that needs its shared-lib
@@ -54,6 +54,19 @@ directories = "5"
 tray-icon = "0.24"
 tao = "0.34"
 notify-rust = "4"
+# Both power the remote-control *viewer* window (any desktop platform can
+# be the controlling side, not just macOS/Windows — those two are just
+# the only ones that can currently be the *controlled* side, which is
+# the OS-specific half in remote_control_mac.rs/remote_control_windows.rs).
+# `softbuffer` presents a plain CPU-drawn pixel buffer into a `tao`
+# window with no GPU/graphics-API setup — the video here is just a
+# decoded JPEG blitted in a few times a second, nowhere near demanding
+# enough to justify wgpu or similar. `image` decodes the incoming JPEG
+# frames; on Windows it doubles as the *encoder* for this device's own
+# outgoing capture (see remote_control_windows.rs) — one dependency
+# either way, not two.
+softbuffer = { version = "0.4", optional = true }
+image = { version = "0.25", default-features = false, features = ["jpeg"], optional = true }
 
 # Not listed unconditionally: rfd's `gtk3` and `xdg-portal` features are
 # mutually exclusive (its build.rs hard-panics if both end up enabled —
@@ -103,16 +116,8 @@ windows = { version = "0.58", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_Graphics_Gdi",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_HiDpi",
 ] }
-# Pure-Rust JPEG encoding for the captured raw GDI pixel buffer —
-# deliberately not Windows' own WIC (Windows Imaging Component) COM API,
-# which would be more COM interop surface to get exactly right with no
-# way to test it on real Windows in this dev environment. `image` needs
-# no Windows-specific setup at all, just raw RGB bytes in, JPEG bytes out.
-[target.'cfg(target_os = "windows")'.dependencies.image]
-version = "0.25"
-default-features = false
-features = ["jpeg"]
 
 # MPRIS media control/reads over D-Bus — see src/media_linux.rs. Also
 # carries rfd's Linux dialog backend (see the non-Linux `rfd` entry above

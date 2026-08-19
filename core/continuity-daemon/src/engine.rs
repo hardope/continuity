@@ -942,7 +942,29 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                             .values()
                             .any(|s| s.role == RemoteControlRole::Controlled);
                         if already_controlled {
-                            let _ = tx.send(Message::RemoteControlResponse { session_id, accepted: false });
+                            let _ = tx.send(Message::RemoteControlResponse { session_id: session_id.clone(), accepted: false });
+                            // This decline previously left both sides
+                            // guessing why "accept" didn't work — the
+                            // requester just saw a plain decline, and this
+                            // device showed nothing at all. A stuck/stale
+                            // session entry that never got cleaned up
+                            // would silently decline *every* future
+                            // request the exact same way, indistinguishable
+                            // from an outright bug — this at least makes
+                            // that state visible instead of a mysterious
+                            // permanent "no" regardless of what's clicked.
+                            state.emit(SyncEvent::RemoteControlSessionEnded {
+                                peer_id: peer_crypto_id.clone(),
+                                peer_name: state
+                                    .trust_store
+                                    .lock()
+                                    .unwrap()
+                                    .get(&peer_crypto_id)
+                                    .map(|d| d.name.clone())
+                                    .unwrap_or_else(|| peer_crypto_id.clone()),
+                                session_id,
+                                reason: Some("already controlling another device".to_string()),
+                            });
                             continue;
                         }
 
