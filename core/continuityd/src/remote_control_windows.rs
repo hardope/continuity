@@ -121,7 +121,7 @@ fn capture_jpeg() -> Option<Vec<u8>> {
             let _ = ReleaseDC(None, screen_dc);
             return None;
         }
-        let previous: HGDIOBJ = SelectObject(mem_dc, bitmap.into());
+        let previous: HGDIOBJ = SelectObject(mem_dc, bitmap);
 
         let blit_ok = BitBlt(mem_dc, 0, 0, width, height, screen_dc, 0, 0, SRCCOPY).is_ok();
 
@@ -145,7 +145,7 @@ fn capture_jpeg() -> Option<Vec<u8>> {
             && GetDIBits(mem_dc, bitmap, 0, height as u32, Some(pixels.as_mut_ptr() as *mut _), &mut bitmap_info, DIB_RGB_COLORS) != 0;
 
         SelectObject(mem_dc, previous);
-        let _ = DeleteObject(bitmap.into());
+        let _ = DeleteObject(bitmap);
         let _ = DeleteDC(mem_dc);
         let _ = ReleaseDC(None, screen_dc);
 
