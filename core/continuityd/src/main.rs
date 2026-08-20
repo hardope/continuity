@@ -334,6 +334,7 @@ fn handle_sync_event(
     match event {
         SyncEvent::Listening { port } => tracing::info!("listening on port {port}"),
         SyncEvent::PairingRequested { peer, code } => {
+            tracing::debug!("PairingRequested: about to show the confirm dialog for '{}' (code {code})", peer.name);
             let result = rfd::MessageDialog::new()
                 .set_title("Continuity — Pairing Request")
                 .set_description(format!(
@@ -342,6 +343,7 @@ fn handle_sync_event(
                 ))
                 .set_buttons(rfd::MessageButtons::YesNo)
                 .show();
+            tracing::debug!("PairingRequested: dialog returned {result:?}");
             let accepted = matches!(result, rfd::MessageDialogResult::Yes);
             let _ = commands.send(EngineCommand::ConfirmPairing {
                 peer_crypto_id: peer.id,

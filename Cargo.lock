@@ -804,7 +804,7 @@ checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
 
 [[package]]
 name = "continuity-crypto"
-version = "0.1.5-beta.10"
+version = "0.1.5-beta.11"
 dependencies = [
  "directories",
  "ed25519-dalek",
@@ -822,7 +822,7 @@ dependencies = [
 
 [[package]]
 name = "continuity-daemon"
-version = "0.1.5-beta.10"
+version = "0.1.5-beta.11"
 dependencies = [
  "anyhow",
  "arboard",
@@ -839,7 +839,7 @@ dependencies = [
 
 [[package]]
 name = "continuity-ffi"
-version = "0.1.5-beta.10"
+version = "0.1.5-beta.11"
 dependencies = [
  "continuity-crypto",
  "continuity-daemon",
@@ -854,7 +854,7 @@ dependencies = [
 
 [[package]]
 name = "continuity-net"
-version = "0.1.5-beta.10"
+version = "0.1.5-beta.11"
 dependencies = [
  "anyhow",
  "bytes",
@@ -876,7 +876,7 @@ dependencies = [
 
 [[package]]
 name = "continuity-proto"
-version = "0.1.5-beta.10"
+version = "0.1.5-beta.11"
 dependencies = [
  "base64",
  "serde",
@@ -885,7 +885,7 @@ dependencies = [
 
 [[package]]
 name = "continuityctl"
-version = "0.1.5-beta.10"
+version = "0.1.5-beta.11"
 dependencies = [
  "anyhow",
  "clap",
@@ -901,7 +901,7 @@ dependencies = [
 
 [[package]]
 name = "continuityd"
-version = "0.1.5-beta.10"
+version = "0.1.5-beta.11"
 dependencies = [
  "anyhow",
  "block2",
