@@ -832,6 +832,17 @@ fn start_engine_thread(
 fn init_logging() {
     use tracing_subscriber::prelude::*;
 
+    // Deliberately its *own* filter, independent of `RUST_LOG` — getting
+    // a user to correctly thread an env var through a manual relaunch
+    // turned out to be a real, repeated source of friction in practice
+    // (shell quoting, launching from the wrong window, a fresh terminal
+    // not picking up a variable set in another one — every variant of
+    // "did the env var actually reach the process" showed up at least
+    // once). The file is the diagnostic path specifically, so it always
+    // captures this app's own debug-level detail regardless of whether
+    // anyone remembered to set anything; third-party crates stay at
+    // `info` so rustls/mdns_sd's own considerable chattiness doesn't
+    // drown it out.
     let file_layer = log_file_path(&profile())
         .and_then(|path| {
             if let Some(parent) = path.parent() {
@@ -839,11 +850,15 @@ fn init_logging() {
             }
             std::fs::OpenOptions::new().create(true).append(true).open(&path).ok()
         })
-        .map(|file| tracing_subscriber::fmt::layer().with_writer(std::sync::Mutex::new(file)).with_ansi(false));
+        .map(|file| {
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::sync::Mutex::new(file))
+                .with_ansi(false)
+                .with_filter(tracing_subscriber::EnvFilter::new("info,continuity_daemon=debug,continuityd=debug"))
+        });
 
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::from_default_env())
-        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::fmt::layer().with_filter(tracing_subscriber::EnvFilter::from_default_env()))
         .with(file_layer)
         .init();
 }
