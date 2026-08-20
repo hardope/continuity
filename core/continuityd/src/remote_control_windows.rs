@@ -184,20 +184,29 @@ fn capture_jpeg() -> Option<Vec<u8>> {
         }
 
         // GDI's 32-bit DIB is BGRA (actually BGRX — the fourth byte isn't
-        // a meaningful alpha channel for a screen capture), not RGBA —
-        // swap the red/blue bytes in place before handing to `image`,
-        // which expects RGBA.
-        for px in pixels.chunks_exact_mut(4) {
-            px.swap(0, 2);
+        // a meaningful alpha channel for a screen capture), and JPEG has
+        // no alpha channel *at all* — `image`'s JPEG encoder correctly
+        // refuses `Rgba8` outright rather than silently dropping the
+        // channel for you (confirmed the hard way: this was the actual,
+        // entire reason screen capture always failed on real Windows
+        // hardware, unrelated to every earlier permission/address/DPI
+        // theory). Converts straight to a packed RGB buffer here — no
+        // point routing through `image::RgbaImage` first just to have it
+        // reject the very shape it was given.
+        let mut rgb_pixels = Vec::with_capacity(pixels.len() / 4 * 3);
+        for px in pixels.chunks_exact(4) {
+            rgb_pixels.push(px[2]); // R (was B)
+            rgb_pixels.push(px[1]); // G
+            rgb_pixels.push(px[0]); // B (was R)
         }
 
-        let Some(image_buffer) = image::RgbaImage::from_raw(width as u32, height as u32, pixels) else {
-            tracing::debug!("capture_jpeg: RgbaImage::from_raw failed — buffer/dimension mismatch ({width}x{height})");
+        let Some(image_buffer) = image::RgbImage::from_raw(width as u32, height as u32, rgb_pixels) else {
+            tracing::debug!("capture_jpeg: RgbImage::from_raw failed — buffer/dimension mismatch ({width}x{height})");
             return None;
         };
         let mut jpeg_bytes = Vec::new();
         let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_bytes, 40);
-        if let Err(e) = encoder.encode(image_buffer.as_raw(), image_buffer.width(), image_buffer.height(), image::ExtendedColorType::Rgba8) {
+        if let Err(e) = encoder.encode(image_buffer.as_raw(), image_buffer.width(), image_buffer.height(), image::ExtendedColorType::Rgb8) {
             tracing::debug!("capture_jpeg: JPEG encode failed: {e}");
             return None;
         }
