@@ -60,9 +60,7 @@ fn profile() -> String {
 }
 
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+    init_logging();
 
     // Without declaring DPI awareness, Windows silently DPI-virtualizes
     // this whole process on any scaled display (the large majority of
@@ -94,10 +92,12 @@ fn main() -> anyhow::Result<()> {
     let remote_control_submenu = Submenu::new("Remote Control", true);
     let pause_item = MenuItem::new("Pause Syncing", true, None);
     let reset_item = MenuItem::new("Reset...", true, None);
+    let about_item = MenuItem::new(format!("About Continuity ({})", env!("CARGO_PKG_VERSION")), true, None);
     let quit_item = MenuItem::new("Quit", true, None);
     let refresh_item_id = refresh_item.id().clone();
     let pause_item_id = pause_item.id().clone();
     let reset_item_id = reset_item.id().clone();
+    let about_item_id = about_item.id().clone();
     let quit_item_id = quit_item.id().clone();
 
     let connected_peers: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -156,6 +156,7 @@ fn main() -> anyhow::Result<()> {
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&pause_item)?;
     menu.append(&reset_item)?;
+    menu.append(&about_item)?;
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&quit_item)?;
 
@@ -255,6 +256,15 @@ fn main() -> anyhow::Result<()> {
                 if matches!(result, rfd::MessageDialogResult::Yes) {
                     let _ = commands.send(EngineCommand::Reset);
                 }
+            } else if event.id == about_item_id {
+                rfd::MessageDialog::new()
+                    .set_title("About Continuity")
+                    .set_description(format!(
+                        "Continuity {}\n\nClipboard, file, and remote-control continuity across your devices — no cloud relay, no account.\n\nhttps://github.com/hardope/continuity",
+                        env!("CARGO_PKG_VERSION")
+                    ))
+                    .set_buttons(rfd::MessageButtons::Ok)
+                    .show();
             } else if event.id == quit_item_id {
                 *control_flow = ControlFlow::Exit;
             } else if let Some(target) = send_target_map.lock().unwrap().get(&event.id).cloned() {
@@ -808,6 +818,44 @@ fn start_engine_thread(
         .recv()
         .map_err(|_| anyhow::anyhow!("engine thread exited before starting"))?
         .map_err(|e| anyhow::anyhow!(e))
+}
+
+/// Every previous version of this only ever logged to stdout — useless
+/// on a release build, which sets `windows_subsystem = "windows"` (see
+/// the top of this file) specifically so launching doesn't pop a console
+/// window; a GUI-subsystem process has no console attached to write to
+/// regardless of how it's launched, terminal or not. Diagnosing a real
+/// report meant guessing blind — no way to ask "what does the log say."
+/// This always *also* writes to a plain file, independent of subsystem
+/// or platform, so a user can be asked to just find and share that
+/// file's content instead.
+fn init_logging() {
+    use tracing_subscriber::prelude::*;
+
+    let file_layer = log_file_path(&profile())
+        .and_then(|path| {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            std::fs::OpenOptions::new().create(true).append(true).open(&path).ok()
+        })
+        .map(|file| tracing_subscriber::fmt::layer().with_writer(std::sync::Mutex::new(file)).with_ansi(false));
+
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::from_default_env())
+        .with(tracing_subscriber::fmt::layer())
+        .with(file_layer)
+        .init();
+}
+
+/// Same directory `continuity-crypto::TrustStore` already uses for its
+/// own config, so logs live right next to it rather than inventing a
+/// second, unrelated location a user would have to be told about
+/// separately.
+fn log_file_path(profile: &str) -> Option<PathBuf> {
+    let dirs = directories::ProjectDirs::from("app", "continuity", "continuity")?;
+    let file_name = if profile == "default" { "continuityd.log".to_string() } else { format!("continuityd.{profile}.log") };
+    Some(dirs.config_dir().join(file_name))
 }
 
 fn received_files_dir(profile: &str) -> PathBuf {

@@ -54,6 +54,13 @@ pub struct RemoteViewer {
     /// normalized position *on the frame*, not the whole window.
     draw_rect: (u32, u32, u32, u32),
     last_move_sent: Instant,
+    /// Normalized position of the last `MouseMove` actually sent —
+    /// `redraw` draws a small marker here. The underlying capture
+    /// (`CGDisplayCreateImage` on macOS, GDI `BitBlt` on Windows) doesn't
+    /// composite the system cursor into the image at all, so without
+    /// this the video shows no cursor whatsoever, anywhere, ever — not
+    /// "wrong position," *absent*. `None` until the first move goes out.
+    last_cursor: Option<(f64, f64)>,
 }
 
 /// Throttles outgoing `MouseMove` — a real desktop mouse reports position
@@ -86,6 +93,7 @@ impl RemoteViewer {
             frame: None,
             draw_rect: (0, 0, 0, 0),
             last_move_sent: Instant::now() - MOVE_THROTTLE,
+            last_cursor: None,
         })
     }
 
@@ -158,6 +166,15 @@ impl RemoteViewer {
             }
         }
 
+        if let Some((nx, ny)) = self.last_cursor {
+            let (off_x, off_y, draw_w, draw_h) = self.draw_rect;
+            if draw_w > 0 && draw_h > 0 {
+                let cx = off_x as f32 + nx as f32 * draw_w as f32;
+                let cy = off_y as f32 + ny as f32 * draw_h as f32;
+                draw_cursor_marker(&mut buffer, width.get(), height.get(), cx, cy);
+            }
+        }
+
         let _ = buffer.present();
     }
 
@@ -175,6 +192,7 @@ impl RemoteViewer {
             WindowEvent::CursorMoved { position, .. } => {
                 if self.last_move_sent.elapsed() >= MOVE_THROTTLE {
                     if let Some((x, y)) = self.normalize(*position) {
+                        self.last_cursor = Some((x, y));
                         self.send(commands, InputEventKind::MouseMove { x, y });
                         self.last_move_sent = Instant::now();
                     }
@@ -234,6 +252,40 @@ impl RemoteViewer {
         let x = ((position.x - ox as f64) / w as f64).clamp(0.0, 1.0);
         let y = ((position.y - oy as f64) / h as f64).clamp(0.0, 1.0);
         Some((x, y))
+    }
+}
+
+/// A small filled circle with a dark outline, clipped to the window
+/// bounds — same purpose as the dot `MainActivity.kt`'s remote-control
+/// screen draws: the underlying capture has no cursor in it at all, so
+/// this is the only visual indication of where a click will actually
+/// land. Deliberately drawn from *this side's own last-sent position*,
+/// not any "real" cursor reported back by the peer (the protocol has no
+/// such message) — which is, if anything, more correct for a remote
+/// control view: it reflects what *this* controller is doing, not
+/// whatever unrelated activity might be moving the controlled machine's
+/// actual system cursor.
+fn draw_cursor_marker(buffer: &mut [u32], width: u32, height: u32, cx: f32, cy: f32) {
+    const RADIUS: f32 = 6.0;
+    const BORDER: f32 = 1.5;
+    let min_x = (cx - RADIUS - BORDER).max(0.0) as u32;
+    let max_x = (cx + RADIUS + BORDER).min(width as f32 - 1.0) as u32;
+    let min_y = (cy - RADIUS - BORDER).max(0.0) as u32;
+    let max_y = (cy + RADIUS + BORDER).min(height as f32 - 1.0) as u32;
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            let dx = x as f32 + 0.5 - cx;
+            let dy = y as f32 + 0.5 - cy;
+            let dist = (dx * dx + dy * dy).sqrt();
+            if dist > RADIUS + BORDER {
+                continue;
+            }
+            let color = if dist > RADIUS { 0x00000000 } else { 0x00ffffff };
+            let di = (y * width + x) as usize;
+            if di < buffer.len() {
+                buffer[di] = color;
+            }
+        }
     }
 }
 

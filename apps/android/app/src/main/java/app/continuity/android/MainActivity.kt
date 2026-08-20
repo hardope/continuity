@@ -7,6 +7,7 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Build
@@ -22,8 +23,10 @@ import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.text.BasicTextField
@@ -36,11 +39,13 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -95,6 +100,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
@@ -114,19 +120,24 @@ import androidx.compose.ui.graphics.vector.PathParser
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.boundsInParent
 import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import app.continuity.android.ui.theme.ContinuityTheme
 import app.continuity.android.ui.theme.SuccessGreen
 import app.continuity.android.ui.theme.SuccessGreenDark
@@ -1305,21 +1316,68 @@ private fun RemoteControlScreen(
     onInputEvent: (uniffi.continuity_ffi.FfiInputEventKind) -> Unit,
     onEnd: () -> Unit,
 ) {
-    Dialog(onDismissRequest = onEnd, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+    Dialog(
+        onDismissRequest = onEnd,
+        properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
+    ) {
+        // Immersive: hide the status/nav bars for as long as this screen
+        // is up (a normal-brightness status bar drawn over a mostly-dark
+        // remote desktop is exactly the "layer disturbing my view" this
+        // was built to remove), restoring them the moment it closes —
+        // this is scoped to the dialog's own window, not a
+        // permanent app-wide setting.
+        val view = androidx.compose.ui.platform.LocalView.current
+        DisposableEffect(Unit) {
+            val dialogWindow = (view.parent as? androidx.compose.ui.window.DialogWindowProvider)?.window
+            val controller = dialogWindow?.let { WindowInsetsControllerCompat(it, view) }
+            controller?.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            controller?.hide(WindowInsetsCompat.Type.systemBars())
+            onDispose { controller?.show(WindowInsetsCompat.Type.systemBars()) }
+        }
+
         Surface(modifier = Modifier.fillMaxSize(), color = androidx.compose.ui.graphics.Color.Black) {
+            val configuration = LocalConfiguration.current
+            val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+
             Box(modifier = Modifier.fillMaxSize()) {
                 val bitmap = remember(frame) {
                     frame?.let { BitmapFactory.decodeByteArray(it, 0, it.size)?.asImageBitmap() }
                 }
                 var imageBounds by remember { mutableStateOf<Rect?>(null) }
                 var trackpadMode by remember { mutableStateOf(false) }
+                // Last position this side sent a MouseMove to, in the same
+                // normalized 0..1 frame space `imageBounds` maps to — the
+                // one piece of visual feedback that was missing entirely:
+                // the underlying capture (`CGDisplayCreateImage` on macOS)
+                // doesn't include the system cursor in the image at all,
+                // so without this the video shows no cursor whatsoever,
+                // anywhere, ever. `null` until the first input goes out.
+                var cursorNx by remember { mutableStateOf<Float?>(null) }
+                var cursorNy by remember { mutableStateOf<Float?>(null) }
+
+                var zoomScale by remember { mutableStateOf(1f) }
+                var panX by remember { mutableStateOf(0f) }
+                var panY by remember { mutableStateOf(0f) }
+
+                var controlsVisible by remember { mutableStateOf(true) }
+                var lastInteractionAt by remember { mutableStateOf(System.currentTimeMillis()) }
+                fun markInteraction() {
+                    controlsVisible = true
+                    lastInteractionAt = System.currentTimeMillis()
+                }
+                LaunchedEffect(lastInteractionAt) {
+                    delay(3000)
+                    controlsVisible = false
+                }
 
                 fun sendClickAt(offset: androidx.compose.ui.geometry.Offset) {
                     val bounds = imageBounds ?: return
                     if (bounds.width <= 0f || bounds.height <= 0f) return
-                    val nx = ((offset.x - bounds.left) / bounds.width).coerceIn(0f, 1f).toDouble()
-                    val ny = ((offset.y - bounds.top) / bounds.height).coerceIn(0f, 1f).toDouble()
-                    onInputEvent(uniffi.continuity_ffi.FfiInputEventKind.MouseMove(nx, ny))
+                    val nx = ((offset.x - bounds.left) / bounds.width).coerceIn(0f, 1f)
+                    val ny = ((offset.y - bounds.top) / bounds.height).coerceIn(0f, 1f)
+                    cursorNx = nx
+                    cursorNy = ny
+                    onInputEvent(uniffi.continuity_ffi.FfiInputEventKind.MouseMove(nx.toDouble(), ny.toDouble()))
                 }
 
                 fun sendClick(button: uniffi.continuity_ffi.FfiMouseButton) {
@@ -1327,79 +1385,181 @@ private fun RemoteControlScreen(
                     onInputEvent(uniffi.continuity_ffi.FfiInputEventKind.MouseButton(button, false))
                 }
 
-                Column(modifier = Modifier.fillMaxSize()) {
-                    Box(modifier = Modifier.weight(1f)) {
+                @Composable
+                fun VideoArea(modifier: Modifier) {
+                    Box(modifier = modifier) {
                         if (bitmap != null) {
-                            Image(
-                                bitmap = bitmap,
-                                contentDescription = null,
-                                contentScale = ContentScale.Fit,
+                            Box(
                                 modifier = Modifier
                                     .fillMaxSize()
-                                    .onGloballyPositioned { coords -> imageBounds = coords.boundsInParent() }
+                                    .graphicsLayer(scaleX = zoomScale, scaleY = zoomScale, translationX = panX, translationY = panY)
                                     .let { base ->
-                                        // Direct-mode tap/drag only applies
-                                        // to the image itself — in trackpad
-                                        // mode this area is view-only, all
-                                        // input comes from the strip below.
+                                        // Pinch-zoom/pan only in trackpad
+                                        // mode — in direct mode, a
+                                        // single-finger drag already means
+                                        // "move the cursor here," and a
+                                        // transform-gesture detector on the
+                                        // same target would fight over that
+                                        // same one-finger drag.
                                         if (trackpadMode) {
-                                            base
+                                            base.pointerInput(Unit) {
+                                                detectTransformGestures { _, pan, zoom, _ ->
+                                                    zoomScale = (zoomScale * zoom).coerceIn(1f, 4f)
+                                                    panX += pan.x
+                                                    panY += pan.y
+                                                    markInteraction()
+                                                }
+                                            }
                                         } else {
                                             base
-                                                .pointerInput(Unit) {
-                                                    detectTapGestures(
-                                                        onTap = { offset ->
-                                                            sendClickAt(offset)
-                                                            sendClick(uniffi.continuity_ffi.FfiMouseButton.LEFT)
-                                                        },
-                                                    )
-                                                }
-                                                .pointerInput(Unit) {
-                                                    detectDragGestures(onDrag = { change, _ -> sendClickAt(change.position) })
-                                                }
                                         }
                                     },
-                            )
+                            ) {
+                                Image(
+                                    bitmap = bitmap,
+                                    contentDescription = null,
+                                    contentScale = ContentScale.Fit,
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .onGloballyPositioned { coords -> imageBounds = coords.boundsInParent() }
+                                        .let { base ->
+                                            // Direct-mode tap/drag only
+                                            // applies to the image itself —
+                                            // in trackpad mode this area is
+                                            // view-only (aside from zoom/pan
+                                            // above), all input comes from
+                                            // the strip below.
+                                            if (trackpadMode) {
+                                                base
+                                            } else {
+                                                base
+                                                    .pointerInput(Unit) {
+                                                        detectTapGestures(
+                                                            onTap = { offset ->
+                                                                sendClickAt(offset)
+                                                                sendClick(uniffi.continuity_ffi.FfiMouseButton.LEFT)
+                                                                markInteraction()
+                                                            },
+                                                        )
+                                                    }
+                                                    .pointerInput(Unit) {
+                                                        detectDragGestures(onDrag = { change, _ ->
+                                                            sendClickAt(change.position)
+                                                            markInteraction()
+                                                        })
+                                                    }
+                                            }
+                                        },
+                                )
+
+                                val bounds = imageBounds
+                                val nx = cursorNx
+                                val ny = cursorNy
+                                if (bounds != null && nx != null && ny != null) {
+                                    val density = androidx.compose.ui.platform.LocalDensity.current
+                                    val radiusPx = with(density) { 8.dp.toPx() }
+                                    val cx = bounds.left + nx * bounds.width
+                                    val cy = bounds.top + ny * bounds.height
+                                    Box(
+                                        modifier = Modifier
+                                            .offset { IntOffset((cx - radiusPx).toInt(), (cy - radiusPx).toInt()) }
+                                            .size(16.dp)
+                                            .background(androidx.compose.ui.graphics.Color.White.copy(alpha = 0.9f), CircleShape)
+                                            .border(1.5.dp, androidx.compose.ui.graphics.Color.Black.copy(alpha = 0.6f), CircleShape),
+                                    )
+                                }
+                            }
                         } else {
                             Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                                 CircularProgressIndicator(color = androidx.compose.ui.graphics.Color.White)
                             }
                         }
                     }
+                }
 
-                    if (trackpadMode) {
-                        TrackpadSurface(
-                            onMove = { nx, ny -> onInputEvent(uniffi.continuity_ffi.FfiInputEventKind.MouseMove(nx, ny)) },
-                            onLeftClick = { sendClick(uniffi.continuity_ffi.FfiMouseButton.LEFT) },
-                            onRightClick = { sendClick(uniffi.continuity_ffi.FfiMouseButton.RIGHT) },
-                        )
+                @Composable
+                fun Trackpad(modifier: Modifier) {
+                    TrackpadSurface(
+                        modifier = modifier,
+                        onMove = { nx, ny ->
+                            cursorNx = nx.toFloat()
+                            cursorNy = ny.toFloat()
+                            onInputEvent(uniffi.continuity_ffi.FfiInputEventKind.MouseMove(nx, ny))
+                            markInteraction()
+                        },
+                        onLeftClick = { sendClick(uniffi.continuity_ffi.FfiMouseButton.LEFT); markInteraction() },
+                        onRightClick = { sendClick(uniffi.continuity_ffi.FfiMouseButton.RIGHT); markInteraction() },
+                    )
+                }
+
+                // Landscape is the orientation this is actually used in
+                // most of the time (a wide remote desktop on a wide phone
+                // screen) — putting the trackpad strip along the *side*
+                // there instead of eating a fixed slice off the bottom
+                // (as portrait does) leaves far more of that width for
+                // the one thing actually being looked at.
+                if (isLandscape) {
+                    Row(modifier = Modifier.fillMaxSize()) {
+                        VideoArea(modifier = Modifier.weight(1f).fillMaxHeight())
+                        if (trackpadMode) {
+                            Trackpad(modifier = Modifier.fillMaxHeight().width(220.dp))
+                        }
+                    }
+                } else {
+                    Column(modifier = Modifier.fillMaxSize()) {
+                        VideoArea(modifier = Modifier.weight(1f).fillMaxWidth())
+                        if (trackpadMode) {
+                            Trackpad(modifier = Modifier.fillMaxWidth().height(220.dp))
+                        }
                     }
                 }
 
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .align(Alignment.TopCenter)
-                        .background(androidx.compose.ui.graphics.Color.Black.copy(alpha = 0.6f))
-                        .padding(horizontal = 16.dp, vertical = 10.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(
-                        "Controlling '$peerName'",
-                        color = androidx.compose.ui.graphics.Color.White,
-                        style = MaterialTheme.typography.titleSmall,
+                // A tap near the top edge always reveals the controls,
+                // even while hidden — otherwise, once auto-hidden, there
+                // would be no way back to the End button short of the
+                // system back gesture. Only present (and only catches
+                // taps) while actually hidden, so it never steals a tap
+                // from the video/trackpad the rest of the time.
+                if (!controlsVisible) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(32.dp)
+                            .align(Alignment.TopCenter)
+                            .pointerInput(Unit) { detectTapGestures(onTap = { markInteraction() }) },
                     )
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        IconButton(onClick = { trackpadMode = !trackpadMode }) {
-                            Icon(
-                                Icons.Default.TouchApp,
-                                contentDescription = if (trackpadMode) "Switch to direct touch" else "Switch to trackpad",
-                                tint = if (trackpadMode) MaterialTheme.colorScheme.primary else androidx.compose.ui.graphics.Color.White,
-                            )
-                        }
-                        IconButton(onClick = onEnd) {
-                            Icon(Icons.Default.Close, contentDescription = "End remote control", tint = androidx.compose.ui.graphics.Color.White)
+                }
+
+                AnimatedVisibility(
+                    visible = controlsVisible,
+                    modifier = Modifier.align(Alignment.TopCenter),
+                    enter = fadeIn(),
+                    exit = fadeOut(),
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(androidx.compose.ui.graphics.Color.Black.copy(alpha = 0.6f))
+                            .padding(horizontal = 16.dp, vertical = 10.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            "Controlling '$peerName'",
+                            color = androidx.compose.ui.graphics.Color.White,
+                            style = MaterialTheme.typography.titleSmall,
+                        )
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            IconButton(onClick = { trackpadMode = !trackpadMode; markInteraction() }) {
+                                Icon(
+                                    Icons.Default.TouchApp,
+                                    contentDescription = if (trackpadMode) "Switch to direct touch" else "Switch to trackpad",
+                                    tint = if (trackpadMode) MaterialTheme.colorScheme.primary else androidx.compose.ui.graphics.Color.White,
+                                )
+                            }
+                            IconButton(onClick = onEnd) {
+                                Icon(Icons.Default.Close, contentDescription = "End remote control", tint = androidx.compose.ui.graphics.Color.White)
+                            }
                         }
                     }
                 }
@@ -1429,6 +1589,7 @@ private fun RemoteControlScreen(
                                 }
                             }
                             fieldValue = new
+                            markInteraction()
                         },
                         modifier = Modifier
                             .align(Alignment.BottomCenter)
@@ -1457,14 +1618,16 @@ private fun RemoteControlScreen(
                 }
 
                 FloatingActionButton(
-                    onClick = { keyboardVisible = !keyboardVisible },
+                    onClick = { keyboardVisible = !keyboardVisible; markInteraction() },
                     modifier = Modifier
                         .align(Alignment.BottomEnd)
                         // Floats above the trackpad strip instead of on
                         // top of its Left/Right click buttons when
                         // trackpad mode is showing that strip along the
-                        // bottom.
-                        .padding(bottom = if (trackpadMode) 269.dp else 20.dp, end = 20.dp),
+                        // bottom (portrait only — in landscape the strip
+                        // is a side panel, not underfoot, so this doesn't
+                        // need to dodge it there).
+                        .padding(bottom = if (trackpadMode && !isLandscape) 269.dp else 20.dp, end = 20.dp),
                 ) {
                     Icon(Icons.Default.Keyboard, contentDescription = "Toggle keyboard")
                 }
@@ -1482,6 +1645,7 @@ private fun RemoteControlScreen(
 /// small trackpad strip; a labeled button isn't).
 @Composable
 private fun TrackpadSurface(
+    modifier: Modifier = Modifier,
     onMove: (nx: Double, ny: Double) -> Unit,
     onLeftClick: () -> Unit,
     onRightClick: () -> Unit,
@@ -1500,14 +1664,12 @@ private fun TrackpadSurface(
     val sensitivity = 2.5f
 
     Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .background(androidx.compose.ui.graphics.Color(0xFF1C1C1E)),
+        modifier = modifier.background(androidx.compose.ui.graphics.Color(0xFF1C1C1E)),
     ) {
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(200.dp)
+                .weight(1f)
                 .onGloballyPositioned { coords ->
                     surfaceWidthPx = coords.size.width.toFloat().coerceAtLeast(1f)
                     surfaceHeightPx = coords.size.height.toFloat().coerceAtLeast(1f)
