@@ -76,8 +76,10 @@ impl RemoteViewer {
             .with_inner_size(LogicalSize::new(1024.0, 640.0))
             .build(target)?;
         let window = Rc::new(window);
+        let window_id = window.id();
         let context = softbuffer::Context::new(window.clone()).map_err(|e| anyhow::anyhow!("{e}"))?;
         let surface = softbuffer::Surface::new(&context, window.clone()).map_err(|e| anyhow::anyhow!("{e}"))?;
+        tracing::debug!("RemoteViewer::open: window {window_id:?} and softbuffer surface created for peer '{peer_name}'");
         Ok(Self {
             window,
             surface,
@@ -104,10 +106,11 @@ impl RemoteViewer {
         match image::load_from_memory(jpeg) {
             Ok(img) => {
                 let rgba = img.to_rgba8();
+                tracing::debug!("handle_frame: decoded {}x{} frame ({} JPEG bytes), requesting redraw", rgba.width(), rgba.height(), jpeg.len());
                 self.frame = Some((rgba.width(), rgba.height(), rgba.into_raw()));
                 self.window.request_redraw();
             }
-            Err(e) => tracing::debug!("couldn't decode incoming remote-control frame: {e}"),
+            Err(e) => tracing::debug!("couldn't decode incoming remote-control frame ({} bytes): {e}", jpeg.len()),
         }
     }
 
@@ -120,12 +123,20 @@ impl RemoteViewer {
     pub fn redraw(&mut self) {
         let size = self.window.inner_size();
         let (Some(width), Some(height)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else {
+            tracing::debug!("redraw: window reported a zero-sized dimension ({}x{}), skipping", size.width, size.height);
             return;
         };
-        if self.surface.resize(width, height).is_err() {
+        if let Err(e) = self.surface.resize(width, height) {
+            tracing::warn!("redraw: softbuffer surface resize failed: {e}");
             return;
         }
-        let Ok(mut buffer) = self.surface.buffer_mut() else { return };
+        let mut buffer = match self.surface.buffer_mut() {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("redraw: softbuffer buffer_mut failed: {e}");
+                return;
+            }
+        };
         // 0x00RRGGBB per softbuffer's pixel format — a dark neutral fill
         // so the letterbox bars read as intentional, not a rendering bug.
         buffer.fill(0x001c1c1e);
@@ -158,7 +169,9 @@ impl RemoteViewer {
             }
         }
 
-        let _ = buffer.present();
+        if let Err(e) = buffer.present() {
+            tracing::warn!("redraw: softbuffer present failed: {e}");
+        }
     }
 
     /// Handles one local window event: mouse/keyboard become
@@ -206,16 +219,27 @@ impl RemoteViewer {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                tracing::debug!("handle_window_event: KeyboardInput physical_key={:?} state={:?} repeat={}", event.physical_key, event.state, event.repeat);
                 if !event.repeat {
-                    if let Some(code) = target_key_code(event.physical_key, self.peer_platform) {
-                        let kind = if event.state == ElementState::Pressed {
-                            InputEventKind::KeyDown { code }
-                        } else {
-                            InputEventKind::KeyUp { code }
-                        };
-                        self.send(commands, kind);
+                    match target_key_code(event.physical_key, self.peer_platform) {
+                        Some(code) => {
+                            let kind = if event.state == ElementState::Pressed {
+                                InputEventKind::KeyDown { code }
+                            } else {
+                                InputEventKind::KeyUp { code }
+                            };
+                            self.send(commands, kind);
+                        }
+                        None => tracing::debug!(
+                            "handle_window_event: no target key code for {:?} on platform {:?} — outside the supported subset",
+                            event.physical_key,
+                            self.peer_platform
+                        ),
                     }
                 }
+            }
+            WindowEvent::Focused(focused) => {
+                tracing::debug!("handle_window_event: window focus changed to {focused}");
             }
             _ => {}
         }
@@ -253,10 +277,10 @@ fn proto_mouse_button(button: TaoMouseButton) -> Option<ProtoMouseButton> {
 /// symbols, arrows, function keys) is silently dropped rather than sent
 /// as a wrong/misleading code.
 fn target_key_code(key: KeyCode, platform: Platform) -> Option<u32> {
-    if platform == Platform::Windows {
-        windows_key_code(key)
-    } else {
-        mac_key_code(key)
+    match platform {
+        Platform::Windows => windows_key_code(key),
+        Platform::Linux => linux_key_code(key),
+        _ => mac_key_code(key),
     }
 }
 
@@ -352,6 +376,54 @@ fn windows_key_code(key: KeyCode) -> Option<u32> {
         KeyCode::Space => 0x20,
         KeyCode::Enter => 0x0D,
         KeyCode::Backspace => 0x08,
+        _ => return None,
+    })
+}
+
+/// Linux evdev `KEY_*` codes (`linux/input-event-codes.h`) — what
+/// `remote_control_linux.rs`'s `NotifyKeyboardKeycode` call expects
+/// directly. Same table as `MainActivity.kt`'s `linuxKeyCodeFor`.
+fn linux_key_code(key: KeyCode) -> Option<u32> {
+    Some(match key {
+        KeyCode::KeyQ => 16,
+        KeyCode::KeyW => 17,
+        KeyCode::KeyE => 18,
+        KeyCode::KeyR => 19,
+        KeyCode::KeyT => 20,
+        KeyCode::KeyY => 21,
+        KeyCode::KeyU => 22,
+        KeyCode::KeyI => 23,
+        KeyCode::KeyO => 24,
+        KeyCode::KeyP => 25,
+        KeyCode::KeyA => 30,
+        KeyCode::KeyS => 31,
+        KeyCode::KeyD => 32,
+        KeyCode::KeyF => 33,
+        KeyCode::KeyG => 34,
+        KeyCode::KeyH => 35,
+        KeyCode::KeyJ => 36,
+        KeyCode::KeyK => 37,
+        KeyCode::KeyL => 38,
+        KeyCode::KeyZ => 44,
+        KeyCode::KeyX => 45,
+        KeyCode::KeyC => 46,
+        KeyCode::KeyV => 47,
+        KeyCode::KeyB => 48,
+        KeyCode::KeyN => 49,
+        KeyCode::KeyM => 50,
+        KeyCode::Digit1 => 2,
+        KeyCode::Digit2 => 3,
+        KeyCode::Digit3 => 4,
+        KeyCode::Digit4 => 5,
+        KeyCode::Digit5 => 6,
+        KeyCode::Digit6 => 7,
+        KeyCode::Digit7 => 8,
+        KeyCode::Digit8 => 9,
+        KeyCode::Digit9 => 10,
+        KeyCode::Digit0 => 11,
+        KeyCode::Space => 57,
+        KeyCode::Enter => 28,
+        KeyCode::Backspace => 14,
         _ => return None,
     })
 }

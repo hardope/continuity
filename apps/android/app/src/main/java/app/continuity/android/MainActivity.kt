@@ -926,14 +926,13 @@ private fun DeviceListCard(
                             }
                         }
                         // Remote control only has a real implementation on
-                        // macOS and Windows (see core/continuityd/src/
-                        // remote_control_*.rs) — Linux has no
-                        // implementation yet despite having one for media
-                        // control, and Android/iOS peers wire in
-                        // `NoopRemoteControlHost` and would just auto-decline,
-                        // so there's no point showing the button at all
-                        // for either.
-                        val remoteControlCapablePlatform = status.platform == "mac_os" || status.platform == "windows"
+                        // macOS, Windows, and Linux (see core/continuityd/
+                        // src/remote_control_*.rs) — Android/iOS peers wire
+                        // in `NoopRemoteControlHost` and would just
+                        // auto-decline, so there's no point showing the
+                        // button at all for either.
+                        val remoteControlCapablePlatform =
+                            status.platform == "mac_os" || status.platform == "windows" || status.platform == "linux"
                         if (status.connected && remoteControlCapablePlatform) {
                             FilledTonalButton(
                                 onClick = { onRequestRemoteControl(peerId) },
@@ -1679,13 +1678,21 @@ private fun TrackpadSurface(
 }
 
 private fun sendCharacter(ch: Char, platform: String, onInputEvent: (uniffi.continuity_ffi.FfiInputEventKind) -> Unit) {
-    val code = (if (platform == "windows") windowsKeyCodeFor(ch) else macKeyCodeFor(ch)) ?: return
+    val code = (when (platform) {
+        "windows" -> windowsKeyCodeFor(ch)
+        "linux" -> linuxKeyCodeFor(ch)
+        else -> macKeyCodeFor(ch)
+    }) ?: return
     onInputEvent(uniffi.continuity_ffi.FfiInputEventKind.KeyDown(code))
     onInputEvent(uniffi.continuity_ffi.FfiInputEventKind.KeyUp(code))
 }
 
 private fun sendBackspace(platform: String, onInputEvent: (uniffi.continuity_ffi.FfiInputEventKind) -> Unit) {
-    val code = if (platform == "windows") 0x08u else 0x33u // VK_BACK vs kVK_Delete
+    val code = when (platform) {
+        "windows" -> 0x08u // VK_BACK
+        "linux" -> 14u // KEY_BACKSPACE
+        else -> 0x33u // kVK_Delete
+    }
     onInputEvent(uniffi.continuity_ffi.FfiInputEventKind.KeyDown(code))
     onInputEvent(uniffi.continuity_ffi.FfiInputEventKind.KeyUp(code))
 }
@@ -1717,6 +1724,22 @@ private fun windowsKeyCodeFor(ch: Char): UInt? = when {
     ch.isDigit() -> ch.code.toUInt()
     ch == ' ' -> 0x20u
     ch == '\n' -> 0x0Du
+    else -> null
+}
+
+/// Linux evdev `KEY_*` codes (`linux/input-event-codes.h`) — what
+/// `remote_control_linux.rs`'s `NotifyKeyboardKeycode` portal call
+/// expects directly. Same table as `remote_viewer.rs`'s `linux_key_code`.
+private fun linuxKeyCodeFor(ch: Char): UInt? = when (ch.lowercaseChar()) {
+    'q' -> 16u; 'w' -> 17u; 'e' -> 18u; 'r' -> 19u; 't' -> 20u; 'y' -> 21u
+    'u' -> 22u; 'i' -> 23u; 'o' -> 24u; 'p' -> 25u
+    'a' -> 30u; 's' -> 31u; 'd' -> 32u; 'f' -> 33u; 'g' -> 34u; 'h' -> 35u
+    'j' -> 36u; 'k' -> 37u; 'l' -> 38u
+    'z' -> 44u; 'x' -> 45u; 'c' -> 46u; 'v' -> 47u; 'b' -> 48u; 'n' -> 49u; 'm' -> 50u
+    '1' -> 2u; '2' -> 3u; '3' -> 4u; '4' -> 5u; '5' -> 6u
+    '6' -> 7u; '7' -> 8u; '8' -> 9u; '9' -> 10u; '0' -> 11u
+    ' ' -> 57u
+    '\n' -> 28u
     else -> null
 }
 

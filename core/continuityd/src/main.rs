@@ -24,6 +24,8 @@ mod media_linux;
 mod remote_control_mac;
 #[cfg(all(target_os = "windows", feature = "remote-control"))]
 mod remote_control_windows;
+#[cfg(all(target_os = "linux", feature = "remote-control"))]
+mod remote_control_linux;
 // The *viewer* (rendering a peer's screen + forwarding local input) is
 // cross-platform — any desktop OS can initiate and view a session, not
 // just the two that can be captured/injected into (see that module's own
@@ -470,10 +472,13 @@ fn handle_sync_event(
             let _ = tray_icon.set_icon(Some(build_icon(false)));
             let _ = tray_icon.set_tooltip(Some("Continuity"));
         }
-        // No viewer surface on desktop (see `RemoteControlSessionStarted`
-        // above) — nothing to do with an incoming frame here yet.
+        // The real routing to an open viewer window happens in
+        // `handle_remote_control_sync_event` (feature-gated, needs the
+        // window/softbuffer machinery) — this arm always compiles
+        // regardless of the `remote-control` feature, so it can only
+        // ever log, never touch a viewer.
         SyncEvent::ScreenFrameReceived { frame, .. } => {
-            tracing::debug!("screen frame received ({} bytes) — no desktop viewer yet", frame.len());
+            tracing::debug!("screen frame received ({} bytes)", frame.len());
         }
     }
 }
@@ -626,7 +631,10 @@ fn handle_remote_control_sync_event(
             if *role != continuity_daemon::RemoteControlRole::Controlling {
                 return;
             }
-            let platform = connected_peer_platforms.lock().unwrap().get(peer_id).copied().unwrap_or(Platform::MacOs);
+            let platform = connected_peer_platforms.lock().unwrap().get(peer_id).copied().unwrap_or_else(|| {
+                tracing::warn!("no known platform for peer '{peer_name}' ({peer_id}) — defaulting to macOS key codes, which will be wrong if it isn't one");
+                Platform::MacOs
+            });
             match remote_viewer::RemoteViewer::open(target, peer_id.clone(), peer_name, platform) {
                 Ok(new_viewer) => *viewer.borrow_mut() = Some(new_viewer),
                 Err(e) => {
@@ -642,10 +650,15 @@ fn handle_remote_control_sync_event(
             }
         }
         SyncEvent::ScreenFrameReceived { peer_id, frame, .. } => {
-            if let Some(v) = viewer.borrow_mut().as_mut() {
-                if v.peer_id() == peer_id {
-                    v.handle_frame(frame);
-                }
+            let mut viewer_ref = viewer.borrow_mut();
+            match viewer_ref.as_mut() {
+                Some(v) if v.peer_id() == peer_id => v.handle_frame(frame),
+                Some(v) => tracing::debug!(
+                    "ScreenFrameReceived for peer '{peer_id}' ({} bytes) but the open viewer is for a different peer ('{}') — dropped",
+                    frame.len(),
+                    v.peer_id()
+                ),
+                None => tracing::debug!("ScreenFrameReceived for peer '{peer_id}' ({} bytes) but no viewer window is open — dropped", frame.len()),
             }
         }
         _ => {}
@@ -771,19 +784,22 @@ fn start_engine_thread(
 
                 // Real remote-control hosts only exist behind the
                 // `remote-control` Cargo feature (see Cargo.toml) — off,
-                // and every platform (Linux included, which has no real
-                // implementation yet regardless) wires in the `Noop` host,
+                // and every unsupported platform wires in the `Noop` host,
                 // which is how a "lite" build stays lite: the heavy
                 // platform capture/injection code and the permissions it
                 // triggers (Screen Recording, Accessibility/Input
-                // Monitoring) are compiled out entirely, not just hidden
-                // behind a disabled UI toggle.
+                // Monitoring, the xdg-desktop-portal dialog) are compiled
+                // out entirely, not just hidden behind a disabled UI
+                // toggle.
                 #[cfg(all(target_os = "macos", feature = "remote-control"))]
                 let remote_control: Arc<dyn continuity_daemon::RemoteControlHost> = Arc::new(remote_control_mac::MacRemoteControlHost::new());
                 #[cfg(all(target_os = "windows", feature = "remote-control"))]
                 let remote_control: Arc<dyn continuity_daemon::RemoteControlHost> =
                     Arc::new(remote_control_windows::WindowsRemoteControlHost::new());
-                #[cfg(not(all(feature = "remote-control", any(target_os = "macos", target_os = "windows"))))]
+                #[cfg(all(target_os = "linux", feature = "remote-control"))]
+                let remote_control: Arc<dyn continuity_daemon::RemoteControlHost> =
+                    Arc::new(remote_control_linux::LinuxRemoteControlHost::new());
+                #[cfg(not(all(feature = "remote-control", any(target_os = "macos", target_os = "windows", target_os = "linux"))))]
                 let remote_control: Arc<dyn continuity_daemon::RemoteControlHost> = Arc::new(continuity_daemon::NoopRemoteControlHost);
 
                 let config = EngineConfig {

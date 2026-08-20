@@ -147,3 +147,11 @@ windows = { version = "0.58", features = [
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = "4"
 rfd = { version = "0.15", default-features = false, features = ["gtk3"] }
+# Remote-control screen capture and input injection via xdg-desktop-portal
+# (RemoteDesktop + ScreenCast) — see remote_control_linux.rs's module doc
+# comment for the Wayland-vs-X11 rationale and, importantly, which half
+# of that file is actually verified. `futures-util` is just for
+# `MessageStream`'s `.next()` (zbus streams are plain `futures::Stream`s,
+# not something zbus itself re-exports a combinator for).
+futures-util = "0.3"
+pipewire = "0.8"
