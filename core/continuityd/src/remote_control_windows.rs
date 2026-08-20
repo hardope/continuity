@@ -32,7 +32,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
     MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT, VIRTUAL_KEY,
 };
-use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+use windows::Win32::Foundation::GetLastError;
+use windows::Win32::UI::WindowsAndMessaging::{
+    DrawIconEx, GetCursorInfo, GetIconInfo, GetSystemMetrics, CURSORINFO, CURSOR_SHOWING, DI_NORMAL, ICONINFO, SM_CXSCREEN, SM_CYSCREEN,
+};
 
 const CAPTURE_FPS: u64 = 10;
 
@@ -107,23 +110,43 @@ fn capture_jpeg() -> Option<Vec<u8>> {
         let width = GetSystemMetrics(SM_CXSCREEN);
         let height = GetSystemMetrics(SM_CYSCREEN);
         if width <= 0 || height <= 0 {
+            tracing::debug!("capture_jpeg: GetSystemMetrics gave non-positive dimensions ({width}x{height})");
             return None;
         }
 
         let screen_dc = GetDC(None);
         if screen_dc.is_invalid() {
+            tracing::debug!("capture_jpeg: GetDC(None) returned an invalid HDC");
             return None;
         }
         let mem_dc = CreateCompatibleDC(screen_dc);
         let bitmap = CreateCompatibleBitmap(screen_dc, width, height);
         if mem_dc.is_invalid() || bitmap.is_invalid() {
+            tracing::debug!(
+                "capture_jpeg: CreateCompatibleDC/CreateCompatibleBitmap failed (mem_dc_invalid={}, bitmap_invalid={})",
+                mem_dc.is_invalid(),
+                bitmap.is_invalid()
+            );
             let _ = DeleteDC(mem_dc);
             let _ = ReleaseDC(None, screen_dc);
             return None;
         }
         let previous: HGDIOBJ = SelectObject(mem_dc, bitmap);
 
-        let blit_ok = BitBlt(mem_dc, 0, 0, width, height, screen_dc, 0, 0, SRCCOPY).is_ok();
+        let blit_result = BitBlt(mem_dc, 0, 0, width, height, screen_dc, 0, 0, SRCCOPY);
+        if let Err(e) = &blit_result {
+            tracing::debug!("capture_jpeg: BitBlt failed: {e}");
+        }
+        let blit_ok = blit_result.is_ok();
+
+        // Composited directly onto the same memory DC the screen was
+        // just blitted into, before `GetDIBits` ever reads it back out —
+        // GDI capture has no equivalent of macOS's Screen-Recording-gated
+        // "no cursor at all" limitation; the real system cursor is right
+        // there for the taking via two long-documented, ordinary calls.
+        if blit_ok {
+            draw_cursor_onto(mem_dc);
+        }
 
         let mut pixels = vec![0u8; (width as usize) * (height as usize) * 4];
         let mut bitmap_info = BITMAPINFO {
@@ -141,8 +164,15 @@ fn capture_jpeg() -> Option<Vec<u8>> {
             },
             ..Default::default()
         };
-        let got_bits = blit_ok
-            && GetDIBits(mem_dc, bitmap, 0, height as u32, Some(pixels.as_mut_ptr() as *mut _), &mut bitmap_info, DIB_RGB_COLORS) != 0;
+        let dibits_result = if blit_ok {
+            GetDIBits(mem_dc, bitmap, 0, height as u32, Some(pixels.as_mut_ptr() as *mut _), &mut bitmap_info, DIB_RGB_COLORS)
+        } else {
+            0
+        };
+        if blit_ok && dibits_result == 0 {
+            tracing::debug!("capture_jpeg: GetDIBits returned 0 — last error: {:?}", GetLastError());
+        }
+        let got_bits = blit_ok && dibits_result != 0;
 
         SelectObject(mem_dc, previous);
         let _ = DeleteObject(bitmap);
@@ -161,13 +191,73 @@ fn capture_jpeg() -> Option<Vec<u8>> {
             px.swap(0, 2);
         }
 
-        let image_buffer = image::RgbaImage::from_raw(width as u32, height as u32, pixels)?;
+        let Some(image_buffer) = image::RgbaImage::from_raw(width as u32, height as u32, pixels) else {
+            tracing::debug!("capture_jpeg: RgbaImage::from_raw failed — buffer/dimension mismatch ({width}x{height})");
+            return None;
+        };
         let mut jpeg_bytes = Vec::new();
         let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_bytes, 40);
-        encoder
-            .encode(image_buffer.as_raw(), image_buffer.width(), image_buffer.height(), image::ExtendedColorType::Rgba8)
-            .ok()?;
+        if let Err(e) = encoder.encode(image_buffer.as_raw(), image_buffer.width(), image_buffer.height(), image::ExtendedColorType::Rgba8) {
+            tracing::debug!("capture_jpeg: JPEG encode failed: {e}");
+            return None;
+        }
         Some(jpeg_bytes)
+    }
+}
+
+/// Draws the real system cursor onto `mem_dc` at its actual current
+/// position — unlike macOS (see `remote_control_mac.rs`'s
+/// `composite_cursor_marker`), this doesn't need a synthetic stand-in at
+/// all: `GetCursorInfo` + `DrawIconEx` is the standard, long-documented
+/// way to grab the literal cursor Windows itself is currently showing,
+/// hotspot and all. A no-op (leaving the frame as a plain screenshot)
+/// whenever any step fails or the cursor's hidden — a missing cursor is
+/// a strictly smaller problem than a wrongly-placed fake one.
+fn draw_cursor_onto(mem_dc: windows::Win32::Graphics::Gdi::HDC) {
+    let mut info = CURSORINFO { cbSize: std::mem::size_of::<CURSORINFO>() as u32, ..Default::default() };
+    // SAFETY: `info` is a correctly-sized, stack-local `CURSORINFO` with
+    // `cbSize` set as the API requires before the call.
+    if unsafe { GetCursorInfo(&mut info) }.is_err() {
+        return;
+    }
+    if info.flags.0 & CURSOR_SHOWING.0 == 0 {
+        // Cursor is programmatically hidden (e.g. a fullscreen video
+        // player, or a game capturing the mouse) — nothing to draw.
+        return;
+    }
+
+    let mut icon_info = ICONINFO::default();
+    // SAFETY: `info.hCursor` came from `GetCursorInfo` above, still valid
+    // for the duration of this call; `icon_info` is a correctly-sized
+    // stack-local out-parameter.
+    if unsafe { GetIconInfo(info.hCursor, &mut icon_info) }.is_err() {
+        return;
+    }
+    // `GetIconInfo` allocates two new bitmaps we now own — required
+    // cleanup, not optional, or this leaks two GDI handles every single
+    // captured frame (10 times a second for as long as a session runs).
+    unsafe {
+        if !icon_info.hbmMask.is_invalid() {
+            let _ = DeleteObject(icon_info.hbmMask);
+        }
+        if !icon_info.hbmColor.is_invalid() {
+            let _ = DeleteObject(icon_info.hbmColor);
+        }
+    }
+
+    // The hotspot is the pixel *within* the cursor image that represents
+    // its actual position (e.g. the tip of an arrow, not the icon's
+    // corner) — `DrawIconEx`'s (x, y) is where the icon's top-left corner
+    // goes, so the hotspot has to be subtracted back out to land the
+    // right pixel of the cursor image on the real screen position.
+    let x = info.ptScreenPos.x - icon_info.xHotspot as i32;
+    let y = info.ptScreenPos.y - icon_info.yHotspot as i32;
+    // SAFETY: `mem_dc` is a valid memory DC for the duration of this
+    // call (owned by `capture_jpeg`, released after it returns);
+    // `info.hCursor` is still valid, same as above. `0, 0` for
+    // width/height means "use the cursor's own actual size."
+    unsafe {
+        let _ = DrawIconEx(mem_dc, x, y, info.hCursor, 0, 0, 0, None, DI_NORMAL);
     }
 }
 

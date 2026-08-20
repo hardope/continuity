@@ -36,16 +36,43 @@ use continuity_daemon::RemoteControlHost;
 use continuity_proto::{InputEventKind, MouseButton as ProtoMouseButton};
 use objc2::AnyThread;
 use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep};
-use objc2_core_foundation::CGPoint;
+use objc2_core_foundation::{CFRetained, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
-    CGDisplayBounds, CGDisplayPixelsHigh, CGDisplayPixelsWide, CGEvent, CGEventTapLocation, CGEventType, CGMainDisplayID, CGMouseButton,
-    CGPreflightScreenCaptureAccess, CGRequestScreenCaptureAccess, CGScrollEventUnit,
+    CGBitmapContextCreate, CGBitmapContextCreateImage, CGColorSpace, CGContext, CGDisplayBounds, CGDisplayPixelsHigh, CGDisplayPixelsWide,
+    CGEvent, CGEventTapLocation, CGEventType, CGImage, CGImageAlphaInfo, CGMainDisplayID, CGMouseButton, CGPreflightScreenCaptureAccess,
+    CGRequestScreenCaptureAccess, CGScrollEventUnit,
 };
 use objc2_foundation::NSDictionary;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Once};
+use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
 use tokio::sync::mpsc;
+
+// Raw IOKit power-management calls — not bound by any `objc2-*` crate
+// (IOKit predates the modern Objective-C-interop crates and is plain C),
+// same pattern as `media_mac.rs`'s hand-declared `AXIsProcessTrusted`.
+// Holding a `PreventUserIdleDisplaySleep` assertion for the duration of
+// a session is the standard, documented technique screen-sharing apps
+// (Zoom, TeamViewer, etc.) use to keep the display actively updating —
+// without it, macOS's own power management can throttle/pause display
+// refresh once there's no *local* physical input for a while, and a
+// remote controller's synthetic `CGEventPost` input apparently doesn't
+// count as activity for this purpose the same way real hardware input
+// does: reported as the screen "freezing" until the physical mouse is
+// touched, which then un-freezes it — exactly the shape idle display
+// power management would produce.
+#[link(name = "IOKit", kind = "framework")]
+unsafe extern "C" {
+    fn IOPMAssertionCreateWithName(
+        assertion_type: core_foundation::string::CFStringRef,
+        assertion_level: u32,
+        assertion_name: core_foundation::string::CFStringRef,
+        assertion_id: *mut u32,
+    ) -> i32;
+    fn IOPMAssertionRelease(assertion_id: u32) -> i32;
+}
+
+const K_IOPM_ASSERTION_LEVEL_ON: u32 = 255;
 
 /// Mirrors `media_mac::ensure_accessibility_trust` exactly, just for the
 /// Screen Recording permission `capture_jpeg` needs instead of the
@@ -109,11 +136,29 @@ const JPEG_QUALITY: f64 = 0.4;
 
 pub struct MacRemoteControlHost {
     capturing: Arc<AtomicBool>,
+    /// The active `IOPMAssertionID`, if a session is currently holding
+    /// one — released in `stop_capture`. `None` both before the first
+    /// session and after it ends.
+    display_sleep_assertion: Mutex<Option<u32>>,
+    /// Normalized position (matching `InputEventKind::MouseMove`'s own
+    /// 0.0..=1.0, top-left-origin convention) of the most recently
+    /// injected mouse position — `capture_jpeg` reads this to composite
+    /// a cursor marker into the captured frame, since `CGDisplayCreateImage`
+    /// has no way to include the real system cursor at all (unlike the
+    /// newer ScreenCaptureKit framework, which isn't used here — see this
+    /// module's top-level doc comment for why). `None` until the first
+    /// `MouseMove` of a session arrives, so nothing's drawn before there's
+    /// a real position to draw.
+    last_cursor: Arc<Mutex<Option<(f64, f64)>>>,
 }
 
 impl MacRemoteControlHost {
     pub fn new() -> Self {
-        Self { capturing: Arc::new(AtomicBool::new(false)) }
+        Self {
+            capturing: Arc::new(AtomicBool::new(false)),
+            display_sleep_assertion: Mutex::new(None),
+            last_cursor: Arc::new(Mutex::new(None)),
+        }
     }
 }
 
@@ -125,27 +170,37 @@ impl Default for MacRemoteControlHost {
 
 impl RemoteControlHost for MacRemoteControlHost {
     fn inject(&self, event: InputEventKind) {
+        if let InputEventKind::MouseMove { x, y } = event {
+            *self.last_cursor.lock().unwrap() = Some((x, y));
+        }
         inject_event(event);
     }
 
     fn start_capture(&self) -> Option<mpsc::Receiver<Vec<u8>>> {
         ensure_screen_recording_trust();
         let display_id = CGMainDisplayID();
+        // Fresh session, no move injected yet — otherwise a marker from
+        // the *previous* session would flash onto the very first frame
+        // of this one at wherever the old session's cursor last was.
+        *self.last_cursor.lock().unwrap() = None;
         // Probed once, synchronously, before spinning up the capture
         // thread at all — `CGDisplayCreateImage` returning `None` means
         // no Screen Recording permission (macOS silently returns null
         // rather than any kind of error the caller can inspect further),
         // and there's no point starting a whole thread just to have its
         // very first frame fail the same way.
-        if capture_jpeg(display_id).is_none() {
+        if capture_jpeg(display_id, None).is_none() {
             tracing::warn!(
                 "screen capture failed — Screen Recording permission likely not granted (System Settings > Privacy & Security > Screen Recording)"
             );
             return None;
         }
 
+        *self.display_sleep_assertion.lock().unwrap() = create_display_sleep_assertion();
+
         self.capturing.store(true, Ordering::Relaxed);
         let capturing = self.capturing.clone();
+        let last_cursor = self.last_cursor.clone();
         // Bounded to a couple of frames' worth, not unbounded — a
         // receiver that falls behind (slow network, the controlling
         // side backgrounded, whatever) should never accumulate an
@@ -164,7 +219,8 @@ impl RemoteControlHost for MacRemoteControlHost {
             let target_interval = Duration::from_millis(1000 / CAPTURE_FPS);
             while capturing.load(Ordering::Relaxed) {
                 let started_at = std::time::Instant::now();
-                if let Some(jpeg) = capture_jpeg(display_id) {
+                let cursor = *last_cursor.lock().unwrap();
+                if let Some(jpeg) = capture_jpeg(display_id, cursor) {
                     // Deliberately `try_send`, not a blocking send — a
                     // full channel means the consumer's behind; dropping
                     // this frame and trying again next tick keeps
@@ -186,19 +242,59 @@ impl RemoteControlHost for MacRemoteControlHost {
 
     fn stop_capture(&self) {
         self.capturing.store(false, Ordering::Relaxed);
+        if let Some(id) = self.display_sleep_assertion.lock().unwrap().take() {
+            unsafe {
+                IOPMAssertionRelease(id);
+            }
+        }
     }
 }
 
-/// One screenshot of `display_id`, JPEG-encoded. `None` covers both real
-/// failure modes the same way, since `CGDisplayCreateImage` gives no way
-/// to tell them apart: no Screen Recording permission, or (much rarer)
-/// the display disappearing mid-call (sleep, unplugged external monitor).
-fn capture_jpeg(display_id: u32) -> Option<Vec<u8>> {
+/// Holds macOS's display awake/refreshing for the duration of a session —
+/// see this module's `IOPMAssertionCreateWithName` doc comment above for
+/// why. Logged, not treated as fatal, if it fails: worst case the
+/// original freezing-when-idle behavior returns, not a broken session.
+fn create_display_sleep_assertion() -> Option<u32> {
+    use core_foundation::base::TCFType;
+    use core_foundation::string::CFString;
+
+    let assertion_type = CFString::new("PreventUserIdleDisplaySleep");
+    let assertion_name = CFString::new("Continuity remote-control session");
+    let mut assertion_id: u32 = 0;
+    let result = unsafe {
+        IOPMAssertionCreateWithName(
+            assertion_type.as_concrete_TypeRef(),
+            K_IOPM_ASSERTION_LEVEL_ON,
+            assertion_name.as_concrete_TypeRef(),
+            &mut assertion_id,
+        )
+    };
+    if result == 0 {
+        Some(assertion_id)
+    } else {
+        tracing::debug!("couldn't create display-sleep-prevention assertion (IOReturn {result})");
+        None
+    }
+}
+
+/// One screenshot of `display_id`, JPEG-encoded, with a small cursor
+/// marker composited in at `cursor_norm` (if given) — see
+/// `MacRemoteControlHost::last_cursor`'s doc comment for why this isn't
+/// the real system cursor. `None` covers both real capture failure modes
+/// the same way, since `CGDisplayCreateImage` gives no way to tell them
+/// apart: no Screen Recording permission, or (much rarer) the display
+/// disappearing mid-call (sleep, unplugged external monitor).
+fn capture_jpeg(display_id: u32, cursor_norm: Option<(f64, f64)>) -> Option<Vec<u8>> {
     // Deprecated in favor of ScreenCaptureKit — see this module's
     // top-level doc comment for why the simpler, synchronous API is the
     // deliberate choice for now.
     #[allow(deprecated)]
     let image = objc2_core_graphics::CGDisplayCreateImage(display_id)?;
+
+    let image = match cursor_norm {
+        Some((nx, ny)) => composite_cursor_marker(&image, nx, ny).unwrap_or(image),
+        None => image,
+    };
 
     let bitmap = NSBitmapImageRep::initWithCGImage(NSBitmapImageRep::alloc(), &image);
     let quality = objc2_foundation::NSNumber::new_f64(JPEG_QUALITY);
@@ -207,6 +303,58 @@ fn capture_jpeg(display_id: u32) -> Option<Vec<u8>> {
         NSDictionary::from_slices(&[compression_key], &[&*quality]);
     let data = unsafe { bitmap.representationUsingType_properties(NSBitmapImageFileType::JPEG, &properties) }?;
     Some(data.to_vec())
+}
+
+/// Draws a small filled circle onto a copy of `image` at `(nx, ny)`
+/// (normalized, top-left-origin, matching `InputEventKind::MouseMove`'s
+/// own convention — flipped to Core Graphics' bottom-left-origin
+/// coordinate space for the actual drawing). Standard
+/// draw-into-a-bitmap-context-then-read-the-image-back-out pattern:
+/// none of this needs to know `NSBitmapImageRep`'s internal pixel layout,
+/// unlike poking the raw bitmap buffer directly would.
+fn composite_cursor_marker(image: &CGImage, nx: f64, ny: f64) -> Option<CFRetained<CGImage>> {
+    let width = CGImage::width(Some(image));
+    let height = CGImage::height(Some(image));
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let color_space = CGColorSpace::new_device_rgb()?;
+    // SAFETY: `data` is null, so CG allocates and owns the backing buffer
+    // itself — nothing here holds a raw pointer into it.
+    let context = unsafe {
+        CGBitmapContextCreate(
+            std::ptr::null_mut(),
+            width,
+            height,
+            8,
+            0,
+            Some(&color_space),
+            CGImageAlphaInfo::PremultipliedLast.0,
+        )
+    }?;
+    let full_rect = CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: CGSize { width: width as f64, height: height as f64 } };
+    CGContext::draw_image(Some(&context), full_rect, Some(image));
+
+    // ~0.6% of the smaller screen dimension — big enough to actually see,
+    // small enough not to obscure whatever's under it.
+    let radius = (width.min(height) as f64) * 0.006;
+    let cx = nx * width as f64;
+    // Core Graphics' default (non-flipped) coordinate space on macOS has
+    // its origin at the *bottom*-left with Y increasing upward, while
+    // `ny` follows the touch/screen convention of top-left-origin with Y
+    // increasing downward — without this flip the marker would appear
+    // mirrored vertically from where the cursor actually is.
+    let cy = (1.0 - ny) * height as f64;
+    let dot_rect =
+        CGRect { origin: CGPoint { x: cx - radius, y: cy - radius }, size: CGSize { width: radius * 2.0, height: radius * 2.0 } };
+
+    CGContext::set_rgb_fill_color(Some(&context), 1.0, 1.0, 1.0, 0.9);
+    CGContext::fill_ellipse_in_rect(Some(&context), dot_rect);
+    CGContext::set_rgb_stroke_color(Some(&context), 0.0, 0.0, 0.0, 0.6);
+    CGContext::set_line_width(Some(&context), (radius * 0.25).max(1.0));
+    CGContext::stroke_ellipse_in_rect(Some(&context), dot_rect);
+
+    CGBitmapContextCreateImage(Some(&context))
 }
 
 /// Injects one input event via `CGEventPost`, the same session-level
@@ -302,8 +450,32 @@ mod manual_verification {
     #[ignore]
     fn print_screen_capture_info() {
         let display_id = CGMainDisplayID();
-        match capture_jpeg(display_id) {
+        match capture_jpeg(display_id, None) {
             Some(jpeg) => println!("captured {} JPEG bytes", jpeg.len()),
+            None => println!("capture failed — check Screen Recording permission"),
+        }
+    }
+
+    /// Visual verification for `composite_cursor_marker`: captures with a
+    /// marker at a known, deliberately off-center position and writes the
+    /// JPEG to disk so it can be eyeballed directly — the thing this
+    /// actually needs to prove (marker present, correctly oriented, not
+    /// mirrored) isn't something a numeric assertion can check on its
+    /// own the way `verify_mouse_move_reaches_real_cursor_position` can
+    /// for cursor movement.
+    #[test]
+    #[ignore]
+    fn print_cursor_marker_capture_info() {
+        let display_id = CGMainDisplayID();
+        // (0.15, 0.15): near the top-left corner — if Y ends up flipped,
+        // this lands near the bottom-left instead, which is easy to tell
+        // apart at a glance.
+        match capture_jpeg(display_id, Some((0.15, 0.15))) {
+            Some(jpeg) => {
+                let path = std::env::var("CURSOR_MARKER_OUT").unwrap_or_else(|_| "/tmp/continuity_cursor_marker.jpg".to_string());
+                std::fs::write(&path, &jpeg).unwrap();
+                println!("captured {} JPEG bytes with cursor marker at (0.15, 0.15), wrote {path}", jpeg.len());
+            }
             None => println!("capture failed — check Screen Recording permission"),
         }
     }

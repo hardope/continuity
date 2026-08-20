@@ -23,7 +23,6 @@ import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
@@ -39,13 +38,11 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -130,7 +127,6 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
@@ -1345,15 +1341,6 @@ private fun RemoteControlScreen(
                 }
                 var imageBounds by remember { mutableStateOf<Rect?>(null) }
                 var trackpadMode by remember { mutableStateOf(false) }
-                // Last position this side sent a MouseMove to, in the same
-                // normalized 0..1 frame space `imageBounds` maps to — the
-                // one piece of visual feedback that was missing entirely:
-                // the underlying capture (`CGDisplayCreateImage` on macOS)
-                // doesn't include the system cursor in the image at all,
-                // so without this the video shows no cursor whatsoever,
-                // anywhere, ever. `null` until the first input goes out.
-                var cursorNx by remember { mutableStateOf<Float?>(null) }
-                var cursorNy by remember { mutableStateOf<Float?>(null) }
 
                 var zoomScale by remember { mutableStateOf(1f) }
                 var panX by remember { mutableStateOf(0f) }
@@ -1375,8 +1362,6 @@ private fun RemoteControlScreen(
                     if (bounds.width <= 0f || bounds.height <= 0f) return
                     val nx = ((offset.x - bounds.left) / bounds.width).coerceIn(0f, 1f)
                     val ny = ((offset.y - bounds.top) / bounds.height).coerceIn(0f, 1f)
-                    cursorNx = nx
-                    cursorNy = ny
                     onInputEvent(uniffi.continuity_ffi.FfiInputEventKind.MouseMove(nx.toDouble(), ny.toDouble()))
                 }
 
@@ -1451,23 +1436,6 @@ private fun RemoteControlScreen(
                                             }
                                         },
                                 )
-
-                                val bounds = imageBounds
-                                val nx = cursorNx
-                                val ny = cursorNy
-                                if (bounds != null && nx != null && ny != null) {
-                                    val density = androidx.compose.ui.platform.LocalDensity.current
-                                    val radiusPx = with(density) { 8.dp.toPx() }
-                                    val cx = bounds.left + nx * bounds.width
-                                    val cy = bounds.top + ny * bounds.height
-                                    Box(
-                                        modifier = Modifier
-                                            .offset { IntOffset((cx - radiusPx).toInt(), (cy - radiusPx).toInt()) }
-                                            .size(16.dp)
-                                            .background(androidx.compose.ui.graphics.Color.White.copy(alpha = 0.9f), CircleShape)
-                                            .border(1.5.dp, androidx.compose.ui.graphics.Color.Black.copy(alpha = 0.6f), CircleShape),
-                                    )
-                                }
                             }
                         } else {
                             Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -1482,8 +1450,6 @@ private fun RemoteControlScreen(
                     TrackpadSurface(
                         modifier = modifier,
                         onMove = { nx, ny ->
-                            cursorNx = nx.toFloat()
-                            cursorNy = ny.toFloat()
                             onInputEvent(uniffi.continuity_ffi.FfiInputEventKind.MouseMove(nx, ny))
                             markInteraction()
                         },
