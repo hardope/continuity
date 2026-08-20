@@ -75,10 +75,15 @@ jobs:
           # depends resolution (core/continuityd/Cargo.toml) needs to
           # compute the .deb's Depends: field — without it, cargo-deb
           # silently produces a .deb with no dependency information at
-          # all, defeating the reason it exists.
+          # all, defeating the reason it exists. libpipewire-0.3-dev/
+          # libspa-0.2-dev are for remote_control_linux.rs's screen
+          # capture (the pipewire/libspa-sys crates link against them via
+          # pkg-config); libclang-dev is for the bindgen build step those
+          # two crates run against pipewire/spa's C headers.
           sudo apt-get install -y \
             libgtk-3-dev libayatana-appindicator3-dev \
-            libdbus-1-dev libxdo-dev pkg-config dpkg-dev
+            libdbus-1-dev libxdo-dev pkg-config dpkg-dev \
+            libpipewire-0.3-dev libspa-0.2-dev libclang-dev
 
       - name: Build
         # Still building continuityctl too (cheap, shares most deps) even
