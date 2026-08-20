@@ -155,3 +155,7 @@ rfd = { version = "0.15", default-features = false, features = ["gtk3"] }
 # not something zbus itself re-exports a combinator for).
 futures-util = "0.3"
 pipewire = "0.8"
+# `call_portal_method`'s generic bound (`B: serde::Serialize + ...`) names
+# `serde` directly — already pulled in transitively via zbus/continuity-proto,
+# but a trait bound needs the crate declared here to resolve `serde::` at all.
+serde = "1"

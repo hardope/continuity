@@ -922,6 +922,7 @@ dependencies = [
  "objc2-foundation",
  "pipewire",
  "rfd",
+ "serde",
  "softbuffer",
  "tao",
  "tokio",
