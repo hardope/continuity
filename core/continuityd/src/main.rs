@@ -248,25 +248,17 @@ fn main() -> anyhow::Result<()> {
             } else if event.id == refresh_item_id {
                 let _ = commands.send(EngineCommand::RefreshDiscovery);
             } else if event.id == reset_item_id {
-                let result = rfd::MessageDialog::new()
-                    .set_title("Continuity — Reset")
-                    .set_description(
-                        "This disconnects every paired device and forgets them all. Each one will need to be paired again from scratch.\n\nAre you sure?",
-                    )
-                    .set_buttons(rfd::MessageButtons::YesNo)
-                    .show();
-                if matches!(result, rfd::MessageDialogResult::Yes) {
-                    let _ = commands.send(EngineCommand::Reset);
-                }
+                confirm(
+                    "Continuity — Reset",
+                    "This disconnects every paired device and forgets them all. Each one will need to be paired again from scratch.\n\nAre you sure?",
+                    commands.clone(),
+                    |commands| { let _ = commands.send(EngineCommand::Reset); },
+                );
             } else if event.id == about_item_id {
-                rfd::MessageDialog::new()
-                    .set_title("About Continuity")
-                    .set_description(format!(
-                        "Continuity {}\n\nClipboard, file, and remote-control continuity across your devices — no cloud relay, no account.\n\nhttps://github.com/hardope/continuity",
-                        env!("CARGO_PKG_VERSION")
-                    ))
-                    .set_buttons(rfd::MessageButtons::Ok)
-                    .show();
+                notify(&format!(
+                    "Continuity {}\n\nClipboard, file, and remote-control continuity across your devices — no cloud relay, no account.\n\nhttps://github.com/hardope/continuity",
+                    env!("CARGO_PKG_VERSION")
+                ));
             } else if event.id == quit_item_id {
                 *control_flow = ControlFlow::Exit;
             } else if let Some(target) = send_target_map.lock().unwrap().get(&event.id).cloned() {
@@ -291,16 +283,12 @@ fn main() -> anyhow::Result<()> {
                 let _ = commands.send(EngineCommand::ReconnectPeer { peer_crypto_id: peer_id });
             } else if let Some(peer_id) = forget_target_map.lock().unwrap().get(&event.id).cloned() {
                 let peer_name = connected_peers.lock().unwrap().get(&peer_id).cloned().unwrap_or_else(|| peer_id.clone());
-                let result = rfd::MessageDialog::new()
-                    .set_title("Continuity — Forget Device")
-                    .set_description(format!(
-                        "Forget '{peer_name}'? This closes the connection now and it'll need to be paired again from scratch to reconnect.\n\nAre you sure?"
-                    ))
-                    .set_buttons(rfd::MessageButtons::YesNo)
-                    .show();
-                if matches!(result, rfd::MessageDialogResult::Yes) {
-                    let _ = commands.send(EngineCommand::RevokeDevice { peer_crypto_id: peer_id });
-                }
+                confirm(
+                    "Continuity — Forget Device",
+                    &format!("Forget '{peer_name}'? This closes the connection now and it'll need to be paired again from scratch to reconnect.\n\nAre you sure?"),
+                    commands.clone(),
+                    move |commands| { let _ = commands.send(EngineCommand::RevokeDevice { peer_crypto_id: peer_id }); },
+                );
             } else {
                 #[cfg(feature = "remote-control")]
                 if let Some(peer_id) = remote_control_target_map.lock().unwrap().get(&event.id).cloned() {
@@ -764,6 +752,65 @@ fn handle_remote_control_sync_event(
             }
         }
         _ => {}
+    }
+}
+
+/// Asks a yes/no question and runs `on_yes` if the answer is yes.
+///
+/// On Linux this goes through a critical, non-expiring desktop
+/// notification with Yes/No actions rather than a blocking
+/// `rfd::MessageDialog` — confirmed for real on a live GNOME 50/Wayland
+/// session that the plain dialog's `.show()` call can simply never
+/// return at all (GNOME/Mutter's Wayland focus-stealing prevention can
+/// refuse to present a brand-new top-level window), which doesn't just
+/// break that one confirmation: since every menu click and engine event
+/// is handled on the same single thread, one permanently-blocked dialog
+/// call freezes the *entire* tray app, including unrelated things like
+/// Quit. macOS/Windows keep the plain, synchronous dialog, which testing
+/// this session confirmed works fine there.
+fn confirm(
+    title: &str,
+    description: &str,
+    commands: tokio::sync::mpsc::UnboundedSender<EngineCommand>,
+    on_yes: impl FnOnce(&tokio::sync::mpsc::UnboundedSender<EngineCommand>) + Send + 'static,
+) {
+    #[cfg(target_os = "linux")]
+    {
+        match notify_rust::Notification::new()
+            .summary(title)
+            .body(description)
+            .action("accept", "Yes")
+            .action("decline", "No")
+            .urgency(notify_rust::Urgency::Critical)
+            .timeout(notify_rust::Timeout::Never)
+            .show()
+        {
+            Ok(handle) => {
+                std::thread::spawn(move || {
+                    let mut accepted = false;
+                    handle.wait_for_action(|action| {
+                        accepted = action == "accept" || action == "default";
+                    });
+                    if accepted {
+                        on_yes(&commands);
+                    }
+                });
+            }
+            Err(e) => {
+                tracing::warn!("couldn't show the '{title}' confirmation notification, falling back to a dialog: {e}");
+                let result = rfd::MessageDialog::new().set_title(title).set_description(description).set_buttons(rfd::MessageButtons::YesNo).show();
+                if matches!(result, rfd::MessageDialogResult::Yes) {
+                    on_yes(&commands);
+                }
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let result = rfd::MessageDialog::new().set_title(title).set_description(description).set_buttons(rfd::MessageButtons::YesNo).show();
+        if matches!(result, rfd::MessageDialogResult::Yes) {
+            on_yes(&commands);
+        }
     }
 }
 
