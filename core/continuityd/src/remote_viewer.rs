@@ -54,6 +54,24 @@ pub struct RemoteViewer {
     /// normalized position *on the frame*, not the whole window.
     draw_rect: (u32, u32, u32, u32),
     last_move_sent: Instant,
+    /// Set once `request_redraw` has been called and cleared at the top
+    /// of `redraw` — without this, a frame arriving every ~100ms calls
+    /// `request_redraw` every time regardless of whether the *previous*
+    /// request has actually been serviced yet. Confirmed for real this
+    /// isn't just a performance nicety: tao's Linux `request_redraw`
+    /// just pushes onto an unbounded channel with no deduping of its
+    /// own, so an unthrottled flood of ~10/sec queued up indefinitely
+    /// against a window stuck in an abnormal, never-mapped state (see
+    /// `rendered_once` below) — live testing on a real GNOME 50/Wayland
+    /// session showed this preceding an actual Mutter segfault
+    /// (`clutter_sprite_invalidate_cursor`, confirmed via the saved
+    /// apport crash report's backtrace) that took down the whole
+    /// desktop session.
+    redraw_pending: bool,
+    /// Whether `redraw` has ever successfully reached `buffer.present()`
+    /// — becomes the basis for `is_stuck`'s watchdog below.
+    rendered_once: bool,
+    opened_at: Instant,
 }
 
 /// Throttles outgoing `MouseMove` — a real desktop mouse reports position
@@ -63,6 +81,15 @@ pub struct RemoteViewer {
 /// carries clipboard/ping traffic. ~120Hz is well past what's
 /// perceptible as latency but a fraction of raw OS mouse-move rate.
 const MOVE_THROTTLE: Duration = Duration::from_millis(8);
+
+/// If the window hasn't rendered a single real frame within this long,
+/// something is fundamentally broken (confirmed on Linux: the window
+/// never gets properly presented by the compositor at all when created
+/// from a background event rather than direct user input) — better to
+/// give up and end the session cleanly than leave a permanently-blank,
+/// still-input-receiving window open indefinitely, which is the state
+/// that preceded a real GNOME Shell crash during testing.
+const RENDER_WATCHDOG: Duration = Duration::from_secs(5);
 
 impl RemoteViewer {
     pub fn open(
@@ -76,6 +103,14 @@ impl RemoteViewer {
             .with_inner_size(LogicalSize::new(1024.0, 640.0))
             .build(target)?;
         let window = Rc::new(window);
+        // Best-effort nudge for the same underlying issue `is_stuck`
+        // guards against: this window is created from a background
+        // engine event, not directly in response to a user click, which
+        // some Wayland compositors can refuse to ever properly present
+        // at all (confirmed on GNOME 50/Mutter — see `RENDER_WATCHDOG`).
+        // Explicit focus doesn't reliably fix that, but it's free.
+        window.set_visible(true);
+        window.set_focus();
         let window_id = window.id();
         let context = softbuffer::Context::new(window.clone()).map_err(|e| anyhow::anyhow!("{e}"))?;
         let surface = softbuffer::Surface::new(&context, window.clone()).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -88,6 +123,9 @@ impl RemoteViewer {
             frame: None,
             draw_rect: (0, 0, 0, 0),
             last_move_sent: Instant::now() - MOVE_THROTTLE,
+            redraw_pending: false,
+            rendered_once: false,
+            opened_at: Instant::now(),
         })
     }
 
@@ -99,16 +137,30 @@ impl RemoteViewer {
         &self.peer_id
     }
 
+    /// True once the window has gone `RENDER_WATCHDOG` without ever
+    /// successfully painting a frame — the caller should treat this as
+    /// a fatal viewer failure and tear the session down rather than
+    /// leave the window open. See `RENDER_WATCHDOG`'s doc comment.
+    pub fn is_stuck(&self) -> bool {
+        !self.rendered_once && self.opened_at.elapsed() > RENDER_WATCHDOG
+    }
+
     /// Decodes one incoming JPEG frame and asks the window to repaint —
     /// the actual blit happens in `redraw`, on the OS's own schedule
-    /// (`RedrawRequested`), not synchronously here.
+    /// (`RedrawRequested`), not synchronously here. Only requests a
+    /// redraw if one isn't already pending (see `redraw_pending`'s doc
+    /// comment) — frames arrive faster than every redraw needs its own
+    /// dedicated request.
     pub fn handle_frame(&mut self, jpeg: &[u8]) {
         match image::load_from_memory(jpeg) {
             Ok(img) => {
                 let rgba = img.to_rgba8();
-                tracing::debug!("handle_frame: decoded {}x{} frame ({} JPEG bytes), requesting redraw", rgba.width(), rgba.height(), jpeg.len());
+                tracing::debug!("handle_frame: decoded {}x{} frame ({} JPEG bytes)", rgba.width(), rgba.height(), jpeg.len());
                 self.frame = Some((rgba.width(), rgba.height(), rgba.into_raw()));
-                self.window.request_redraw();
+                if !self.redraw_pending {
+                    self.redraw_pending = true;
+                    self.window.request_redraw();
+                }
             }
             Err(e) => tracing::debug!("couldn't decode incoming remote-control frame ({} bytes): {e}", jpeg.len()),
         }
@@ -121,6 +173,7 @@ impl RemoteViewer {
     /// window is momentarily zero-sized (e.g. mid-resize) rather than
     /// erroring — `softbuffer` can't resize to zero either way.
     pub fn redraw(&mut self) {
+        self.redraw_pending = false;
         let size = self.window.inner_size();
         let (Some(width), Some(height)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else {
             tracing::debug!("redraw: window reported a zero-sized dimension ({}x{}), skipping", size.width, size.height);
@@ -171,7 +224,9 @@ impl RemoteViewer {
 
         if let Err(e) = buffer.present() {
             tracing::warn!("redraw: softbuffer present failed: {e}");
+            return;
         }
+        self.rendered_once = true;
     }
 
     /// Handles one local window event: mouse/keyboard become

@@ -13,7 +13,7 @@
 ; scaffolding users expect from a background sync tool.
 
 #define MyAppName "Continuity"
-#define MyAppVersion "0.1.5-beta.13"
+#define MyAppVersion "0.1.5-beta.14"
 #define MyAppPublisher "hardope"
 #define MyAppURL "https://github.com/hardope/continuity"
 #define MyAppExeName "continuityd.exe"

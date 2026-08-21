@@ -741,14 +741,30 @@ fn handle_remote_control_sync_event(
         }
         SyncEvent::ScreenFrameReceived { peer_id, frame, .. } => {
             let mut viewer_ref = viewer.borrow_mut();
-            match viewer_ref.as_mut() {
-                Some(v) if v.peer_id() == peer_id => v.handle_frame(frame),
-                Some(v) => tracing::debug!(
-                    "ScreenFrameReceived for peer '{peer_id}' ({} bytes) but the open viewer is for a different peer ('{}') — dropped",
-                    frame.len(),
-                    v.peer_id()
-                ),
-                None => tracing::debug!("ScreenFrameReceived for peer '{peer_id}' ({} bytes) but no viewer window is open — dropped", frame.len()),
+            let stuck = match viewer_ref.as_mut() {
+                Some(v) if v.peer_id() == peer_id => {
+                    v.handle_frame(frame);
+                    v.is_stuck()
+                }
+                Some(v) => {
+                    tracing::debug!(
+                        "ScreenFrameReceived for peer '{peer_id}' ({} bytes) but the open viewer is for a different peer ('{}') — dropped",
+                        frame.len(),
+                        v.peer_id()
+                    );
+                    false
+                }
+                None => {
+                    tracing::debug!("ScreenFrameReceived for peer '{peer_id}' ({} bytes) but no viewer window is open — dropped", frame.len());
+                    false
+                }
+            };
+            if stuck {
+                tracing::warn!("remote-control viewer for '{peer_id}' never rendered a frame — giving up and ending the session");
+                *viewer_ref = None;
+                drop(viewer_ref);
+                let _ = commands.send(EngineCommand::EndRemoteControlSession { peer_crypto_id: peer_id.clone() });
+                notify("Couldn't display the remote screen — ending the session");
             }
         }
         _ => {}
