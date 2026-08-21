@@ -334,21 +334,81 @@ fn handle_sync_event(
     match event {
         SyncEvent::Listening { port } => tracing::info!("listening on port {port}"),
         SyncEvent::PairingRequested { peer, code } => {
-            tracing::debug!("PairingRequested: about to show the confirm dialog for '{}' (code {code})", peer.name);
-            let result = rfd::MessageDialog::new()
-                .set_title("Continuity — Pairing Request")
-                .set_description(format!(
-                    "'{}' wants to pair.\n\nConfirmation code: {code}\n\nDoes this match the code shown on the other device?",
-                    peer.name
-                ))
-                .set_buttons(rfd::MessageButtons::YesNo)
-                .show();
-            tracing::debug!("PairingRequested: dialog returned {result:?}");
-            let accepted = matches!(result, rfd::MessageDialogResult::Yes);
-            let _ = commands.send(EngineCommand::ConfirmPairing {
-                peer_crypto_id: peer.id,
-                accept: accepted,
-            });
+            // A modal `rfd::MessageDialog` is a brand-new top-level GTK
+            // window with no parent, created from a background daemon
+            // rather than in direct response to a user click — GNOME/
+            // Mutter's Wayland focus-stealing prevention can simply
+            // never present a window like that at all. Confirmed for
+            // real on a live GNOME 50/Wayland session: the dialog's own
+            // `.show()` call never returned, leaving the pairing request
+            // stuck forever with no visible prompt. A desktop
+            // notification with actions goes through the OS's own
+            // notification server instead of a raw app window,
+            // sidestepping that restriction — same approach
+            // `notify_file_received` above already uses successfully.
+            // macOS/Windows keep the plain dialog, which testing this
+            // session confirmed works fine there.
+            #[cfg(target_os = "linux")]
+            {
+                tracing::debug!("PairingRequested: showing the confirm notification for '{}' (code {code})", peer.name);
+                let peer_id = peer.id.clone();
+                let commands = commands.clone();
+                match notify_rust::Notification::new()
+                    .summary("Continuity — Pairing Request")
+                    .body(&format!(
+                        "'{}' wants to pair.\n\nConfirmation code: {code}\n\nDoes this match the code shown on the other device?",
+                        peer.name
+                    ))
+                    .action("accept", "Yes, pair")
+                    .action("decline", "No")
+                    // Critical + Never: this needs a real answer, not
+                    // something that silently vanishes after a few
+                    // seconds while the user's still reading the code.
+                    .urgency(notify_rust::Urgency::Critical)
+                    .timeout(notify_rust::Timeout::Never)
+                    .show()
+                {
+                    Ok(handle) => {
+                        std::thread::spawn(move || {
+                            let mut accepted = false;
+                            handle.wait_for_action(|action| {
+                                accepted = action == "accept" || action == "default";
+                            });
+                            tracing::debug!("PairingRequested: notification action resolved, accepted={accepted}");
+                            let _ = commands.send(EngineCommand::ConfirmPairing { peer_crypto_id: peer_id, accept: accepted });
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!("couldn't show the pairing-confirmation notification, falling back to a dialog: {e}");
+                        let result = rfd::MessageDialog::new()
+                            .set_title("Continuity — Pairing Request")
+                            .set_description(format!(
+                                "'{}' wants to pair.\n\nConfirmation code: {code}\n\nDoes this match the code shown on the other device?",
+                                peer.name
+                            ))
+                            .set_buttons(rfd::MessageButtons::YesNo)
+                            .show();
+                        let accepted = matches!(result, rfd::MessageDialogResult::Yes);
+                        let _ = commands.send(EngineCommand::ConfirmPairing { peer_crypto_id: peer_id, accept: accepted });
+                    }
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let result = rfd::MessageDialog::new()
+                    .set_title("Continuity — Pairing Request")
+                    .set_description(format!(
+                        "'{}' wants to pair.\n\nConfirmation code: {code}\n\nDoes this match the code shown on the other device?",
+                        peer.name
+                    ))
+                    .set_buttons(rfd::MessageButtons::YesNo)
+                    .show();
+                let accepted = matches!(result, rfd::MessageDialogResult::Yes);
+                let _ = commands.send(EngineCommand::ConfirmPairing {
+                    peer_crypto_id: peer.id,
+                    accept: accepted,
+                });
+            }
         }
         // Paired/Disconnected/ClipboardReceived are routine — they'd fire
         // constantly on an active mesh and a popup for each one is just
@@ -429,19 +489,59 @@ fn handle_sync_event(
         // frequent to be worth a debug log line on its own.
         SyncEvent::PeerActivity { .. } => {}
         SyncEvent::RemoteControlRequested { peer_id, peer_name, .. } => {
-            // Same shape as the pairing-request dialog above — a fresh,
+            // Same shape as the pairing-request prompt above — a fresh,
             // explicit accept every time, deliberately not a "remember
             // this device" checkbox (see `Message::RemoteControlRequest`'s
-            // doc comment in continuity-proto).
-            let result = rfd::MessageDialog::new()
-                .set_title("Continuity — Remote Control Request")
-                .set_description(format!(
-                    "'{peer_name}' wants to control this device's keyboard, mouse, and screen.\n\nAllow it?"
-                ))
-                .set_buttons(rfd::MessageButtons::YesNo)
-                .show();
-            let accept = matches!(result, rfd::MessageDialogResult::Yes);
-            let _ = commands.send(EngineCommand::RespondToRemoteControlRequest { peer_crypto_id: peer_id, accept });
+            // doc comment in continuity-proto) — and the same Linux/
+            // Wayland dialog-never-presented risk, since this is also
+            // triggered by a network event, not a user click. See the
+            // `PairingRequested` handler's comment for the full
+            // explanation of why Linux gets a notification instead.
+            #[cfg(target_os = "linux")]
+            {
+                let commands = commands.clone();
+                match notify_rust::Notification::new()
+                    .summary("Continuity — Remote Control Request")
+                    .body(&format!("'{peer_name}' wants to control this device's keyboard, mouse, and screen."))
+                    .action("accept", "Allow")
+                    .action("decline", "Deny")
+                    .urgency(notify_rust::Urgency::Critical)
+                    .timeout(notify_rust::Timeout::Never)
+                    .show()
+                {
+                    Ok(handle) => {
+                        std::thread::spawn(move || {
+                            let mut accept = false;
+                            handle.wait_for_action(|action| {
+                                accept = action == "accept" || action == "default";
+                            });
+                            let _ = commands.send(EngineCommand::RespondToRemoteControlRequest { peer_crypto_id: peer_id, accept });
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!("couldn't show the remote-control-request notification, falling back to a dialog: {e}");
+                        let result = rfd::MessageDialog::new()
+                            .set_title("Continuity — Remote Control Request")
+                            .set_description(format!("'{peer_name}' wants to control this device's keyboard, mouse, and screen.\n\nAllow it?"))
+                            .set_buttons(rfd::MessageButtons::YesNo)
+                            .show();
+                        let accept = matches!(result, rfd::MessageDialogResult::Yes);
+                        let _ = commands.send(EngineCommand::RespondToRemoteControlRequest { peer_crypto_id: peer_id, accept });
+                    }
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let result = rfd::MessageDialog::new()
+                    .set_title("Continuity — Remote Control Request")
+                    .set_description(format!(
+                        "'{peer_name}' wants to control this device's keyboard, mouse, and screen.\n\nAllow it?"
+                    ))
+                    .set_buttons(rfd::MessageButtons::YesNo)
+                    .show();
+                let accept = matches!(result, rfd::MessageDialogResult::Yes);
+                let _ = commands.send(EngineCommand::RespondToRemoteControlRequest { peer_crypto_id: peer_id, accept });
+            }
         }
         SyncEvent::RemoteControlDeclined { peer_name, .. } => {
             notify(&format!("'{peer_name}' declined the remote control request"));
