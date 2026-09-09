@@ -150,6 +150,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
 
         maybeRequestNotificationPermission()
+        maybeRequestNearbyWifiDevicesPermission()
         ContextCompat.startForegroundService(this, Intent(this, ContinuityForegroundService::class.java))
 
         setContent {
@@ -177,6 +178,23 @@ class MainActivity : ComponentActivity() {
             PackageManager.PERMISSION_GRANTED
         ) {
             requestNotifications.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
+    private val requestNearbyWifiDevices =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { /* no-op either way */ }
+
+    // NEARBY_WIFI_DEVICES is a runtime ("dangerous") permission as of API 33
+    // — declaring it in the manifest (see AndroidManifest.xml) only makes it
+    // requestable, it doesn't grant it. Without an explicit request here it
+    // stays denied on every Android 13+ device, which is exactly the local
+    // Wi-Fi discovery this permission gates (see docs/protocol.md).
+    private fun maybeRequestNearbyWifiDevicesPermission() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.NEARBY_WIFI_DEVICES) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            requestNearbyWifiDevices.launch(Manifest.permission.NEARBY_WIFI_DEVICES)
         }
     }
 }

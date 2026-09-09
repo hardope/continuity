@@ -145,6 +145,19 @@ impl RemoteViewer {
         !self.rendered_once && self.opened_at.elapsed() > RENDER_WATCHDOG
     }
 
+    /// Whether at least one real frame has been painted yet — the caller
+    /// uses this to decide whether the event loop still needs to keep
+    /// waking itself on a timer so `is_stuck`'s watchdog actually gets a
+    /// chance to run. A session whose screen-stream connection never
+    /// arrives produces no `ScreenFrameReceived` events at all, and
+    /// `ControlFlow::Wait` only wakes the loop on a real OS/user event —
+    /// without an explicit timer poll, `is_stuck` would never be checked
+    /// a second time and a permanently blank window would sit open
+    /// forever instead of the watchdog ever catching it.
+    pub fn is_rendered(&self) -> bool {
+        self.rendered_once
+    }
+
     /// Decodes one incoming JPEG frame and asks the window to repaint —
     /// the actual blit happens in `redraw`, on the OS's own schedule
     /// (`RedrawRequested`), not synchronously here. Only requests a

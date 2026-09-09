@@ -186,6 +186,12 @@ fn main() -> anyhow::Result<()> {
         let _tray_icon = &tray_icon;
         let _target = target;
         *control_flow = ControlFlow::Wait;
+        // Reactive check: catches a viewer that was already open and
+        // idle on the *previous* tick. Doesn't by itself guarantee a
+        // next tick ever happens, though — see the `WaitUntil` set at
+        // the bottom of this closure for that half.
+        #[cfg(feature = "remote-control")]
+        check_viewer_watchdog(&viewer, &commands);
 
         // These match on `&event` (reference) rather than `event` — the
         // `UserEvent` handling below moves `event` by value to hand
@@ -301,6 +307,22 @@ fn main() -> anyhow::Result<()> {
         // the menu is handled by the OS/tray-icon crate) — just drain the
         // channel so it doesn't build up.
         let _ = TrayIconEvent::receiver().try_recv();
+
+        // Evaluated last, after everything above (including a viewer
+        // window possibly just opened this very tick by the `UserEvent`
+        // handling above) — a not-yet-rendered viewer needs this loop to
+        // keep waking itself on a short timer, since a session whose
+        // screen-stream connection never arrives produces neither a real
+        // OS event nor a `UserEvent` to wake `ControlFlow::Wait` on its
+        // own; without this, `check_viewer_watchdog` above would never
+        // get a second chance to run and a permanently blank window
+        // could sit open forever. Cleared back to plain `Wait` once a
+        // frame lands (`is_rendered()` true) so this doesn't needlessly
+        // keep polling for the rest of an otherwise-healthy session.
+        #[cfg(feature = "remote-control")]
+        if viewer.borrow().as_ref().is_some_and(|v| !v.is_rendered()) {
+            *control_flow = ControlFlow::WaitUntil(std::time::Instant::now() + std::time::Duration::from_millis(500));
+        }
     });
 }
 
@@ -741,33 +763,42 @@ fn handle_remote_control_sync_event(
         }
         SyncEvent::ScreenFrameReceived { peer_id, frame, .. } => {
             let mut viewer_ref = viewer.borrow_mut();
-            let stuck = match viewer_ref.as_mut() {
-                Some(v) if v.peer_id() == peer_id => {
-                    v.handle_frame(frame);
-                    v.is_stuck()
-                }
-                Some(v) => {
-                    tracing::debug!(
-                        "ScreenFrameReceived for peer '{peer_id}' ({} bytes) but the open viewer is for a different peer ('{}') — dropped",
-                        frame.len(),
-                        v.peer_id()
-                    );
-                    false
-                }
-                None => {
-                    tracing::debug!("ScreenFrameReceived for peer '{peer_id}' ({} bytes) but no viewer window is open — dropped", frame.len());
-                    false
-                }
-            };
-            if stuck {
-                tracing::warn!("remote-control viewer for '{peer_id}' never rendered a frame — giving up and ending the session");
-                *viewer_ref = None;
-                drop(viewer_ref);
-                let _ = commands.send(EngineCommand::EndRemoteControlSession { peer_crypto_id: peer_id.clone() });
-                notify("Couldn't display the remote screen — ending the session");
+            match viewer_ref.as_mut() {
+                Some(v) if v.peer_id() == peer_id => v.handle_frame(frame),
+                Some(v) => tracing::debug!(
+                    "ScreenFrameReceived for peer '{peer_id}' ({} bytes) but the open viewer is for a different peer ('{}') — dropped",
+                    frame.len(),
+                    v.peer_id()
+                ),
+                None => tracing::debug!("ScreenFrameReceived for peer '{peer_id}' ({} bytes) but no viewer window is open — dropped", frame.len()),
             }
+            drop(viewer_ref);
+            check_viewer_watchdog(viewer, commands);
         }
         _ => {}
+    }
+}
+
+/// Tears the session down if the open viewer window (if any) has gone
+/// `RENDER_WATCHDOG` without painting a single real frame — see
+/// `RemoteViewer::is_stuck`'s doc comment for why that state is treated
+/// as a fatal viewer failure rather than something worth leaving open
+/// indefinitely. Called both right after a frame arrives (the original
+/// path) and on every event-loop tick (see the `WaitUntil` polling next
+/// to `check_viewer_watchdog`'s call sites) so a session that never
+/// receives *any* frame at all still gets caught, not just one that
+/// receives some but fails to render them.
+#[cfg(feature = "remote-control")]
+fn check_viewer_watchdog(
+    viewer: &std::rc::Rc<std::cell::RefCell<Option<remote_viewer::RemoteViewer>>>,
+    commands: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
+) {
+    let stuck_peer_id = viewer.borrow().as_ref().filter(|v| v.is_stuck()).map(|v| v.peer_id().to_string());
+    if let Some(peer_id) = stuck_peer_id {
+        tracing::warn!("remote-control viewer for '{peer_id}' never rendered a frame — giving up and ending the session");
+        *viewer.borrow_mut() = None;
+        let _ = commands.send(EngineCommand::EndRemoteControlSession { peer_crypto_id: peer_id });
+        notify("Couldn't display the remote screen — ending the session");
     }
 }
 

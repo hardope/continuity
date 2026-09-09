@@ -49,7 +49,24 @@ class ContinuityForegroundService : Service() {
         // of time, and Service.onCreate() runs on the main thread, so
         // calling it inline here freezes the whole app (no ANR crash, just
         // a silently frozen UI) until it finishes. Off the main thread instead.
-        serviceScope.launch { startEngine() }
+        serviceScope.launch {
+            try {
+                startEngine()
+            } catch (e: Exception) {
+                // Anything here (Keystore access failing, the trust store
+                // file being unreadable, the mDNS/TLS listener failing to
+                // bind, ...) used to be an uncaught exception on this
+                // coroutine — with no CoroutineExceptionHandler installed,
+                // that propagates to the thread's default handler and
+                // kills the whole process, which looks like "the app
+                // launches and immediately closes" with no indication why.
+                // Surface it as a normal in-app error instead.
+                android.util.Log.e("ContinuityService", "engine startup failed", e)
+                EngineHolder.events.tryEmit(
+                    FfiSyncEvent.Error("Couldn't start Continuity: ${e.message ?: e.javaClass.simpleName}"),
+                )
+            }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
