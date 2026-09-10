@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::task::JoinHandle;
 
@@ -28,6 +28,21 @@ const FILE_ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
 /// a real file, far more than any UI needs to redraw a progress bar at a
 /// rate a human can perceive.
 const PROGRESS_EVENT_BYTES: u64 = 1024 * 1024;
+/// Caps how many read-but-not-yet-written chunks `send_file` is allowed
+/// to get ahead of the writer loop, in units of `CHUNK_SIZE` — 32 * 64KB
+/// = 2MB. Below this, `send_file`'s read loop blocks instead of reading
+/// more of the file. **Real bug fixed here**: `send_file` used to read
+/// the *entire* file into memory up front, then enqueue every chunk into
+/// an unbounded channel with no limit on how far that could outrun the
+/// network — for a 260MB file that meant up to ~2x the file size in
+/// transient memory (the whole buffer, plus a full duplicate queued
+/// ahead of the actual writes), enough to OOM a memory-constrained
+/// device like Android (no `android:largeHeap`, so a few hundred MB of
+/// default headroom). This bounds memory to a small, fixed window
+/// regardless of file size, and doubles as real backpressure: a slow
+/// peer now measurably slows down how fast this side reads the file,
+/// rather than racing ahead of it.
+const SEND_WINDOW_CHUNKS: usize = 32;
 /// Nothing else in this connection's message loop ever sends anything
 /// unprompted except on real activity (clipboard changes, file transfers,
 /// now-playing changes) — a quiet-but-healthy connection can go long
@@ -208,6 +223,15 @@ struct SharedState {
     /// by the writer loop's own `break` on failure, completely
     /// independent of this staleness heuristic.
     file_transfers_in_flight: Mutex<HashMap<String, u32>>,
+    /// One `Semaphore` per outbound transfer currently streaming, holding
+    /// `SEND_WINDOW_CHUNKS` permits — `send_file`'s read loop acquires
+    /// one per chunk (blocking, i.e. pausing both reading *and* sending,
+    /// once the window's full) and the writer loop's `Message::FileChunk`
+    /// handling returns one every time a chunk is actually written. A
+    /// connection dying closes the semaphore (see `handle_connection_inner`'s
+    /// cleanup) so a `send_file` task blocked waiting for room doesn't
+    /// hang forever waiting on a writer that's already gone.
+    file_send_windows: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
     clipboard: Arc<dyn ClipboardBackend>,
     media: Arc<dyn MediaController>,
     remote_control: Arc<dyn RemoteControlHost>,
@@ -602,6 +626,7 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
         pending_pairings: Mutex::new(HashMap::new()),
         pending_file_accepts: Mutex::new(HashMap::new()),
         file_transfers_in_flight: Mutex::new(HashMap::new()),
+        file_send_windows: Mutex::new(HashMap::new()),
         clipboard: config.clipboard,
         media: config.media,
         remote_control: config.remote_control,
@@ -1511,6 +1536,16 @@ async fn handle_connection_inner(
 
             match &msg {
                 Message::FileChunk { transfer_id, data, .. } => {
+                    // Returns the permit `send_file`'s read loop acquired
+                    // for this exact chunk — see `SEND_WINDOW_CHUNKS`'s
+                    // doc comment. Unconditional (not folded into the
+                    // progress-tracking `let else` below it): every
+                    // written `FileChunk` consumed exactly one permit
+                    // regardless of whether this loop happens to still
+                    // have progress-tracking state for its transfer.
+                    if let Some(window) = state.file_send_windows.lock().unwrap().get(transfer_id) {
+                        window.add_permits(1);
+                    }
                     // What actually reflects real wire progress:
                     // `send_file`'s own chunk loop only *enqueues* into
                     // this unbounded channel, which (for a large file)
@@ -1550,6 +1585,7 @@ async fn handle_connection_inner(
                     // covered. See `file_transfers_in_flight`'s doc
                     // comment.
                     state.end_file_transfer(peer_crypto_id);
+                    state.file_send_windows.lock().unwrap().remove(transfer_id);
                     sending_totals.remove(transfer_id);
                     sending_progress.remove(transfer_id);
                     let file_name = sending_names.remove(transfer_id).unwrap_or_else(|| transfer_id.clone());
@@ -1582,11 +1618,26 @@ async fn handle_connection_inner(
         });
         let _ = tokio::fs::remove_file(&rf.path).await;
     }
-    // Backstop for both directions at once — any receive just cleaned up
-    // above, plus the one send-side gap precise accounting can't cover
-    // (a connection dying mid-write, after every chunk was enqueued but
-    // before the writer ever reached `FileComplete`). See
-    // `clear_file_transfers`'s doc comment.
+    // Same idea, for the writer's own per-transfer bookkeeping: any
+    // transfer_id still here never reached a successfully-written
+    // `FileComplete`, so nothing else has reported or cleaned it up yet.
+    // Closing the send window also unblocks a `send_file` task that
+    // might still be blocked in `window.acquire()` waiting for room a
+    // now-dead writer will never make — without this it would hang
+    // forever instead of failing the transfer.
+    for transfer_id in sending_names.into_keys() {
+        if let Some(window) = state.file_send_windows.lock().unwrap().remove(&transfer_id) {
+            window.close();
+        }
+        state.emit(SyncEvent::FileTransferFailed {
+            transfer_id,
+            reason: "connection closed mid-transfer".into(),
+        });
+    }
+    // Backstop for `file_transfers_in_flight` specifically (a separate
+    // counter from the cleanup above) covering both directions at once
+    // — see `clear_file_transfers`'s doc comment for why a wholesale
+    // removal is safe here.
     state.clear_file_transfers(&peer.id);
 
     state.emit(SyncEvent::Disconnected {
@@ -1769,8 +1820,14 @@ async fn send_file(state: &Arc<SharedState>, peer_crypto_id: &str, path: PathBuf
         .unwrap_or("file")
         .to_string();
 
-    let data = match tokio::fs::read(&path).await {
-        Ok(d) => d,
+    // Neither the size nor the content is read into memory here — see
+    // `SEND_WINDOW_CHUNKS`'s doc comment for why that used to be a real
+    // bug (an OOM risk on memory-constrained devices for a large file).
+    // `File::open` happens up front, same as before: if this device
+    // can't even read the file, better to find out before bothering the
+    // peer with an offer for it at all.
+    let size_bytes = match tokio::fs::metadata(&path).await {
+        Ok(m) => m.len(),
         Err(e) => {
             state.emit(SyncEvent::FileTransferFailed {
                 transfer_id,
@@ -1779,28 +1836,12 @@ async fn send_file(state: &Arc<SharedState>, peer_crypto_id: &str, path: PathBuf
             return;
         }
     };
-    let size_bytes = data.len() as u64;
-    // SHA-256 over the whole file, synchronously, used to run directly on
-    // this tokio worker thread — for a large file that's real, CPU-bound
-    // work blocking that thread from polling anything else scheduled on
-    // it for as long as the hash takes (a debug build's unoptimized SHA-256
-    // is dramatically slower than a release build's; this showed up as a
-    // ~15s stall before the very first message of a 150MB transfer even
-    // reached the wire, when testing the keepalive fix below). `spawn_
-    // blocking` moves it to tokio's dedicated blocking-task thread pool
-    // instead, matching every other CPU/host-bound call in this codebase
-    // (the clipboard and now-playing watchers, for the same reason).
-    let (data, hash) = match tokio::task::spawn_blocking(move || {
-        let hash = content_hash(&data);
-        (data, hash)
-    })
-    .await
-    {
-        Ok(result) => result,
+    let mut file = match tokio::fs::File::open(&path).await {
+        Ok(f) => f,
         Err(e) => {
             state.emit(SyncEvent::FileTransferFailed {
                 transfer_id,
-                reason: format!("hashing task panicked: {e}"),
+                reason: format!("couldn't read '{}': {e}", path.display()),
             });
             return;
         }
@@ -1876,33 +1917,76 @@ async fn send_file(state: &Arc<SharedState>, peer_crypto_id: &str, path: PathBuf
         size_bytes,
     });
 
-    for (seq, chunk) in data.chunks(CHUNK_SIZE).enumerate() {
+    let window = Arc::new(tokio::sync::Semaphore::new(SEND_WINDOW_CHUNKS));
+    state.file_send_windows.lock().unwrap().insert(transfer_id.clone(), window.clone());
+
+    // Every abnormal exit below (a read error, the send window closing
+    // because the connection died, a chunk/`FileComplete` failing to
+    // even enqueue) needs the exact same cleanup — unlike the success
+    // path, which leaves ending `file_transfers_in_flight` and emitting
+    // `FileSent` to the writer loop (see below), a failure here is
+    // final and this function is the only thing that will ever report
+    // or clean it up.
+    macro_rules! fail_transfer {
+        ($reason:expr) => {{
+            state.end_file_transfer(peer_crypto_id);
+            state.file_send_windows.lock().unwrap().remove(&transfer_id);
+            state.emit(SyncEvent::FileTransferFailed { transfer_id: transfer_id.clone(), reason: $reason });
+            return;
+        }};
+    }
+
+    // Streams the file in `CHUNK_SIZE` windows straight from disk — never
+    // more than one chunk in memory on top of whatever's currently
+    // in-flight in `window` — and hashes incrementally alongside sending,
+    // the same pattern the receiving side already uses, rather than
+    // hashing the whole file up front the way this used to.
+    let mut hasher = IncrementalHash::new();
+    let mut seq: u64 = 0;
+    loop {
+        let mut buf = vec![0u8; CHUNK_SIZE];
+        let mut filled = 0;
+        while filled < buf.len() {
+            match file.read(&mut buf[filled..]).await {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) => fail_transfer!(format!("error reading '{}': {e}", path.display())),
+            }
+        }
+        if filled == 0 {
+            break;
+        }
+        buf.truncate(filled);
+
+        // Blocks here once `SEND_WINDOW_CHUNKS` chunks are read but not
+        // yet actually written — real backpressure: reading more of the
+        // file pauses along with sending, instead of racing ahead of a
+        // slow peer. `Err` means the writer loop closed the window
+        // because the connection died (see `handle_connection_inner`'s
+        // cleanup), not that this should hang forever waiting on it.
+        let Ok(permit) = window.acquire().await else {
+            fail_transfer!("connection closed mid-transfer".to_string());
+        };
+        permit.forget();
+
+        hasher.update(&buf);
         if tx
-            .send(Message::FileChunk {
-                transfer_id: transfer_id.clone(),
-                seq: seq as u64,
-                data: chunk.to_vec(),
-            })
+            .send(Message::FileChunk { transfer_id: transfer_id.clone(), seq, data: buf })
             .is_err()
         {
             // The writer side is already gone — nothing will ever write
-            // (or fail to write) the `FileComplete` this was waiting on,
-            // so this is the one send-side path that *does* need to end
-            // the marker itself rather than leaving it to the writer loop.
-            state.end_file_transfer(peer_crypto_id);
-            state.emit(SyncEvent::FileTransferFailed {
-                transfer_id,
-                reason: "connection closed mid-transfer".into(),
-            });
-            return;
+            // (or fail to write) the `FileComplete` this would otherwise
+            // wait on, so this is the one send-side path that does need
+            // to fail the transfer itself rather than leaving it to the
+            // writer loop.
+            fail_transfer!("connection closed mid-transfer".to_string());
         }
+        seq += 1;
     }
 
+    let hash = hasher.finalize_hex();
     if tx
-        .send(Message::FileComplete {
-            transfer_id: transfer_id.clone(),
-            content_hash: hash,
-        })
+        .send(Message::FileComplete { transfer_id: transfer_id.clone(), content_hash: hash })
         .is_err()
     {
         // Same "writer's gone, nothing will ever balance this" case as
@@ -1910,15 +1994,10 @@ async fn send_file(state: &Arc<SharedState>, peer_crypto_id: &str, path: PathBuf
         // later, after the very last chunk happened to get enqueued
         // successfully but the connection died before `FileComplete`
         // could follow it.
-        state.end_file_transfer(peer_crypto_id);
-        state.emit(SyncEvent::FileTransferFailed {
-            transfer_id,
-            reason: "connection closed mid-transfer".into(),
-        });
-        // No trailing `return` — falling off the end of this `if` block
-        // is also the end of the function, so it's redundant.
+        fail_transfer!("connection closed mid-transfer".to_string());
     }
-    // `FileSent` is *not* emitted here — `tx.send` above only enqueues
+    // `FileSent`, `end_file_transfer`, and removing this transfer's send
+    // window are *not* done here — `tx.send` above only enqueues
     // `FileComplete`, which (behind a large backlog of still-unwritten
     // `FileChunk`s in this unbounded channel) can return long before the
     // writer loop actually reaches it. Emitting "sent" that early was a
@@ -1927,8 +2006,8 @@ async fn send_file(state: &Arc<SharedState>, peer_crypto_id: &str, path: PathBuf
     // progress row on `FileSent` would see it reappear a moment later
     // when the next (now orphaned) progress event showed up with nothing
     // left to ever remove it again. The writer loop's own `Message::
-    // FileComplete` handling below emits `FileSent` once it's actually
-    // been written — the same fix already applied to `end_file_transfer`.
+    // FileComplete` handling below does all three once it's actually
+    // been written.
 }
 
 async fn apply_remote_clipboard(state: &Arc<SharedState>, hash: String, data: Vec<u8>) {
