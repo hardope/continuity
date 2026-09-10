@@ -22,6 +22,13 @@ pub struct TrustedDevice {
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct TrustFile {
     devices: HashMap<String, TrustedDevice>,
+    /// Peers explicitly allowed, at least once, to remote-control this
+    /// device — see `TrustStore::allow_remote_control`'s doc comment.
+    /// `#[serde(default)]` so a trust file written before this field
+    /// existed just deserializes as "nobody's allowed yet" instead of
+    /// failing to load.
+    #[serde(default)]
+    remote_control_allowed: std::collections::HashSet<String>,
 }
 
 /// The set of paired devices this one accepts connections from — the whole
@@ -78,6 +85,7 @@ impl TrustStore {
 
     pub fn revoke(&mut self, device_id: &str) -> Result<(), TrustError> {
         self.file.devices.remove(device_id);
+        self.file.remote_control_allowed.remove(device_id);
         self.save()
     }
 
@@ -85,6 +93,32 @@ impl TrustStore {
     /// trusted peer will need to be paired again from scratch.
     pub fn clear(&mut self) -> Result<(), TrustError> {
         self.file.devices.clear();
+        self.file.remote_control_allowed.clear();
+        self.save()
+    }
+
+    /// Whether this peer has already been explicitly allowed, at least
+    /// once, to remote-control this device — see `allow_remote_control`'s
+    /// doc comment for the flow this supports. `false` for a peer that's
+    /// never asked, was denied last time, or isn't paired at all.
+    pub fn is_remote_control_allowed(&self, device_id: &str) -> bool {
+        self.file.remote_control_allowed.contains(device_id)
+    }
+
+    /// Remembers that this peer was explicitly allowed to remote-control
+    /// this device, so a future request from it skips the confirmation
+    /// prompt and is accepted automatically — the same "ask once, then
+    /// trust" shape reconnecting to an already-paired device already has.
+    /// Deliberately opt-in: only ever called from a real "Allow" click
+    /// (see `EngineCommand::RespondToRemoteControlRequest`'s handling in
+    /// `engine.rs`), never implied by pairing trust alone or by a request
+    /// merely arriving — remote control grants full keyboard/mouse/screen
+    /// access, a materially bigger risk than clipboard/file sync, so it
+    /// gets its own, narrower trust flag rather than riding along with
+    /// `trust()`. `revoke`/`clear` above both also drop this — forgetting
+    /// a device forgets everything about it, including this.
+    pub fn allow_remote_control(&mut self, device_id: &str) -> Result<(), TrustError> {
+        self.file.remote_control_allowed.insert(device_id.to_string());
         self.save()
     }
 
@@ -139,6 +173,41 @@ mod tests {
 
         store.revoke("abc123").unwrap();
         assert!(!store.is_trusted("abc123"));
+    }
+
+    #[test]
+    fn remote_control_trust_persists_across_reload_and_is_scoped_per_peer() {
+        let (mut store, dir) = temp_store();
+        let path = store_path(&store);
+        store
+            .trust(TrustedDevice { id: "abc123".into(), name: "Test MacBook".into(), paired_at_unix: 1 })
+            .unwrap();
+        store
+            .trust(TrustedDevice { id: "def456".into(), name: "Test iMac".into(), paired_at_unix: 2 })
+            .unwrap();
+        assert!(!store.is_remote_control_allowed("abc123"), "not allowed until explicitly granted");
+
+        store.allow_remote_control("abc123").unwrap();
+        assert!(store.is_remote_control_allowed("abc123"));
+        assert!(!store.is_remote_control_allowed("def456"), "granting one peer shouldn't grant another");
+
+        let reloaded = TrustStore::load(path).unwrap();
+        assert!(reloaded.is_remote_control_allowed("abc123"));
+        assert!(!reloaded.is_remote_control_allowed("def456"));
+        drop(dir);
+    }
+
+    #[test]
+    fn revoking_a_device_also_clears_its_remote_control_trust() {
+        let (mut store, _dir) = temp_store();
+        store
+            .trust(TrustedDevice { id: "abc123".into(), name: "Test MacBook".into(), paired_at_unix: 1 })
+            .unwrap();
+        store.allow_remote_control("abc123").unwrap();
+        assert!(store.is_remote_control_allowed("abc123"));
+
+        store.revoke("abc123").unwrap();
+        assert!(!store.is_remote_control_allowed("abc123"), "forgetting a device should forget its remote-control trust too");
     }
 
     fn store_path(store: &TrustStore) -> PathBuf {

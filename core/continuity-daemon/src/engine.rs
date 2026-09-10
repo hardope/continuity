@@ -340,6 +340,109 @@ async fn handle_screen_stream_connection(mut conn: Connection, state: Arc<Shared
     result
 }
 
+/// Actually accepts a remote-control request and starts serving it:
+/// enforces the one-active-`Controlled`-session-at-a-time rule, starts
+/// capture, resolves the peer's dial-back address, and — if all of that
+/// succeeds — tells the peer, records the session, and spawns the
+/// screen-stream push task; each failure point declines with a specific
+/// reason instead. Shared by two call sites with the exact same accept
+/// logic: a human clicking "Allow" (`EngineCommand::RespondToRemoteControlRequest`
+/// above) and a repeat request from a peer already remembered via
+/// `TrustStore::is_remote_control_allowed` (the accept loop's handling of
+/// `Message::RemoteControlRequest`) — the only difference between them is
+/// *whether* a prompt was shown first, never what accepting itself does.
+fn accept_remote_control_session(state: &Arc<SharedState>, peer_crypto_id: String, session_id: String) {
+    let Some(tx) = state.peer_senders.lock().unwrap().get(&peer_crypto_id).cloned() else {
+        return;
+    };
+
+    // This device's keyboard/mouse/screen are one shared physical
+    // resource — two different peers controlling it at once would mean
+    // both fighting over the same cursor, and `RemoteControlHost`'s
+    // capture start/stop isn't session-scoped, just a single on/off
+    // switch. Accepting a second Controlled-role session while one's
+    // already active would silently corrupt that shared state (the
+    // first session's eventual `stop_capture` would kill the second
+    // one's stream too) — declined outright instead.
+    let already_controlled =
+        state.remote_control_sessions.lock().unwrap().values().any(|s| s.role == RemoteControlRole::Controlled);
+    if already_controlled {
+        let _ = tx.send(Message::RemoteControlResponse { session_id: session_id.clone(), accepted: false });
+        // This decline previously left both sides guessing why "accept"
+        // didn't work — the requester just saw a plain decline, and this
+        // device showed nothing at all. A stuck/stale session entry that
+        // never got cleaned up would silently decline *every* future
+        // request the exact same way, indistinguishable from an outright
+        // bug — this at least makes that state visible instead of a
+        // mysterious permanent "no" regardless of what's clicked.
+        state.emit(SyncEvent::RemoteControlSessionEnded {
+            peer_id: peer_crypto_id.clone(),
+            peer_name: state.trust_store.lock().unwrap().get(&peer_crypto_id).map(|d| d.name.clone()).unwrap_or_else(|| peer_crypto_id.clone()),
+            session_id,
+            reason: Some("already controlling another device".to_string()),
+        });
+        return;
+    }
+
+    // Accepting starts capture *before* telling the peer it succeeded —
+    // if it fails (no Screen Recording permission, say), the peer hears
+    // about a session that never really started instead of one that
+    // silently never sends any frames.
+    let Some(frames) = state.remote_control.start_capture() else {
+        let _ = tx.send(Message::RemoteControlResponse { session_id: session_id.clone(), accepted: false });
+        state.emit(SyncEvent::RemoteControlSessionEnded {
+            peer_id: peer_crypto_id.clone(),
+            peer_name: state.trust_store.lock().unwrap().get(&peer_crypto_id).map(|d| d.name.clone()).unwrap_or_else(|| peer_crypto_id.clone()),
+            session_id,
+            reason: Some("couldn't start screen capture".to_string()),
+        });
+        return;
+    };
+
+    let Some(addr) = state.known_addresses.lock().unwrap().get(&peer_crypto_id).copied() else {
+        let _ = tx.send(Message::RemoteControlResponse { session_id: session_id.clone(), accepted: false });
+        state.remote_control.stop_capture();
+        // Same silent-failure shape as the `already_controlled` decline
+        // above, and just as real: `known_addresses` only ever gets
+        // populated by mDNS discovery, not by the mesh connection this
+        // very request arrived over (deliberately — an inbound
+        // connection's remote port is the peer's *ephemeral* one, not
+        // one that would ever accept a dial-back; see the accept loop's
+        // own comment for the bug that taught us that). If mDNS never
+        // delivered this peer's real address here — most plausibly a
+        // firewall dropping inbound multicast on this machine —
+        // accepting would only ever end up right back here with nothing
+        // to actually dial, so this declines instead of accepting into a
+        // session that can never send a frame.
+        state.emit(SyncEvent::RemoteControlSessionEnded {
+            peer_id: peer_crypto_id.clone(),
+            peer_name: state.trust_store.lock().unwrap().get(&peer_crypto_id).map(|d| d.name.clone()).unwrap_or_else(|| peer_crypto_id.clone()),
+            session_id,
+            reason: Some("couldn't find a network address to reach this device back on".to_string()),
+        });
+        return;
+    };
+
+    state.remote_control_sessions.lock().unwrap().insert(
+        peer_crypto_id.clone(),
+        RemoteControlSession { session_id: session_id.clone(), role: RemoteControlRole::Controlled, active: true },
+    );
+    let _ = tx.send(Message::RemoteControlResponse { session_id: session_id.clone(), accepted: true });
+    state.emit(SyncEvent::RemoteControlSessionStarted {
+        peer_id: peer_crypto_id.clone(),
+        peer_name: state.trust_store.lock().unwrap().get(&peer_crypto_id).map(|d| d.name.clone()).unwrap_or_else(|| peer_crypto_id.clone()),
+        session_id: session_id.clone(),
+        role: RemoteControlRole::Controlled,
+    });
+
+    let push_state = state.clone();
+    let push_peer_id = peer_crypto_id.clone();
+    let join = tokio::spawn(async move {
+        push_screen_stream(push_state, push_peer_id, session_id, addr, frames).await;
+    });
+    state.remote_control_stream_handles.lock().unwrap().insert(peer_crypto_id, join.abort_handle());
+}
+
 /// The controlled side's half of the screen stream: dials a fresh
 /// connection to the controlling peer, identifies it with
 /// `ScreenStreamHandshake`, then pushes every frame `start_capture`
@@ -924,132 +1027,17 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                             continue;
                         }
 
-                        // This device's keyboard/mouse/screen are one
-                        // shared physical resource — two different peers
-                        // controlling it at once would mean both fighting
-                        // over the same cursor, and `RemoteControlHost`'s
-                        // capture start/stop isn't session-scoped, just a
-                        // single on/off switch. Accepting a second
-                        // Controlled-role session while one's already
-                        // active would silently corrupt that shared
-                        // state (the first session's eventual
-                        // `stop_capture` would kill the second one's
-                        // stream too) — declined outright instead.
-                        let already_controlled = state
-                            .remote_control_sessions
-                            .lock()
-                            .unwrap()
-                            .values()
-                            .any(|s| s.role == RemoteControlRole::Controlled);
-                        if already_controlled {
-                            let _ = tx.send(Message::RemoteControlResponse { session_id: session_id.clone(), accepted: false });
-                            // This decline previously left both sides
-                            // guessing why "accept" didn't work — the
-                            // requester just saw a plain decline, and this
-                            // device showed nothing at all. A stuck/stale
-                            // session entry that never got cleaned up
-                            // would silently decline *every* future
-                            // request the exact same way, indistinguishable
-                            // from an outright bug — this at least makes
-                            // that state visible instead of a mysterious
-                            // permanent "no" regardless of what's clicked.
-                            state.emit(SyncEvent::RemoteControlSessionEnded {
-                                peer_id: peer_crypto_id.clone(),
-                                peer_name: state
-                                    .trust_store
-                                    .lock()
-                                    .unwrap()
-                                    .get(&peer_crypto_id)
-                                    .map(|d| d.name.clone())
-                                    .unwrap_or_else(|| peer_crypto_id.clone()),
-                                session_id,
-                                reason: Some("already controlling another device".to_string()),
-                            });
-                            continue;
+                        // A human just said yes to this specific peer —
+                        // remember it so a *future* request from the same
+                        // peer skips this prompt entirely (see
+                        // `accept_remote_control_session`'s call site in
+                        // the accept loop below, and
+                        // `TrustStore::allow_remote_control`'s doc comment
+                        // for the security tradeoff this accepts).
+                        if let Err(e) = state.trust_store.lock().unwrap().allow_remote_control(&peer_crypto_id) {
+                            tracing::warn!("couldn't persist remote-control trust for '{peer_crypto_id}': {e}");
                         }
-
-                        // Accepting starts capture *before* telling the
-                        // peer it succeeded — if it fails (no Screen
-                        // Recording permission, say), the peer hears
-                        // about a session that never really started
-                        // instead of one that silently never sends any
-                        // frames.
-                        let Some(frames) = state.remote_control.start_capture() else {
-                            let _ = tx.send(Message::RemoteControlResponse { session_id: session_id.clone(), accepted: false });
-                            state.emit(SyncEvent::RemoteControlSessionEnded {
-                                peer_id: peer_crypto_id.clone(),
-                                peer_name: state
-                                    .trust_store
-                                    .lock()
-                                    .unwrap()
-                                    .get(&peer_crypto_id)
-                                    .map(|d| d.name.clone())
-                                    .unwrap_or_else(|| peer_crypto_id.clone()),
-                                session_id,
-                                reason: Some("couldn't start screen capture".to_string()),
-                            });
-                            continue;
-                        };
-
-                        let Some(addr) = state.known_addresses.lock().unwrap().get(&peer_crypto_id).copied() else {
-                            let _ = tx.send(Message::RemoteControlResponse { session_id: session_id.clone(), accepted: false });
-                            state.remote_control.stop_capture();
-                            // Same silent-failure shape as the
-                            // `already_controlled` decline above, and
-                            // just as real: `known_addresses` only ever
-                            // gets populated by mDNS discovery, not by
-                            // the mesh connection this very request
-                            // arrived over (deliberately — an inbound
-                            // connection's remote port is the peer's
-                            // *ephemeral* one, not one that would ever
-                            // accept a dial-back; see the accept loop's
-                            // own comment for the bug that taught us
-                            // that). If mDNS never delivered this peer's
-                            // real address here — most plausibly a
-                            // firewall dropping inbound multicast on this
-                            // machine — accepting would only ever end up
-                            // right back here with nothing to actually
-                            // dial, so this declines instead of accepting
-                            // into a session that can never send a frame.
-                            state.emit(SyncEvent::RemoteControlSessionEnded {
-                                peer_id: peer_crypto_id.clone(),
-                                peer_name: state
-                                    .trust_store
-                                    .lock()
-                                    .unwrap()
-                                    .get(&peer_crypto_id)
-                                    .map(|d| d.name.clone())
-                                    .unwrap_or_else(|| peer_crypto_id.clone()),
-                                session_id,
-                                reason: Some("couldn't find a network address to reach this device back on".to_string()),
-                            });
-                            continue;
-                        };
-
-                        state.remote_control_sessions.lock().unwrap().insert(
-                            peer_crypto_id.clone(),
-                            RemoteControlSession { session_id: session_id.clone(), role: RemoteControlRole::Controlled, active: true },
-                        );
-                        let _ = tx.send(Message::RemoteControlResponse { session_id: session_id.clone(), accepted: true });
-                        state.emit(SyncEvent::RemoteControlSessionStarted {
-                            peer_id: peer_crypto_id.clone(),
-                            peer_name: state
-                                .trust_store
-                                .lock()
-                                .unwrap()
-                                .get(&peer_crypto_id)
-                                .map(|d| d.name.clone())
-                                .unwrap_or_else(|| peer_crypto_id.clone()),
-                            session_id: session_id.clone(),
-                            role: RemoteControlRole::Controlled,
-                        });
-
-                        let push_state = state.clone();
-                        let push_peer_id = peer_crypto_id.clone();
-                        let join = tokio::spawn(async move {
-                            push_screen_stream(push_state, push_peer_id, session_id, addr, frames).await;
-                        });
-                        state.remote_control_stream_handles.lock().unwrap().insert(peer_crypto_id, join.abort_handle());
+                        accept_remote_control_session(&state, peer_crypto_id, session_id);
                     }
                     EngineCommand::SendInputEvent { peer_crypto_id, event } => {
                         let valid_controlling_session = state
@@ -1335,6 +1323,16 @@ async fn handle_connection_inner(
                         if let Some(tx) = state.peer_senders.lock().unwrap().get(&peer.id) {
                             let _ = tx.send(Message::RemoteControlResponse { session_id, accepted: false });
                         }
+                        continue;
+                    }
+                    // This exact peer already got an explicit "Allow"
+                    // from a human in a past session (see
+                    // `TrustStore::allow_remote_control`) — skip the
+                    // prompt and accept straight away, the same way a
+                    // reconnect from an already-paired device skips
+                    // re-pairing instead of asking again every time.
+                    if state.trust_store.lock().unwrap().is_remote_control_allowed(&peer.id) {
+                        accept_remote_control_session(state, peer.id.clone(), session_id);
                         continue;
                     }
                     state.pending_remote_control_requests.lock().unwrap().insert(peer.id.clone(), session_id.clone());

@@ -153,8 +153,16 @@ fn main() -> anyhow::Result<()> {
     menu.append(&refresh_item)?;
     menu.append(&send_submenu)?;
     menu.append(&forget_submenu)?;
-    #[cfg(feature = "remote-control")]
-    menu.append(&remote_control_submenu)?;
+    // `remote_control_submenu` is built and kept up to date below like
+    // any other submenu, just deliberately never appended to the visible
+    // menu here — real testing (mac controlling mac) found the
+    // *requesting* device's tray app freezing solid once the peer
+    // accepted, somewhere in the viewer-window/event-loop path. Rather
+    // than ship a button that can lock up the whole app, the entry point
+    // is hidden while that gets tracked down; everything behind it (the
+    // engine session logic, the viewer window, the stuck-window
+    // watchdog) is untouched and ready to come back the moment this
+    // `menu.append` line is restored.
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&pause_item)?;
     menu.append(&reset_item)?;
