@@ -282,6 +282,10 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Needed for CHANGELOG.md below — this job otherwise only downloads
+      # artifacts, no source checkout by default.
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -295,9 +299,34 @@ jobs:
           # executable-bit step needed here anymore.
           merge-multiple: true
 
+      # Pulls this exact version's section out of CHANGELOG.md (between
+      # its `## [x.y.z]` heading and the next one) so the release gets
+      # real, human-written notes instead of just an auto-generated
+      # commit list. Degrades gracefully — an empty file here just means
+      # `generate_release_notes` below is the only source, not a failed
+      # release — for a tag cut before CHANGELOG.md has a matching entry.
+      - name: Extract this release's changelog section
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          awk -v ver="$VERSION" '
+            /^## \[/ {
+              if (found) exit
+              if (index($0, "[" ver "]") > 0) { found = 1; next }
+              next
+            }
+            found { print }
+          ' CHANGELOG.md > release_notes.md
+          if [ ! -s release_notes.md ]; then
+            echo "::warning::No CHANGELOG.md section found for $VERSION — release will use auto-generated notes only."
+          fi
+
       - uses: softprops/action-gh-release@v2
         with:
           files: artifacts/*
+          body_path: release_notes.md
+          # GitHub appends its own auto-generated commit/PR summary after
+          # `body_path`'s content rather than replacing it — curated notes
+          # up top, full commit list below for anyone who wants it.
           generate_release_notes: true
           # Standard semver pre-release convention: a tag like
           # `v0.1.5-beta.1` gets flagged as a GitHub pre-release (shown
