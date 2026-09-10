@@ -460,6 +460,9 @@ fn handle_sync_event(
         SyncEvent::FileReceiving { from_name, file_name, .. } => {
             notify(&format!("Receiving '{file_name}' from '{from_name}'..."));
         }
+        SyncEvent::FileSending { to_name, file_name, .. } => {
+            notify(&format!("Sending '{file_name}' to '{to_name}'..."));
+        }
         // No persistent progress-bar surface in the tray (just a menu and
         // one-shot notifications) — a notification per throttled tick
         // would just be noise on top of the start/end ones already shown

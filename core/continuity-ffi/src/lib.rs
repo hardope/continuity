@@ -159,6 +159,7 @@ pub enum FfiSyncEvent {
     ClipboardReceived { from_name: String },
     ClipboardBroadcast { peer_count: u32 },
     FileReceiving { transfer_id: String, from_name: String, file_name: String, size_bytes: u64 },
+    FileSending { transfer_id: String, to_name: String, file_name: String, size_bytes: u64 },
     FileTransferProgress { transfer_id: String, bytes_transferred: u64, total_bytes: u64, direction: FfiFileTransferDirection },
     FileReceived { transfer_id: String, file_name: String, path: String },
     FileSent { transfer_id: String, file_name: String, to_name: String },
@@ -265,6 +266,9 @@ impl From<continuity_daemon::SyncEvent> for FfiSyncEvent {
             E::ClipboardBroadcast { peer_count } => FfiSyncEvent::ClipboardBroadcast { peer_count: peer_count as u32 },
             E::FileReceiving { transfer_id, from_name, file_name, size_bytes } => {
                 FfiSyncEvent::FileReceiving { transfer_id, from_name, file_name, size_bytes }
+            }
+            E::FileSending { transfer_id, to_name, file_name, size_bytes } => {
+                FfiSyncEvent::FileSending { transfer_id, to_name, file_name, size_bytes }
             }
             E::FileTransferProgress { transfer_id, bytes_transferred, total_bytes, direction } => {
                 FfiSyncEvent::FileTransferProgress { transfer_id, bytes_transferred, total_bytes, direction: direction.into() }

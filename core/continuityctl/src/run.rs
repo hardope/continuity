@@ -92,6 +92,9 @@ fn handle_event(event: SyncEvent, cli_state: &CliState) {
         SyncEvent::FileReceiving { from_name, file_name, size_bytes, .. } => {
             println!("receiving '{file_name}' ({size_bytes} bytes) from '{from_name}'...");
         }
+        SyncEvent::FileSending { to_name, file_name, size_bytes, .. } => {
+            println!("sending '{file_name}' ({size_bytes} bytes) to '{to_name}'...");
+        }
         SyncEvent::FileTransferProgress { bytes_transferred, total_bytes, direction, .. } => {
             let verb = match direction {
                 continuity_daemon::FileTransferDirection::Sending => "sent",

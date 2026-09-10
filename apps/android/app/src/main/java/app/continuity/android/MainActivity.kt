@@ -346,7 +346,19 @@ private fun ContinuityScreen(onFilePickerRequested: ((Uri) -> Unit) -> Unit) {
                         totalBytes = event.sizeBytes.toLong(),
                     )
                 }
+                is FfiSyncEvent.FileSending -> {
+                    transfers[event.transferId] = TransferProgress(
+                        label = "Sending '${event.fileName}' to '${event.toName}'",
+                        bytesTransferred = 0L,
+                        totalBytes = event.sizeBytes.toLong(),
+                    )
+                }
                 is FfiSyncEvent.FileTransferProgress -> {
+                    // `FileSending`/`FileReceiving` always arrives before
+                    // the first progress event for the same transfer, so
+                    // there's already a labeled row here in practice —
+                    // this fallback only matters if a progress event
+                    // somehow won the race against that first event.
                     val existingLabel = transfers[event.transferId]?.label
                         ?: if (event.direction == uniffi.continuity_ffi.FfiFileTransferDirection.SENDING) "Sending file..." else "Receiving file..."
                     transfers[event.transferId] = TransferProgress(
@@ -773,16 +785,19 @@ private fun TransfersCard(transfers: Map<String, TransferProgress>) {
                 ) {
                     Text(transfer.label, style = MaterialTheme.typography.titleMedium)
                     // `totalBytes` is only ever 0 in the brief instant
-                    // before the very first progress update arrives for
-                    // an outbound transfer — an indeterminate bar reads
-                    // as "working on it" rather than a division by zero.
+                    // before `FileSending`/`FileReceiving` (which always
+                    // carries the real size) has been processed for a
+                    // brand new transfer — an indeterminate bar reads as
+                    // "working on it" rather than a division by zero.
                     if (transfer.totalBytes > 0) {
+                        val fraction = (transfer.bytesTransferred.toFloat() / transfer.totalBytes.toFloat()).coerceIn(0f, 1f)
                         LinearProgressIndicator(
-                            progress = { (transfer.bytesTransferred.toFloat() / transfer.totalBytes.toFloat()).coerceIn(0f, 1f) },
+                            progress = { fraction },
                             modifier = Modifier.fillMaxWidth(),
                         )
                         Text(
-                            "${formatBytes(transfer.bytesTransferred)} / ${formatBytes(transfer.totalBytes)}",
+                            "${formatBytes(transfer.bytesTransferred)} / ${formatBytes(transfer.totalBytes)} " +
+                                "(${(fraction * 100).toInt()}%)",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )

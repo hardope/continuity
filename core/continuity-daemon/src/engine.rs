@@ -1492,6 +1492,7 @@ async fn handle_connection_inner(
     // else here has it) and bytes actually written so far.
     let mut sending_totals: HashMap<String, u64> = HashMap::new();
     let mut sending_progress: HashMap<String, u64> = HashMap::new();
+    let mut sending_names: HashMap<String, String> = HashMap::new();
 
     let writer = async {
         while let Some(msg) = rx.recv().await {
@@ -1499,8 +1500,9 @@ async fn handle_connection_inner(
             // afterward — inspecting it post-write (not pre-) matters
             // here: everything below reacts to what was *actually*
             // written, not what was merely about to be attempted.
-            if let Message::FileOffer { transfer_id, size_bytes, .. } = &msg {
+            if let Message::FileOffer { transfer_id, size_bytes, file_name, .. } = &msg {
                 sending_totals.insert(transfer_id.clone(), *size_bytes);
+                sending_names.insert(transfer_id.clone(), file_name.clone());
             }
             if write_message(&mut write_half, &msg).await.is_err() {
                 break;
@@ -1550,6 +1552,11 @@ async fn handle_connection_inner(
                     state.end_file_transfer(peer_crypto_id);
                     sending_totals.remove(transfer_id);
                     sending_progress.remove(transfer_id);
+                    let file_name = sending_names.remove(transfer_id).unwrap_or_else(|| transfer_id.clone());
+                    // The *real* "sent" signal — see `send_file`'s own
+                    // (deliberately absent) `FileSent` emission for why
+                    // this can't just happen there instead.
+                    state.emit(SyncEvent::FileSent { transfer_id: transfer_id.clone(), file_name, to_name: peer.name.clone() });
                 }
                 _ => {}
             }
@@ -1862,6 +1869,12 @@ async fn send_file(state: &Arc<SharedState>, peer_crypto_id: &str, path: PathBuf
     // still be slowly draining the backlog — exactly the window this
     // exists to protect. See `file_transfers_in_flight`'s doc comment.
     state.begin_file_transfer(peer_crypto_id);
+    state.emit(SyncEvent::FileSending {
+        transfer_id: transfer_id.clone(),
+        to_name: peer_name.clone(),
+        file_name: file_name.clone(),
+        size_bytes,
+    });
 
     for (seq, chunk) in data.chunks(CHUNK_SIZE).enumerate() {
         if tx
@@ -1902,13 +1915,20 @@ async fn send_file(state: &Arc<SharedState>, peer_crypto_id: &str, path: PathBuf
             transfer_id,
             reason: "connection closed mid-transfer".into(),
         });
-        return;
+        // No trailing `return` — falling off the end of this `if` block
+        // is also the end of the function, so it's redundant.
     }
-    state.emit(SyncEvent::FileSent {
-        transfer_id,
-        file_name,
-        to_name: peer_name,
-    });
+    // `FileSent` is *not* emitted here — `tx.send` above only enqueues
+    // `FileComplete`, which (behind a large backlog of still-unwritten
+    // `FileChunk`s in this unbounded channel) can return long before the
+    // writer loop actually reaches it. Emitting "sent" that early was a
+    // real bug: it could reach a shell before every `FileTransferProgress`
+    // for the tail of the file had arrived, so a UI that removed its
+    // progress row on `FileSent` would see it reappear a moment later
+    // when the next (now orphaned) progress event showed up with nothing
+    // left to ever remove it again. The writer loop's own `Message::
+    // FileComplete` handling below emits `FileSent` once it's actually
+    // been written — the same fix already applied to `end_file_transfer`.
 }
 
 async fn apply_remote_clipboard(state: &Arc<SharedState>, hash: String, data: Vec<u8>) {

@@ -164,6 +164,7 @@ class ContinuityForegroundService : Service() {
                 "Pairing request from '${event.peer.name}' — open Continuity to confirm"
             is FfiSyncEvent.PairingDeclined -> "Pairing with '${event.peerName}' was declined"
             is FfiSyncEvent.FileReceiving -> "Receiving '${event.fileName}' from '${event.fromName}'..."
+            is FfiSyncEvent.FileSending -> "Sending '${event.fileName}' to '${event.toName}'..."
             is FfiSyncEvent.FileReceived -> {
                 notifyFileReceived(event.fileName, event.path)
                 return

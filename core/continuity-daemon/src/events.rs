@@ -36,6 +36,12 @@ pub enum SyncEvent {
     ClipboardReceived { from_name: String },
     ClipboardBroadcast { peer_count: usize },
     FileReceiving { transfer_id: String, from_name: String, file_name: String, size_bytes: u64 },
+    /// Mirrors `FileReceiving` for the outbound side — fired once the
+    /// peer has accepted the offer and sending is genuinely about to
+    /// start, carrying the file name/size a shell needs to label a
+    /// progress row *before* the first `FileTransferProgress` for this
+    /// transfer arrives (which carries neither).
+    FileSending { transfer_id: String, to_name: String, file_name: String, size_bytes: u64 },
     /// Periodic progress for one transfer, sending or receiving —
     /// throttled (see `PROGRESS_EVENT_INTERVAL` in `engine.rs`) rather
     /// than emitted per-chunk, since a large file is hundreds of chunks
