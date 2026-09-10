@@ -197,6 +197,12 @@ class ContinuityForegroundService : Service() {
             is FfiSyncEvent.NowPlayingChanged,
             is FfiSyncEvent.PeerDiscovered,
             is FfiSyncEvent.PeerActivity,
+            // Fires roughly once per MB, far too often for a system
+            // notification per tick — the in-app `TransfersCard` (see
+            // MainActivity) is the live view for this; FileReceiving/
+            // FileReceived/FileSent/FileTransferFailed above already
+            // cover the start/end notifications.
+            is FfiSyncEvent.FileTransferProgress,
             // Android is a remote-control *controller* only (see
             // EngineHolder's `NoopRemoteControlHost` wiring) — an
             // inbound `RemoteControlRequested` against this device is
