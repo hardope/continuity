@@ -82,6 +82,7 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.FloatingActionButton
@@ -228,6 +229,20 @@ private data class NowPlayingSnapshot(
     val receivedAtMillis: Long,
 )
 
+/** One in-progress file transfer, sending or receiving — tracked from
+ * `FfiSyncEvent.FileTransferProgress` (throttled server-side to roughly
+ * once per MB, not once per chunk) and removed the moment the transfer
+ * ends, successfully or not. [label] only has a real file name on the
+ * receiving side: `FileReceiving` carries one and arrives before any
+ * progress event for that transfer, but there's no equivalent
+ * "sending started" event yet, so an outbound transfer's row stays
+ * generic rather than guessing at a name. */
+private data class TransferProgress(
+    val label: String,
+    val bytesTransferred: Long,
+    val totalBytes: Long,
+)
+
 /** Who a "Send File" action targets, chosen via the device picker when
  * more than one device is connected. */
 private sealed class SendTarget {
@@ -243,6 +258,7 @@ private fun ContinuityScreen(onFilePickerRequested: ((Uri) -> Unit) -> Unit) {
     val devices = remember { mutableStateMapOf<String, DeviceStatus>() }
     val nearby = remember { mutableStateMapOf<String, String>() }
     val nowPlaying = remember { mutableStateMapOf<String, NowPlayingSnapshot>() }
+    val transfers = remember { mutableStateMapOf<String, TransferProgress>() }
     var pendingPairing by remember { mutableStateOf<Pair<uniffi.continuity_ffi.FfiDeviceInfo, String>?>(null) }
     var isPaused by remember { mutableStateOf(false) }
     var showResetConfirm by remember { mutableStateOf(false) }
@@ -322,10 +338,35 @@ private fun ContinuityScreen(onFilePickerRequested: ((Uri) -> Unit) -> Unit) {
                         ActivityEntry(Icons.Default.Sync, "Clipboard changed, but no device connected to send it to", warningColor)
                     },
                 )
-                is FfiSyncEvent.FileReceiving -> activity.add(0, ActivityEntry(Icons.Default.FolderOpen, "Receiving '${event.fileName}' from '${event.fromName}'...", null))
-                is FfiSyncEvent.FileReceived -> activity.add(0, ActivityEntry(Icons.Default.Inbox, "Received '${event.fileName}'", successColor))
-                is FfiSyncEvent.FileSent -> activity.add(0, ActivityEntry(Icons.Default.FileUpload, "Sent '${event.fileName}' to '${event.toName}'", successColor))
-                is FfiSyncEvent.FileTransferFailed -> activity.add(0, ActivityEntry(Icons.Default.Error, "Transfer failed: ${event.reason}", warningColor))
+                is FfiSyncEvent.FileReceiving -> {
+                    activity.add(0, ActivityEntry(Icons.Default.FolderOpen, "Receiving '${event.fileName}' from '${event.fromName}'...", null))
+                    transfers[event.transferId] = TransferProgress(
+                        label = "Receiving '${event.fileName}' from '${event.fromName}'",
+                        bytesTransferred = 0L,
+                        totalBytes = event.sizeBytes.toLong(),
+                    )
+                }
+                is FfiSyncEvent.FileTransferProgress -> {
+                    val existingLabel = transfers[event.transferId]?.label
+                        ?: if (event.direction == uniffi.continuity_ffi.FfiFileTransferDirection.SENDING) "Sending file..." else "Receiving file..."
+                    transfers[event.transferId] = TransferProgress(
+                        label = existingLabel,
+                        bytesTransferred = event.bytesTransferred.toLong(),
+                        totalBytes = event.totalBytes.toLong(),
+                    )
+                }
+                is FfiSyncEvent.FileReceived -> {
+                    transfers.remove(event.transferId)
+                    activity.add(0, ActivityEntry(Icons.Default.Inbox, "Received '${event.fileName}'", successColor))
+                }
+                is FfiSyncEvent.FileSent -> {
+                    transfers.remove(event.transferId)
+                    activity.add(0, ActivityEntry(Icons.Default.FileUpload, "Sent '${event.fileName}' to '${event.toName}'", successColor))
+                }
+                is FfiSyncEvent.FileTransferFailed -> {
+                    transfers.remove(event.transferId)
+                    activity.add(0, ActivityEntry(Icons.Default.Error, "Transfer failed: ${event.reason}", warningColor))
+                }
                 is FfiSyncEvent.Error -> activity.add(0, ActivityEntry(Icons.Default.Error, event.message, warningColor))
                 is FfiSyncEvent.WasReset -> {
                     devices.clear()
@@ -471,6 +512,9 @@ private fun ContinuityScreen(onFilePickerRequested: ((Uri) -> Unit) -> Unit) {
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
             Spacer(Modifier.height(4.dp))
+            if (transfers.isNotEmpty()) {
+                TransfersCard(transfers = transfers)
+            }
             if (nearby.isNotEmpty()) {
                 NearbyDevicesCard(
                     nearby = nearby,
@@ -708,6 +752,53 @@ private fun ContinuityScreen(onFilePickerRequested: ((Uri) -> Unit) -> Unit) {
             onEnd = { EngineHolder.engine?.endRemoteControlSession(remoteControlPeer) },
         )
     }
+}
+
+/// One row per file transfer currently in progress (sending or
+/// receiving), each with a determinate progress bar — [transfers] is
+/// keyed by transfer id so simultaneous transfers to/from different
+/// devices each get their own row rather than being conflated into one.
+@Composable
+private fun TransfersCard(transfers: Map<String, TransferProgress>) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+    ) {
+        Column(modifier = Modifier.padding(vertical = 4.dp)) {
+            transfers.values.toList().forEachIndexed { index, transfer ->
+                if (index > 0) HorizontalDivider(Modifier.padding(horizontal = 16.dp))
+                Column(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Text(transfer.label, style = MaterialTheme.typography.titleMedium)
+                    // `totalBytes` is only ever 0 in the brief instant
+                    // before the very first progress update arrives for
+                    // an outbound transfer — an indeterminate bar reads
+                    // as "working on it" rather than a division by zero.
+                    if (transfer.totalBytes > 0) {
+                        LinearProgressIndicator(
+                            progress = { (transfer.bytesTransferred.toFloat() / transfer.totalBytes.toFloat()).coerceIn(0f, 1f) },
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        Text(
+                            "${formatBytes(transfer.bytesTransferred)} / ${formatBytes(transfer.totalBytes)}",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    } else {
+                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                    }
+                }
+            }
+        }
+    }
+}
+
+private fun formatBytes(bytes: Long): String = when {
+    bytes >= 1024 * 1024 -> "%.1f MB".format(bytes / (1024.0 * 1024.0))
+    bytes >= 1024 -> "%.1f KB".format(bytes / 1024.0)
+    else -> "$bytes B"
 }
 
 /// Untrusted devices seen on the network — the engine deliberately doesn't

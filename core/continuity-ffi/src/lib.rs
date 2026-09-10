@@ -159,6 +159,7 @@ pub enum FfiSyncEvent {
     ClipboardReceived { from_name: String },
     ClipboardBroadcast { peer_count: u32 },
     FileReceiving { transfer_id: String, from_name: String, file_name: String, size_bytes: u64 },
+    FileTransferProgress { transfer_id: String, bytes_transferred: u64, total_bytes: u64, direction: FfiFileTransferDirection },
     FileReceived { transfer_id: String, file_name: String, path: String },
     FileSent { transfer_id: String, file_name: String, to_name: String },
     FileTransferFailed { transfer_id: String, reason: String },
@@ -182,6 +183,21 @@ pub enum FfiSyncEvent {
 pub enum FfiRemoteControlRole {
     Controlling,
     Controlled,
+}
+
+#[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FfiFileTransferDirection {
+    Sending,
+    Receiving,
+}
+
+impl From<continuity_daemon::FileTransferDirection> for FfiFileTransferDirection {
+    fn from(direction: continuity_daemon::FileTransferDirection) -> Self {
+        match direction {
+            continuity_daemon::FileTransferDirection::Sending => FfiFileTransferDirection::Sending,
+            continuity_daemon::FileTransferDirection::Receiving => FfiFileTransferDirection::Receiving,
+        }
+    }
 }
 
 impl From<continuity_daemon::RemoteControlRole> for FfiRemoteControlRole {
@@ -249,6 +265,9 @@ impl From<continuity_daemon::SyncEvent> for FfiSyncEvent {
             E::ClipboardBroadcast { peer_count } => FfiSyncEvent::ClipboardBroadcast { peer_count: peer_count as u32 },
             E::FileReceiving { transfer_id, from_name, file_name, size_bytes } => {
                 FfiSyncEvent::FileReceiving { transfer_id, from_name, file_name, size_bytes }
+            }
+            E::FileTransferProgress { transfer_id, bytes_transferred, total_bytes, direction } => {
+                FfiSyncEvent::FileTransferProgress { transfer_id, bytes_transferred, total_bytes, direction: direction.into() }
             }
             E::FileReceived { transfer_id, file_name, path } => {
                 FfiSyncEvent::FileReceived { transfer_id, file_name, path }

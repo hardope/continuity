@@ -92,6 +92,14 @@ fn handle_event(event: SyncEvent, cli_state: &CliState) {
         SyncEvent::FileReceiving { from_name, file_name, size_bytes, .. } => {
             println!("receiving '{file_name}' ({size_bytes} bytes) from '{from_name}'...");
         }
+        SyncEvent::FileTransferProgress { bytes_transferred, total_bytes, direction, .. } => {
+            let verb = match direction {
+                continuity_daemon::FileTransferDirection::Sending => "sent",
+                continuity_daemon::FileTransferDirection::Receiving => "received",
+            };
+            let percent = (bytes_transferred * 100 / total_bytes.max(1)).min(100);
+            println!("{verb} {bytes_transferred}/{total_bytes} bytes ({percent}%)");
+        }
         SyncEvent::FileReceived { file_name, path, .. } => println!("received '{file_name}' -> {path}"),
         SyncEvent::FileSent { file_name, to_name, .. } => println!("sent '{file_name}' to '{to_name}'"),
         SyncEvent::FileTransferFailed { reason, .. } => println!("file transfer failed: {reason}"),

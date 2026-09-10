@@ -460,6 +460,13 @@ fn handle_sync_event(
         SyncEvent::FileReceiving { from_name, file_name, .. } => {
             notify(&format!("Receiving '{file_name}' from '{from_name}'..."));
         }
+        // No persistent progress-bar surface in the tray (just a menu and
+        // one-shot notifications) — a notification per throttled tick
+        // would just be noise on top of the start/end ones already shown
+        // below. Logged instead, same as `PeerActivity`.
+        SyncEvent::FileTransferProgress { transfer_id, bytes_transferred, total_bytes, .. } => {
+            tracing::debug!("file transfer {transfer_id}: {bytes_transferred}/{total_bytes} bytes");
+        }
         SyncEvent::FileReceived { file_name, path, .. } => notify_file_received(&file_name, &path),
         SyncEvent::FileSent { file_name, to_name, .. } => {
             notify(&format!("Sent '{file_name}' to '{to_name}'"));

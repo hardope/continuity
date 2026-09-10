@@ -11,6 +11,13 @@ pub enum RemoteControlRole {
     Controlled,
 }
 
+/// Which way a file is moving, for `SyncEvent::FileTransferProgress`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileTransferDirection {
+    Sending,
+    Receiving,
+}
+
 /// Everything a shell (CLI, tray app, mobile UI) might want to react to.
 /// The engine never blocks waiting for a shell to notice one of these —
 /// where a response is actually needed (pairing confirmation), the shell
@@ -29,6 +36,13 @@ pub enum SyncEvent {
     ClipboardReceived { from_name: String },
     ClipboardBroadcast { peer_count: usize },
     FileReceiving { transfer_id: String, from_name: String, file_name: String, size_bytes: u64 },
+    /// Periodic progress for one transfer, sending or receiving —
+    /// throttled (see `PROGRESS_EVENT_INTERVAL` in `engine.rs`) rather
+    /// than emitted per-chunk, since a large file is hundreds of chunks
+    /// and nothing needs UI-refresh-rate granularity. `direction` lets
+    /// one shell tell its own outbound sends apart from inbound receives
+    /// if it ever needs to (e.g. two progress rows open at once).
+    FileTransferProgress { transfer_id: String, bytes_transferred: u64, total_bytes: u64, direction: FileTransferDirection },
     FileReceived { transfer_id: String, file_name: String, path: String },
     FileSent { transfer_id: String, file_name: String, to_name: String },
     FileTransferFailed { transfer_id: String, reason: String },

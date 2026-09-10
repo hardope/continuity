@@ -2801,6 +2801,36 @@ public object FfiConverterTypeFfiError : FfiConverterRustBuffer<FfiException> {
 
 
 
+
+enum class FfiFileTransferDirection {
+    
+    SENDING,
+    RECEIVING;
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiFileTransferDirection: FfiConverterRustBuffer<FfiFileTransferDirection> {
+    override fun read(buf: ByteBuffer) = try {
+        FfiFileTransferDirection.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: FfiFileTransferDirection) = 4UL
+
+    override fun write(value: FfiFileTransferDirection, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
 /**
  * Mirrors `continuity_proto::InputEventKind` — see its own doc comment
  * for why key codes are the platform's own native codes, not a shared
@@ -3190,6 +3220,14 @@ sealed class FfiSyncEvent {
         companion object
     }
     
+    data class FileTransferProgress(
+        val `transferId`: kotlin.String, 
+        val `bytesTransferred`: kotlin.ULong, 
+        val `totalBytes`: kotlin.ULong, 
+        val `direction`: FfiFileTransferDirection) : FfiSyncEvent() {
+        companion object
+    }
+    
     data class FileReceived(
         val `transferId`: kotlin.String, 
         val `fileName`: kotlin.String, 
@@ -3333,69 +3371,75 @@ public object FfiConverterTypeFfiSyncEvent : FfiConverterRustBuffer<FfiSyncEvent
                 FfiConverterString.read(buf),
                 FfiConverterULong.read(buf),
                 )
-            10 -> FfiSyncEvent.FileReceived(
+            10 -> FfiSyncEvent.FileTransferProgress(
+                FfiConverterString.read(buf),
+                FfiConverterULong.read(buf),
+                FfiConverterULong.read(buf),
+                FfiConverterTypeFfiFileTransferDirection.read(buf),
+                )
+            11 -> FfiSyncEvent.FileReceived(
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 )
-            11 -> FfiSyncEvent.FileSent(
+            12 -> FfiSyncEvent.FileSent(
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 )
-            12 -> FfiSyncEvent.FileTransferFailed(
+            13 -> FfiSyncEvent.FileTransferFailed(
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 )
-            13 -> FfiSyncEvent.Error(
+            14 -> FfiSyncEvent.Error(
                 FfiConverterString.read(buf),
                 )
-            14 -> FfiSyncEvent.WasReset
-            15 -> FfiSyncEvent.PausedStateChanged(
+            15 -> FfiSyncEvent.WasReset
+            16 -> FfiSyncEvent.PausedStateChanged(
                 FfiConverterBoolean.read(buf),
                 )
-            16 -> FfiSyncEvent.ReconnectFailed(
+            17 -> FfiSyncEvent.ReconnectFailed(
                 FfiConverterString.read(buf),
                 )
-            17 -> FfiSyncEvent.NowPlayingChanged(
+            18 -> FfiSyncEvent.NowPlayingChanged(
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 FfiConverterTypeFfiNowPlayingInfo.read(buf),
                 )
-            18 -> FfiSyncEvent.PeerDiscovered(
+            19 -> FfiSyncEvent.PeerDiscovered(
                 FfiConverterTypeFfiDeviceInfo.read(buf),
                 )
-            19 -> FfiSyncEvent.PeerActivity(
+            20 -> FfiSyncEvent.PeerActivity(
                 FfiConverterString.read(buf),
                 FfiConverterULong.read(buf),
                 )
-            20 -> FfiSyncEvent.WasRevoked(
+            21 -> FfiSyncEvent.WasRevoked(
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 )
-            21 -> FfiSyncEvent.RevokedByPeer(
+            22 -> FfiSyncEvent.RevokedByPeer(
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 )
-            22 -> FfiSyncEvent.RemoteControlRequested(
+            23 -> FfiSyncEvent.RemoteControlRequested(
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 )
-            23 -> FfiSyncEvent.RemoteControlDeclined(
+            24 -> FfiSyncEvent.RemoteControlDeclined(
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 )
-            24 -> FfiSyncEvent.RemoteControlSessionStarted(
+            25 -> FfiSyncEvent.RemoteControlSessionStarted(
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 FfiConverterTypeFfiRemoteControlRole.read(buf),
                 )
-            25 -> FfiSyncEvent.RemoteControlSessionEnded(
+            26 -> FfiSyncEvent.RemoteControlSessionEnded(
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 FfiConverterOptionalString.read(buf),
                 )
-            26 -> FfiSyncEvent.ScreenFrameReceived(
+            27 -> FfiSyncEvent.ScreenFrameReceived(
                 FfiConverterString.read(buf),
                 FfiConverterByteArray.read(buf),
                 )
@@ -3470,6 +3514,16 @@ public object FfiConverterTypeFfiSyncEvent : FfiConverterRustBuffer<FfiSyncEvent
                 + FfiConverterString.allocationSize(value.`fromName`)
                 + FfiConverterString.allocationSize(value.`fileName`)
                 + FfiConverterULong.allocationSize(value.`sizeBytes`)
+            )
+        }
+        is FfiSyncEvent.FileTransferProgress -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`transferId`)
+                + FfiConverterULong.allocationSize(value.`bytesTransferred`)
+                + FfiConverterULong.allocationSize(value.`totalBytes`)
+                + FfiConverterTypeFfiFileTransferDirection.allocationSize(value.`direction`)
             )
         }
         is FfiSyncEvent.FileReceived -> {
@@ -3661,103 +3715,111 @@ public object FfiConverterTypeFfiSyncEvent : FfiConverterRustBuffer<FfiSyncEvent
                 FfiConverterULong.write(value.`sizeBytes`, buf)
                 Unit
             }
-            is FfiSyncEvent.FileReceived -> {
+            is FfiSyncEvent.FileTransferProgress -> {
                 buf.putInt(10)
+                FfiConverterString.write(value.`transferId`, buf)
+                FfiConverterULong.write(value.`bytesTransferred`, buf)
+                FfiConverterULong.write(value.`totalBytes`, buf)
+                FfiConverterTypeFfiFileTransferDirection.write(value.`direction`, buf)
+                Unit
+            }
+            is FfiSyncEvent.FileReceived -> {
+                buf.putInt(11)
                 FfiConverterString.write(value.`transferId`, buf)
                 FfiConverterString.write(value.`fileName`, buf)
                 FfiConverterString.write(value.`path`, buf)
                 Unit
             }
             is FfiSyncEvent.FileSent -> {
-                buf.putInt(11)
+                buf.putInt(12)
                 FfiConverterString.write(value.`transferId`, buf)
                 FfiConverterString.write(value.`fileName`, buf)
                 FfiConverterString.write(value.`toName`, buf)
                 Unit
             }
             is FfiSyncEvent.FileTransferFailed -> {
-                buf.putInt(12)
+                buf.putInt(13)
                 FfiConverterString.write(value.`transferId`, buf)
                 FfiConverterString.write(value.`reason`, buf)
                 Unit
             }
             is FfiSyncEvent.Error -> {
-                buf.putInt(13)
+                buf.putInt(14)
                 FfiConverterString.write(value.`message`, buf)
                 Unit
             }
             is FfiSyncEvent.WasReset -> {
-                buf.putInt(14)
+                buf.putInt(15)
                 Unit
             }
             is FfiSyncEvent.PausedStateChanged -> {
-                buf.putInt(15)
+                buf.putInt(16)
                 FfiConverterBoolean.write(value.`paused`, buf)
                 Unit
             }
             is FfiSyncEvent.ReconnectFailed -> {
-                buf.putInt(16)
+                buf.putInt(17)
                 FfiConverterString.write(value.`peerId`, buf)
                 Unit
             }
             is FfiSyncEvent.NowPlayingChanged -> {
-                buf.putInt(17)
+                buf.putInt(18)
                 FfiConverterString.write(value.`peerId`, buf)
                 FfiConverterString.write(value.`peerName`, buf)
                 FfiConverterTypeFfiNowPlayingInfo.write(value.`info`, buf)
                 Unit
             }
             is FfiSyncEvent.PeerDiscovered -> {
-                buf.putInt(18)
+                buf.putInt(19)
                 FfiConverterTypeFfiDeviceInfo.write(value.`device`, buf)
                 Unit
             }
             is FfiSyncEvent.PeerActivity -> {
-                buf.putInt(19)
+                buf.putInt(20)
                 FfiConverterString.write(value.`peerId`, buf)
                 FfiConverterULong.write(value.`secondsSinceActivity`, buf)
                 Unit
             }
             is FfiSyncEvent.WasRevoked -> {
-                buf.putInt(20)
-                FfiConverterString.write(value.`peerId`, buf)
-                FfiConverterString.write(value.`peerName`, buf)
-                Unit
-            }
-            is FfiSyncEvent.RevokedByPeer -> {
                 buf.putInt(21)
                 FfiConverterString.write(value.`peerId`, buf)
                 FfiConverterString.write(value.`peerName`, buf)
                 Unit
             }
-            is FfiSyncEvent.RemoteControlRequested -> {
+            is FfiSyncEvent.RevokedByPeer -> {
                 buf.putInt(22)
                 FfiConverterString.write(value.`peerId`, buf)
                 FfiConverterString.write(value.`peerName`, buf)
                 Unit
             }
-            is FfiSyncEvent.RemoteControlDeclined -> {
+            is FfiSyncEvent.RemoteControlRequested -> {
                 buf.putInt(23)
                 FfiConverterString.write(value.`peerId`, buf)
                 FfiConverterString.write(value.`peerName`, buf)
                 Unit
             }
-            is FfiSyncEvent.RemoteControlSessionStarted -> {
+            is FfiSyncEvent.RemoteControlDeclined -> {
                 buf.putInt(24)
+                FfiConverterString.write(value.`peerId`, buf)
+                FfiConverterString.write(value.`peerName`, buf)
+                Unit
+            }
+            is FfiSyncEvent.RemoteControlSessionStarted -> {
+                buf.putInt(25)
                 FfiConverterString.write(value.`peerId`, buf)
                 FfiConverterString.write(value.`peerName`, buf)
                 FfiConverterTypeFfiRemoteControlRole.write(value.`role`, buf)
                 Unit
             }
             is FfiSyncEvent.RemoteControlSessionEnded -> {
-                buf.putInt(25)
+                buf.putInt(26)
                 FfiConverterString.write(value.`peerId`, buf)
                 FfiConverterString.write(value.`peerName`, buf)
                 FfiConverterOptionalString.write(value.`reason`, buf)
                 Unit
             }
             is FfiSyncEvent.ScreenFrameReceived -> {
-                buf.putInt(26)
+                buf.putInt(27)
                 FfiConverterString.write(value.`peerId`, buf)
                 FfiConverterByteArray.write(value.`frame`, buf)
                 Unit
