@@ -29,6 +29,7 @@ pub async fn run(profile: &str, name: Option<String>) -> anyhow::Result<()> {
         clipboard: Arc::new(ArboardClipboard),
         media: Arc::new(continuity_daemon::NoopMediaController),
         remote_control: Arc::new(continuity_daemon::NoopRemoteControlHost),
+        screen_lock: Arc::new(continuity_daemon::NoopScreenLockController),
         received_files_dir: received_files_dir(profile),
     };
 
@@ -153,6 +154,13 @@ fn handle_event(event: SyncEvent, cli_state: &CliState) {
         SyncEvent::ScreenFrameReceived { frame, .. } => {
             tracing::debug!("screen frame received ({} bytes)", frame.len());
         }
+        SyncEvent::ScreenLockResult { peer_name, action, outcome, .. } => {
+            println!("screen {action:?} on '{peer_name}': {outcome:?}");
+        }
+        SyncEvent::ScreenLockRequested { peer_name, action, outcome, .. } => {
+            println!("'{peer_name}' asked to {action:?} this device's screen ({outcome:?} — this CLI can't do either)");
+        }
+        SyncEvent::UnlockPermissionChanged { .. } => {}
     }
 }
 

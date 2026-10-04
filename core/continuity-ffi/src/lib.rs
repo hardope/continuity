@@ -13,6 +13,7 @@ use continuity_crypto::{Identity, TrustStore};
 use continuity_daemon::{ClipboardBackend, EngineCommand, EngineConfig};
 use continuity_proto::{
     DeviceInfo as CoreDeviceInfo, MediaCommand as CoreMediaCommand, Platform as CorePlatform,
+    ScreenLockAction as CoreScreenLockAction, ScreenLockOutcome as CoreScreenLockOutcome,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -52,6 +53,9 @@ pub struct FfiDeviceInfo {
     pub id: String,
     pub name: String,
     pub platform: String,
+    /// What the peer announced — gate any feature newer than v1 on this
+    /// (see `continuity_proto::PROTOCOL_VERSION`), e.g. only offer
+    /// lock/unlock to a peer reporting 2 or higher.
     pub protocol_version: u32,
 }
 
@@ -148,6 +152,53 @@ impl From<continuity_proto::NowPlayingInfo> for FfiNowPlayingInfo {
     }
 }
 
+/// Mirrors `continuity_proto::ScreenLockAction`.
+#[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FfiScreenLockAction {
+    Lock,
+    Unlock,
+}
+
+impl From<FfiScreenLockAction> for CoreScreenLockAction {
+    fn from(a: FfiScreenLockAction) -> Self {
+        match a {
+            FfiScreenLockAction::Lock => CoreScreenLockAction::Lock,
+            FfiScreenLockAction::Unlock => CoreScreenLockAction::Unlock,
+        }
+    }
+}
+
+impl From<CoreScreenLockAction> for FfiScreenLockAction {
+    fn from(a: CoreScreenLockAction) -> Self {
+        match a {
+            CoreScreenLockAction::Lock => FfiScreenLockAction::Lock,
+            CoreScreenLockAction::Unlock => FfiScreenLockAction::Unlock,
+        }
+    }
+}
+
+/// Mirrors `continuity_proto::ScreenLockOutcome`.
+#[derive(uniffi::Enum, Debug, Clone, PartialEq, Eq)]
+pub enum FfiScreenLockOutcome {
+    Done,
+    /// The peer's user hasn't allowed this device to unlock it — tell the
+    /// user where to turn that on (the peer's own tray menu).
+    NotAllowed,
+    Unsupported,
+    Failed { reason: String },
+}
+
+impl From<CoreScreenLockOutcome> for FfiScreenLockOutcome {
+    fn from(o: CoreScreenLockOutcome) -> Self {
+        match o {
+            CoreScreenLockOutcome::Done => FfiScreenLockOutcome::Done,
+            CoreScreenLockOutcome::NotAllowed => FfiScreenLockOutcome::NotAllowed,
+            CoreScreenLockOutcome::Unsupported => FfiScreenLockOutcome::Unsupported,
+            CoreScreenLockOutcome::Failed { reason } => FfiScreenLockOutcome::Failed { reason },
+        }
+    }
+}
+
 #[derive(uniffi::Enum, Debug, Clone)]
 pub enum FfiSyncEvent {
     Listening { port: u16 },
@@ -178,6 +229,9 @@ pub enum FfiSyncEvent {
     RemoteControlSessionStarted { peer_id: String, peer_name: String, role: FfiRemoteControlRole },
     RemoteControlSessionEnded { peer_id: String, peer_name: String, reason: Option<String> },
     ScreenFrameReceived { peer_id: String, frame: Vec<u8> },
+    ScreenLockResult { peer_id: String, peer_name: String, action: FfiScreenLockAction, outcome: FfiScreenLockOutcome },
+    ScreenLockRequested { peer_id: String, peer_name: String, action: FfiScreenLockAction, outcome: FfiScreenLockOutcome },
+    UnlockPermissionChanged { peer_id: String, peer_name: String, allowed: bool },
 }
 
 #[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -304,6 +358,15 @@ impl From<continuity_daemon::SyncEvent> for FfiSyncEvent {
                 FfiSyncEvent::RemoteControlSessionEnded { peer_id, peer_name, reason }
             }
             E::ScreenFrameReceived { peer_id, frame, .. } => FfiSyncEvent::ScreenFrameReceived { peer_id, frame },
+            E::ScreenLockResult { peer_id, peer_name, action, outcome } => {
+                FfiSyncEvent::ScreenLockResult { peer_id, peer_name, action: action.into(), outcome: outcome.into() }
+            }
+            E::ScreenLockRequested { peer_id, peer_name, action, outcome } => {
+                FfiSyncEvent::ScreenLockRequested { peer_id, peer_name, action: action.into(), outcome: outcome.into() }
+            }
+            E::UnlockPermissionChanged { peer_id, peer_name, allowed } => {
+                FfiSyncEvent::UnlockPermissionChanged { peer_id, peer_name, allowed }
+            }
         }
     }
 }
@@ -397,6 +460,11 @@ impl ContinuityEngine {
                     // that could accidentally expose a phone's screen or
                     // inject input into it.
                     remote_control: Arc::new(continuity_daemon::NoopRemoteControlHost),
+                    // Same reasoning as `remote_control` above: a phone
+                    // asks a desktop to lock/unlock, never the other way
+                    // around, so an inbound request here is answered
+                    // `Unsupported` by the engine itself.
+                    screen_lock: Arc::new(continuity_daemon::NoopScreenLockController),
                     received_files_dir: PathBuf::from(received_files_dir),
                 };
                 continuity_daemon::start(config).await.map_err(|e| e.to_string())
@@ -538,6 +606,30 @@ impl ContinuityEngine {
     /// none is active.
     pub fn end_remote_control_session(&self, peer_id: String) {
         let _ = self.commands.send(EngineCommand::EndRemoteControlSession { peer_crypto_id: peer_id });
+    }
+
+    /// Asks `peer_id` to lock or unlock its screen; the answer arrives as
+    /// `FfiSyncEvent::ScreenLockResult`. Only call this for a peer whose
+    /// `FfiDeviceInfo.protocol_version` is 2 or higher — an older peer
+    /// doesn't know the message and drops the connection on it.
+    pub fn request_screen_lock(&self, peer_id: String, action: FfiScreenLockAction) {
+        let _ = self.commands.send(EngineCommand::RequestScreenLock { peer_crypto_id: peer_id, action: action.into() });
+    }
+
+    /// Turns remote unlock of *this* device on/off for one peer. Exposed
+    /// for symmetry like `respond_to_remote_control_request` — a phone
+    /// wires in `NoopScreenLockController`, so there's nothing to unlock
+    /// here today.
+    pub fn set_unlock_allowed(&self, peer_id: String, allowed: bool) {
+        let _ = self.commands.send(EngineCommand::SetUnlockAllowed { peer_crypto_id: peer_id, allowed });
+    }
+
+    /// Puts `text` on one peer's clipboard — for sharing a link or a
+    /// snippet of text to a specific device from the system share sheet.
+    /// Works with any peer, including older ones (it's an ordinary
+    /// clipboard update on the wire).
+    pub fn send_text(&self, peer_id: String, text: String) {
+        let _ = self.commands.send(EngineCommand::SendText { peer_crypto_id: peer_id, text });
     }
 }
 

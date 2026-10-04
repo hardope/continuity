@@ -804,6 +804,12 @@ internal open class UniffiVTableCallbackInterfaceEventListener(
 
 
 
+
+
+
+
+
+
 // A JNA Library to expose the extern-C FFI definitions.
 // This is an implementation detail which will be called internally by the public API.
 
@@ -853,6 +859,8 @@ internal interface UniffiLib : Library {
     ): Unit
     fun uniffi_continuity_ffi_fn_method_continuityengine_request_remote_control(`ptr`: Pointer,`peerId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    fun uniffi_continuity_ffi_fn_method_continuityengine_request_screen_lock(`ptr`: Pointer,`peerId`: RustBuffer.ByValue,`action`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     fun uniffi_continuity_ffi_fn_method_continuityengine_reset(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_continuity_ffi_fn_method_continuityengine_respond_to_remote_control_request(`ptr`: Pointer,`peerId`: RustBuffer.ByValue,`accept`: Byte,uniffi_out_err: UniffiRustCallStatus, 
@@ -865,7 +873,11 @@ internal interface UniffiLib : Library {
     ): Unit
     fun uniffi_continuity_ffi_fn_method_continuityengine_send_media_command(`ptr`: Pointer,`peerId`: RustBuffer.ByValue,`command`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    fun uniffi_continuity_ffi_fn_method_continuityengine_send_text(`ptr`: Pointer,`peerId`: RustBuffer.ByValue,`text`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     fun uniffi_continuity_ffi_fn_method_continuityengine_set_paused(`ptr`: Pointer,`paused`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_continuity_ffi_fn_method_continuityengine_set_unlock_allowed(`ptr`: Pointer,`peerId`: RustBuffer.ByValue,`allowed`: Byte,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_continuity_ffi_fn_clone_eventlistener(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Pointer
@@ -1015,6 +1027,8 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_continuity_ffi_checksum_method_continuityengine_request_remote_control(
     ): Short
+    fun uniffi_continuity_ffi_checksum_method_continuityengine_request_screen_lock(
+    ): Short
     fun uniffi_continuity_ffi_checksum_method_continuityengine_reset(
     ): Short
     fun uniffi_continuity_ffi_checksum_method_continuityengine_respond_to_remote_control_request(
@@ -1027,7 +1041,11 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_continuity_ffi_checksum_method_continuityengine_send_media_command(
     ): Short
+    fun uniffi_continuity_ffi_checksum_method_continuityengine_send_text(
+    ): Short
     fun uniffi_continuity_ffi_checksum_method_continuityengine_set_paused(
+    ): Short
+    fun uniffi_continuity_ffi_checksum_method_continuityengine_set_unlock_allowed(
     ): Short
     fun uniffi_continuity_ffi_checksum_method_eventlistener_on_event(
     ): Short
@@ -1083,6 +1101,9 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_continuity_ffi_checksum_method_continuityengine_request_remote_control() != 15704.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_continuity_ffi_checksum_method_continuityengine_request_screen_lock() != 48563.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_continuity_ffi_checksum_method_continuityengine_reset() != 40739.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1101,7 +1122,13 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_continuity_ffi_checksum_method_continuityengine_send_media_command() != 1860.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_continuity_ffi_checksum_method_continuityengine_send_text() != 39493.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_continuity_ffi_checksum_method_continuityengine_set_paused() != 20054.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_continuity_ffi_checksum_method_continuityengine_set_unlock_allowed() != 56413.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_continuity_ffi_checksum_method_eventlistener_on_event() != 22386.toShort()) {
@@ -1921,6 +1948,14 @@ public interface ContinuityEngineInterface {
     fun `requestRemoteControl`(`peerId`: kotlin.String)
     
     /**
+     * Asks `peer_id` to lock or unlock its screen; the answer arrives as
+     * `FfiSyncEvent::ScreenLockResult`. Only call this for a peer whose
+     * `FfiDeviceInfo.protocol_version` is 2 or higher — an older peer
+     * doesn't know the message and drops the connection on it.
+     */
+    fun `requestScreenLock`(`peerId`: kotlin.String, `action`: FfiScreenLockAction)
+    
+    /**
      * Clears every paired device and disconnects all active peers — the
      * host app should confirm with the user before calling this, there's
      * no undo.
@@ -1967,11 +2002,27 @@ public interface ContinuityEngineInterface {
     fun `sendMediaCommand`(`peerId`: kotlin.String, `command`: FfiMediaCommand)
     
     /**
+     * Puts `text` on one peer's clipboard — for sharing a link or a
+     * snippet of text to a specific device from the system share sheet.
+     * Works with any peer, including older ones (it's an ordinary
+     * clipboard update on the wire).
+     */
+    fun `sendText`(`peerId`: kotlin.String, `text`: kotlin.String)
+    
+    /**
      * Temporarily stop syncing (new connections, dialing, clipboard) in
      * either direction, without stopping the engine or foreground
      * service. Call again with `false` to resume.
      */
     fun `setPaused`(`paused`: kotlin.Boolean)
+    
+    /**
+     * Turns remote unlock of *this* device on/off for one peer. Exposed
+     * for symmetry like `respond_to_remote_control_request` — a phone
+     * wires in `NoopScreenLockController`, so there's nothing to unlock
+     * here today.
+     */
+    fun `setUnlockAllowed`(`peerId`: kotlin.String, `allowed`: kotlin.Boolean)
     
     companion object
 }
@@ -2164,6 +2215,23 @@ open class ContinuityEngine: Disposable, AutoCloseable, ContinuityEngineInterfac
 
     
     /**
+     * Asks `peer_id` to lock or unlock its screen; the answer arrives as
+     * `FfiSyncEvent::ScreenLockResult`. Only call this for a peer whose
+     * `FfiDeviceInfo.protocol_version` is 2 or higher — an older peer
+     * doesn't know the message and drops the connection on it.
+     */override fun `requestScreenLock`(`peerId`: kotlin.String, `action`: FfiScreenLockAction)
+        = 
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_continuity_ffi_fn_method_continuityengine_request_screen_lock(
+        it, FfiConverterString.lower(`peerId`),FfiConverterTypeFfiScreenLockAction.lower(`action`),_status)
+}
+    }
+    
+    
+
+    
+    /**
      * Clears every paired device and disconnects all active peers — the
      * host app should confirm with the user before calling this, there's
      * no undo.
@@ -2264,6 +2332,23 @@ open class ContinuityEngine: Disposable, AutoCloseable, ContinuityEngineInterfac
 
     
     /**
+     * Puts `text` on one peer's clipboard — for sharing a link or a
+     * snippet of text to a specific device from the system share sheet.
+     * Works with any peer, including older ones (it's an ordinary
+     * clipboard update on the wire).
+     */override fun `sendText`(`peerId`: kotlin.String, `text`: kotlin.String)
+        = 
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_continuity_ffi_fn_method_continuityengine_send_text(
+        it, FfiConverterString.lower(`peerId`),FfiConverterString.lower(`text`),_status)
+}
+    }
+    
+    
+
+    
+    /**
      * Temporarily stop syncing (new connections, dialing, clipboard) in
      * either direction, without stopping the engine or foreground
      * service. Call again with `false` to resume.
@@ -2273,6 +2358,23 @@ open class ContinuityEngine: Disposable, AutoCloseable, ContinuityEngineInterfac
     uniffiRustCall() { _status ->
     UniffiLib.INSTANCE.uniffi_continuity_ffi_fn_method_continuityengine_set_paused(
         it, FfiConverterBoolean.lower(`paused`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Turns remote unlock of *this* device on/off for one peer. Exposed
+     * for symmetry like `respond_to_remote_control_request` — a phone
+     * wires in `NoopScreenLockController`, so there's nothing to unlock
+     * here today.
+     */override fun `setUnlockAllowed`(`peerId`: kotlin.String, `allowed`: kotlin.Boolean)
+        = 
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_continuity_ffi_fn_method_continuityengine_set_unlock_allowed(
+        it, FfiConverterString.lower(`peerId`),FfiConverterBoolean.lower(`allowed`),_status)
 }
     }
     
@@ -2622,6 +2724,11 @@ data class FfiDeviceInfo (
     var `id`: kotlin.String, 
     var `name`: kotlin.String, 
     var `platform`: kotlin.String, 
+    /**
+     * What the peer announced — gate any feature newer than v1 on this
+     * (see `continuity_proto::PROTOCOL_VERSION`), e.g. only offer
+     * lock/unlock to a peer reporting 2 or higher.
+     */
     var `protocolVersion`: kotlin.UInt
 ) {
     
@@ -3168,6 +3275,138 @@ public object FfiConverterTypeFfiRemoteControlRole: FfiConverterRustBuffer<FfiRe
 
 
 
+/**
+ * Mirrors `continuity_proto::ScreenLockAction`.
+ */
+
+enum class FfiScreenLockAction {
+    
+    LOCK,
+    UNLOCK;
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiScreenLockAction: FfiConverterRustBuffer<FfiScreenLockAction> {
+    override fun read(buf: ByteBuffer) = try {
+        FfiScreenLockAction.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: FfiScreenLockAction) = 4UL
+
+    override fun write(value: FfiScreenLockAction, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+/**
+ * Mirrors `continuity_proto::ScreenLockOutcome`.
+ */
+sealed class FfiScreenLockOutcome {
+    
+    object Done : FfiScreenLockOutcome()
+    
+    
+    /**
+     * The peer's user hasn't allowed this device to unlock it — tell the
+     * user where to turn that on (the peer's own tray menu).
+     */
+    object NotAllowed : FfiScreenLockOutcome()
+    
+    
+    object Unsupported : FfiScreenLockOutcome()
+    
+    
+    data class Failed(
+        val `reason`: kotlin.String) : FfiScreenLockOutcome() {
+        companion object
+    }
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiScreenLockOutcome : FfiConverterRustBuffer<FfiScreenLockOutcome>{
+    override fun read(buf: ByteBuffer): FfiScreenLockOutcome {
+        return when(buf.getInt()) {
+            1 -> FfiScreenLockOutcome.Done
+            2 -> FfiScreenLockOutcome.NotAllowed
+            3 -> FfiScreenLockOutcome.Unsupported
+            4 -> FfiScreenLockOutcome.Failed(
+                FfiConverterString.read(buf),
+                )
+            else -> throw RuntimeException("invalid enum value, something is very wrong!!")
+        }
+    }
+
+    override fun allocationSize(value: FfiScreenLockOutcome) = when(value) {
+        is FfiScreenLockOutcome.Done -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
+        is FfiScreenLockOutcome.NotAllowed -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
+        is FfiScreenLockOutcome.Unsupported -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
+        is FfiScreenLockOutcome.Failed -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`reason`)
+            )
+        }
+    }
+
+    override fun write(value: FfiScreenLockOutcome, buf: ByteBuffer) {
+        when(value) {
+            is FfiScreenLockOutcome.Done -> {
+                buf.putInt(1)
+                Unit
+            }
+            is FfiScreenLockOutcome.NotAllowed -> {
+                buf.putInt(2)
+                Unit
+            }
+            is FfiScreenLockOutcome.Unsupported -> {
+                buf.putInt(3)
+                Unit
+            }
+            is FfiScreenLockOutcome.Failed -> {
+                buf.putInt(4)
+                FfiConverterString.write(value.`reason`, buf)
+                Unit
+            }
+        }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
+    }
+}
+
+
+
+
+
 sealed class FfiSyncEvent {
     
     data class Listening(
@@ -3336,6 +3575,29 @@ sealed class FfiSyncEvent {
         companion object
     }
     
+    data class ScreenLockResult(
+        val `peerId`: kotlin.String, 
+        val `peerName`: kotlin.String, 
+        val `action`: FfiScreenLockAction, 
+        val `outcome`: FfiScreenLockOutcome) : FfiSyncEvent() {
+        companion object
+    }
+    
+    data class ScreenLockRequested(
+        val `peerId`: kotlin.String, 
+        val `peerName`: kotlin.String, 
+        val `action`: FfiScreenLockAction, 
+        val `outcome`: FfiScreenLockOutcome) : FfiSyncEvent() {
+        companion object
+    }
+    
+    data class UnlockPermissionChanged(
+        val `peerId`: kotlin.String, 
+        val `peerName`: kotlin.String, 
+        val `allowed`: kotlin.Boolean) : FfiSyncEvent() {
+        companion object
+    }
+    
 
     
     companion object
@@ -3456,6 +3718,23 @@ public object FfiConverterTypeFfiSyncEvent : FfiConverterRustBuffer<FfiSyncEvent
             28 -> FfiSyncEvent.ScreenFrameReceived(
                 FfiConverterString.read(buf),
                 FfiConverterByteArray.read(buf),
+                )
+            29 -> FfiSyncEvent.ScreenLockResult(
+                FfiConverterString.read(buf),
+                FfiConverterString.read(buf),
+                FfiConverterTypeFfiScreenLockAction.read(buf),
+                FfiConverterTypeFfiScreenLockOutcome.read(buf),
+                )
+            30 -> FfiSyncEvent.ScreenLockRequested(
+                FfiConverterString.read(buf),
+                FfiConverterString.read(buf),
+                FfiConverterTypeFfiScreenLockAction.read(buf),
+                FfiConverterTypeFfiScreenLockOutcome.read(buf),
+                )
+            31 -> FfiSyncEvent.UnlockPermissionChanged(
+                FfiConverterString.read(buf),
+                FfiConverterString.read(buf),
+                FfiConverterBoolean.read(buf),
                 )
             else -> throw RuntimeException("invalid enum value, something is very wrong!!")
         }
@@ -3685,6 +3964,35 @@ public object FfiConverterTypeFfiSyncEvent : FfiConverterRustBuffer<FfiSyncEvent
                 + FfiConverterByteArray.allocationSize(value.`frame`)
             )
         }
+        is FfiSyncEvent.ScreenLockResult -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`peerId`)
+                + FfiConverterString.allocationSize(value.`peerName`)
+                + FfiConverterTypeFfiScreenLockAction.allocationSize(value.`action`)
+                + FfiConverterTypeFfiScreenLockOutcome.allocationSize(value.`outcome`)
+            )
+        }
+        is FfiSyncEvent.ScreenLockRequested -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`peerId`)
+                + FfiConverterString.allocationSize(value.`peerName`)
+                + FfiConverterTypeFfiScreenLockAction.allocationSize(value.`action`)
+                + FfiConverterTypeFfiScreenLockOutcome.allocationSize(value.`outcome`)
+            )
+        }
+        is FfiSyncEvent.UnlockPermissionChanged -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`peerId`)
+                + FfiConverterString.allocationSize(value.`peerName`)
+                + FfiConverterBoolean.allocationSize(value.`allowed`)
+            )
+        }
     }
 
     override fun write(value: FfiSyncEvent, buf: ByteBuffer) {
@@ -3854,6 +4162,29 @@ public object FfiConverterTypeFfiSyncEvent : FfiConverterRustBuffer<FfiSyncEvent
                 buf.putInt(28)
                 FfiConverterString.write(value.`peerId`, buf)
                 FfiConverterByteArray.write(value.`frame`, buf)
+                Unit
+            }
+            is FfiSyncEvent.ScreenLockResult -> {
+                buf.putInt(29)
+                FfiConverterString.write(value.`peerId`, buf)
+                FfiConverterString.write(value.`peerName`, buf)
+                FfiConverterTypeFfiScreenLockAction.write(value.`action`, buf)
+                FfiConverterTypeFfiScreenLockOutcome.write(value.`outcome`, buf)
+                Unit
+            }
+            is FfiSyncEvent.ScreenLockRequested -> {
+                buf.putInt(30)
+                FfiConverterString.write(value.`peerId`, buf)
+                FfiConverterString.write(value.`peerName`, buf)
+                FfiConverterTypeFfiScreenLockAction.write(value.`action`, buf)
+                FfiConverterTypeFfiScreenLockOutcome.write(value.`outcome`, buf)
+                Unit
+            }
+            is FfiSyncEvent.UnlockPermissionChanged -> {
+                buf.putInt(31)
+                FfiConverterString.write(value.`peerId`, buf)
+                FfiConverterString.write(value.`peerName`, buf)
+                FfiConverterBoolean.write(value.`allowed`, buf)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }

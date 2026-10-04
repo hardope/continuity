@@ -4,4 +4,12 @@
          pure-Compose UI. Actual theming (colors, typography) is Compose's
          MaterialTheme in Theme.kt. -->
     <style name="Theme.Continuity" parent="android:Theme.Material.Light.NoActionBar" />
+
+    <!-- ShareActivity draws its own dimmed backdrop and bottom sheet in
+         Compose; the window itself just needs to be see-through. -->
+    <style name="Theme.Continuity.Share" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowAnimationStyle">@android:style/Animation.Translucent</item>
+    </style>
 </resources>

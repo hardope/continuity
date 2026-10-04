@@ -32,6 +32,9 @@ mod remote_control_linux;
 // doc comment) — so it's gated only on the feature, not target_os.
 #[cfg(feature = "remote-control")]
 mod remote_viewer;
+#[cfg(target_os = "linux")]
+mod screen_lock_linux;
+mod share;
 
 use continuity_crypto::{Identity, TrustStore};
 use continuity_daemon::{ArboardClipboard, EngineCommand, EngineConfig, SyncEvent};
@@ -41,6 +44,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
+#[cfg(target_os = "linux")]
+use tray_icon::menu::CheckMenuItem;
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, TrayIconBuilder, TrayIconEvent};
 
@@ -62,6 +67,14 @@ fn profile() -> String {
 }
 
 fn main() -> anyhow::Result<()> {
+    // What the file manager's "Send with Continuity" entries run (see
+    // share.rs): hand the files to the already-running instance and exit,
+    // without ever starting a second tray app or touching its log file.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some(share::SHARE_TO_FLAG) {
+        std::process::exit(share::run_share_client(&profile(), &args[2..]));
+    }
+
     init_logging();
 
     // Without declaring DPI awareness, Windows silently DPI-virtualizes
@@ -115,6 +128,21 @@ fn main() -> anyhow::Result<()> {
     let forget_target_map: Arc<Mutex<HashMap<MenuId, String>>> = Arc::new(Mutex::new(HashMap::new()));
     rebuild_forget_menu(&forget_submenu, &connected_peers.lock().unwrap(), &forget_target_map);
 
+    // Remote unlock is Linux-only (see screen_lock_linux.rs), so is the
+    // menu that grants it. Lists every connected device *plus* any device
+    // already allowed, even while it's offline — a lost phone is exactly
+    // the device whose permission most needs to be easy to take back.
+    // `unlock_permissions` mirrors the engine's trust store via
+    // `SyncEvent::UnlockPermissionChanged`: peer id -> (name, allowed).
+    #[cfg(target_os = "linux")]
+    let unlock_submenu = Submenu::new("Allow Remote Unlock", true);
+    #[cfg(target_os = "linux")]
+    let unlock_permissions: Arc<Mutex<HashMap<String, (String, bool)>>> = Arc::new(Mutex::new(HashMap::new()));
+    #[cfg(target_os = "linux")]
+    let unlock_target_map: Arc<Mutex<HashMap<MenuId, String>>> = Arc::new(Mutex::new(HashMap::new()));
+    #[cfg(target_os = "linux")]
+    rebuild_unlock_menu(&unlock_submenu, &connected_peers.lock().unwrap(), &unlock_permissions.lock().unwrap(), &unlock_target_map);
+
     // A connected peer's platform isn't tracked anywhere else on desktop
     // (`connected_peers` above only keeps id->name) — needed both to
     // gate which peers even get a "Remote Control" entry (any platform
@@ -153,6 +181,8 @@ fn main() -> anyhow::Result<()> {
     menu.append(&refresh_item)?;
     menu.append(&send_submenu)?;
     menu.append(&forget_submenu)?;
+    #[cfg(target_os = "linux")]
+    menu.append(&unlock_submenu)?;
     // `remote_control_submenu` is built and kept up to date below like
     // any other submenu, just deliberately never appended to the visible
     // menu here — real testing (mac controlling mac) found the
@@ -177,6 +207,11 @@ fn main() -> anyhow::Result<()> {
         .build()?;
 
     let commands = start_engine_thread(profile(), device_name, proxy)?;
+    // Entries left behind by a previous run that didn't quit cleanly would
+    // point at devices that may not be connected now — start from none and
+    // let `Connected` events add them back.
+    share::remove_menu_entries();
+    let share_server = share::start_server(&profile(), commands.clone(), connected_peers.clone());
     let is_paused: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
     // The open remote-control viewer window, if any — at most one at a
     // time (mirrors the engine's own one-Controlled-session-device-wide
@@ -228,9 +263,19 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
+        // Finder's "Open With > Continuity" (see share.rs and the
+        // CFBundleDocumentTypes entry in installers/macos/Info.plist).
+        #[cfg(target_os = "macos")]
+        if let tao::event::Event::Opened { urls } = &event {
+            let paths: Vec<PathBuf> = urls.iter().filter_map(|url| url.to_file_path().ok()).collect();
+            share::handle_opened_files(paths, connected_peers.clone(), commands.clone());
+        }
+
         if let tao::event::Event::UserEvent(sync_event) = event {
             #[cfg(feature = "remote-control")]
             handle_remote_control_sync_event(&sync_event, target, &viewer, &connected_peer_platforms, &commands);
+            #[cfg(target_os = "linux")]
+            let unlock_menu_update = unlock_menu_update(&sync_event);
             handle_sync_event(
                 sync_event,
                 &send_submenu,
@@ -253,6 +298,16 @@ fn main() -> anyhow::Result<()> {
                 &connected_peer_platforms.lock().unwrap(),
                 &remote_control_target_map,
             );
+            // After `handle_sync_event`, so `connected_peers` already
+            // reflects this event when the menu is rebuilt from it. Only for
+            // events that change what it shows — rebuilding on every event
+            // (now-playing updates arrive every 1.5s) would keep yanking
+            // the menu out from under someone who has it open.
+            #[cfg(target_os = "linux")]
+            if let Some(update) = unlock_menu_update {
+                update.apply(&mut unlock_permissions.lock().unwrap());
+                rebuild_unlock_menu(&unlock_submenu, &connected_peers.lock().unwrap(), &unlock_permissions.lock().unwrap(), &unlock_target_map);
+            }
         }
 
         if let Ok(event) = MenuEvent::receiver().try_recv() {
@@ -274,6 +329,10 @@ fn main() -> anyhow::Result<()> {
                     env!("CARGO_PKG_VERSION")
                 ));
             } else if event.id == quit_item_id {
+                share::remove_menu_entries();
+                if let Some(server) = &share_server {
+                    server.shutdown();
+                }
                 *control_flow = ControlFlow::Exit;
             } else if let Some(target) = send_target_map.lock().unwrap().get(&event.id).cloned() {
                 if let Some(path) = rfd::FileDialog::new().pick_file() {
@@ -307,6 +366,41 @@ fn main() -> anyhow::Result<()> {
                 #[cfg(feature = "remote-control")]
                 if let Some(peer_id) = remote_control_target_map.lock().unwrap().get(&event.id).cloned() {
                     let _ = commands.send(EngineCommand::RequestRemoteControl { peer_crypto_id: peer_id });
+                }
+                // A separate `let`, not inline in the `if let`: a temporary
+                // guard in an `if let` scrutinee lives for the whole block,
+                // and `rebuild_unlock_menu` at the end locks this same map.
+                #[cfg(target_os = "linux")]
+                let unlock_peer = unlock_target_map.lock().unwrap().get(&event.id).cloned();
+                #[cfg(target_os = "linux")]
+                if let Some(peer_id) = unlock_peer {
+                    let current = unlock_permissions.lock().unwrap().get(&peer_id).cloned();
+                    let peer_name = current
+                        .as_ref()
+                        .map(|(name, _)| name.clone())
+                        .or_else(|| connected_peers.lock().unwrap().get(&peer_id).cloned())
+                        .unwrap_or_else(|| peer_id.clone());
+                    if current.is_some_and(|(_, allowed)| allowed) {
+                        let _ = commands.send(EngineCommand::SetUnlockAllowed { peer_crypto_id: peer_id, allowed: false });
+                    } else {
+                        // Turning it *on* is the one direction that needs a
+                        // human to confirm: it lets that device skip this
+                        // computer's password from then on.
+                        confirm(
+                            "Continuity — Allow Remote Unlock",
+                            &format!(
+                                "Allow '{peer_name}' to unlock this computer without your password?\n\nAnyone using '{peer_name}' while it's unlocked could then unlock this computer. You'll get a notification every time it's used, and you can turn it off again from this menu at any time."
+                            ),
+                            commands.clone(),
+                            move |commands| {
+                                let _ = commands.send(EngineCommand::SetUnlockAllowed { peer_crypto_id: peer_id, allowed: true });
+                            },
+                        );
+                    }
+                    // The click already flipped the checkmark on its own;
+                    // put it back to what's actually allowed until the
+                    // engine confirms a change.
+                    rebuild_unlock_menu(&unlock_submenu, &connected_peers.lock().unwrap(), &unlock_permissions.lock().unwrap(), &unlock_target_map);
                 }
             }
         }
@@ -442,6 +536,7 @@ fn handle_sync_event(
             connected_peers.lock().unwrap().insert(peer.id, peer.name);
             rebuild_send_menu(send_submenu, &connected_peers.lock().unwrap(), send_target_map);
             rebuild_forget_menu(forget_submenu, &connected_peers.lock().unwrap(), forget_target_map);
+            share::sync_menu_entries(&connected_peers.lock().unwrap());
         }
         SyncEvent::PeerDiscovered { device } => {
             nearby_peers.lock().unwrap().insert(device.id, device.name);
@@ -451,6 +546,7 @@ fn handle_sync_event(
             connected_peers.lock().unwrap().remove(&peer_id);
             rebuild_send_menu(send_submenu, &connected_peers.lock().unwrap(), send_target_map);
             rebuild_forget_menu(forget_submenu, &connected_peers.lock().unwrap(), forget_target_map);
+            share::sync_menu_entries(&connected_peers.lock().unwrap());
             tracing::info!("'{peer_name}' disconnected");
         }
         SyncEvent::ClipboardReceived { from_name } => {
@@ -482,6 +578,7 @@ fn handle_sync_event(
             connected_peers.lock().unwrap().clear();
             rebuild_send_menu(send_submenu, &connected_peers.lock().unwrap(), send_target_map);
             rebuild_forget_menu(forget_submenu, &connected_peers.lock().unwrap(), forget_target_map);
+            share::sync_menu_entries(&connected_peers.lock().unwrap());
             notify("All paired devices have been forgotten");
         }
         SyncEvent::WasRevoked { peer_id, peer_name } => {
@@ -493,6 +590,7 @@ fn handle_sync_event(
             connected_peers.lock().unwrap().remove(&peer_id);
             rebuild_send_menu(send_submenu, &connected_peers.lock().unwrap(), send_target_map);
             rebuild_forget_menu(forget_submenu, &connected_peers.lock().unwrap(), forget_target_map);
+            share::sync_menu_entries(&connected_peers.lock().unwrap());
             notify(&format!("Forgot '{peer_name}'"));
         }
         SyncEvent::RevokedByPeer { peer_name, .. } => {
@@ -610,6 +708,112 @@ fn handle_sync_event(
         SyncEvent::ScreenFrameReceived { frame, .. } => {
             tracing::debug!("screen frame received ({} bytes)", frame.len());
         }
+        // Always announced — an unlock is the one thing a peer can do here
+        // without anyone at this computer saying yes at that moment, and a
+        // refused attempt is either a device that needs allowing first or
+        // someone trying something they shouldn't. (Shown after the fact
+        // for an unlock, naturally — the notification is waiting on the
+        // unlocked desktop.)
+        SyncEvent::ScreenLockRequested { peer_name, action, outcome, .. } => {
+            use continuity_proto::{ScreenLockAction, ScreenLockOutcome};
+            let verb = match action {
+                ScreenLockAction::Lock => "lock",
+                ScreenLockAction::Unlock => "unlock",
+            };
+            let text = match outcome {
+                ScreenLockOutcome::Done => format!("'{peer_name}' {verb}ed this computer"),
+                ScreenLockOutcome::NotAllowed => format!(
+                    "'{peer_name}' tried to unlock this computer, but remote unlock isn't turned on for it. To allow it, use Allow Remote Unlock in the Continuity menu."
+                ),
+                ScreenLockOutcome::Unsupported => format!("'{peer_name}' asked to {verb} this computer, which isn't supported here"),
+                ScreenLockOutcome::Failed { reason } => format!("Couldn't {verb} this computer for '{peer_name}': {reason}"),
+            };
+            notify(&text);
+        }
+        // No desktop UI sends `RequestScreenLock` (only Android does today).
+        SyncEvent::ScreenLockResult { peer_name, action, outcome, .. } => {
+            tracing::info!("screen {action:?} on '{peer_name}': {outcome:?}");
+        }
+        // Tracked by the Linux "Allow Remote Unlock" menu in `main()`.
+        SyncEvent::UnlockPermissionChanged { .. } => {}
+    }
+}
+
+/// How one engine event changes the Linux "Allow Remote Unlock" menu, if
+/// at all — see `unlock_menu_update`.
+#[cfg(target_os = "linux")]
+enum UnlockMenuUpdate {
+    Permission { peer_id: String, peer_name: String, allowed: bool },
+    /// The device was forgotten, which drops its permission with it (see
+    /// `TrustStore::revoke`).
+    Forget { peer_id: String },
+    /// Reset — every permission is gone (see `TrustStore::clear`).
+    Clear,
+    /// Only who's connected changed.
+    Refresh,
+}
+
+#[cfg(target_os = "linux")]
+impl UnlockMenuUpdate {
+    fn apply(self, permissions: &mut HashMap<String, (String, bool)>) {
+        match self {
+            UnlockMenuUpdate::Permission { peer_id, peer_name, allowed } => {
+                permissions.insert(peer_id, (peer_name, allowed));
+            }
+            UnlockMenuUpdate::Forget { peer_id } => {
+                permissions.remove(&peer_id);
+            }
+            UnlockMenuUpdate::Clear => permissions.clear(),
+            UnlockMenuUpdate::Refresh => {}
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn unlock_menu_update(event: &SyncEvent) -> Option<UnlockMenuUpdate> {
+    match event {
+        SyncEvent::UnlockPermissionChanged { peer_id, peer_name, allowed } => {
+            Some(UnlockMenuUpdate::Permission { peer_id: peer_id.clone(), peer_name: peer_name.clone(), allowed: *allowed })
+        }
+        SyncEvent::WasRevoked { peer_id, .. } => Some(UnlockMenuUpdate::Forget { peer_id: peer_id.clone() }),
+        SyncEvent::WasReset => Some(UnlockMenuUpdate::Clear),
+        SyncEvent::Connected { .. } | SyncEvent::Disconnected { .. } => Some(UnlockMenuUpdate::Refresh),
+        _ => None,
+    }
+}
+
+/// Same rebuild-from-scratch approach as `rebuild_send_menu`, but over
+/// connected devices *and* any device that's allowed while offline (see
+/// where `unlock_submenu` is created), with a checkmark per device.
+#[cfg(target_os = "linux")]
+fn rebuild_unlock_menu(
+    submenu: &Submenu,
+    connected: &HashMap<String, String>,
+    permissions: &HashMap<String, (String, bool)>,
+    target_map: &Arc<Mutex<HashMap<MenuId, String>>>,
+) {
+    while submenu.remove_at(0).is_some() {}
+    let mut map = target_map.lock().unwrap();
+    map.clear();
+
+    let mut entries: Vec<(String, String, bool)> = connected
+        .iter()
+        .map(|(id, name)| (id.clone(), name.clone(), permissions.get(id).is_some_and(|(_, allowed)| *allowed)))
+        .collect();
+    for (id, (name, allowed)) in permissions {
+        if *allowed && !connected.contains_key(id) {
+            entries.push((id.clone(), format!("{name} (offline)"), true));
+        }
+    }
+    if entries.is_empty() {
+        let _ = submenu.append(&MenuItem::new("No device connected", false, None));
+        return;
+    }
+    entries.sort_by(|a, b| a.1.cmp(&b.1));
+    for (id, label, allowed) in entries {
+        let item = CheckMenuItem::new(label, true, allowed, None);
+        map.insert(item.id().clone(), id);
+        let _ = submenu.append(&item);
     }
 }
 
@@ -1016,6 +1220,14 @@ fn start_engine_thread(
                 #[cfg(not(all(feature = "remote-control", any(target_os = "macos", target_os = "windows", target_os = "linux"))))]
                 let remote_control: Arc<dyn continuity_daemon::RemoteControlHost> = Arc::new(continuity_daemon::NoopRemoteControlHost);
 
+                // Remote lock/unlock: Linux only. macOS and Windows have no
+                // supported API for an ordinary app to dismiss their lock
+                // screens, so they answer `Unsupported` instead.
+                #[cfg(target_os = "linux")]
+                let screen_lock: Arc<dyn continuity_daemon::ScreenLockController> = Arc::new(screen_lock_linux::LinuxScreenLock);
+                #[cfg(not(target_os = "linux"))]
+                let screen_lock: Arc<dyn continuity_daemon::ScreenLockController> = Arc::new(continuity_daemon::NoopScreenLockController);
+
                 let config = EngineConfig {
                     identity,
                     device_name,
@@ -1023,6 +1235,7 @@ fn start_engine_thread(
                     clipboard: Arc::new(ArboardClipboard),
                     media,
                     remote_control,
+                    screen_lock,
                     received_files_dir: received_files_dir(&profile),
                 };
                 continuity_daemon::start(config).await

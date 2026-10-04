@@ -33,6 +33,30 @@
             </intent-filter>
         </activity>
 
+        <!-- "Continuity" in every app's share sheet: files (one or many) go
+             to the chosen device(s) as file transfers; shared text or a link
+             goes to that device's clipboard. */* because a single filter
+             can't say "anything with an attachment" — ShareActivity sorts
+             out which it got. Translucent and out of Recents: it's a
+             bottom sheet over whatever app the share started in. -->
+        <activity
+            android:name=".ShareActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:label="@string/share_target_label"
+            android:theme="@style/Theme.Continuity.Share">
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+        </activity>
+
         <service
             android:name=".ContinuityForegroundService"
             android:exported="false"

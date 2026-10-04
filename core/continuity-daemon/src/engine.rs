@@ -2,15 +2,18 @@ use crate::clipboard::ClipboardBackend;
 use crate::events::{EngineCommand, FileTransferDirection, RemoteControlRole, SyncEvent};
 use crate::media::MediaController;
 use crate::remote_control::RemoteControlHost;
+use crate::screen_lock::{ScreenLockController, ScreenLockError};
 use continuity_crypto::{
     content_hash, generate_self_signed, Identity, IncrementalHash, TlsIdentity, TrustStore,
     TrustedDevice,
 };
 use continuity_net::{
     announce_and_identify, connect, peer_from_service_info, read_frame, read_message,
-    start_pairing, write_frame, write_message, Connection, Discovery, Listener, ServiceEvent,
+    start_pairing, write_frame, write_message, Connection, Discovery, FramingError, Listener, ServiceEvent,
 };
-use continuity_proto::{DeviceInfo, Message, NowPlayingInfo, Platform, PROTOCOL_VERSION};
+use continuity_proto::{
+    DeviceInfo, Message, NowPlayingInfo, Platform, ScreenLockAction, ScreenLockOutcome, PROTOCOL_VERSION,
+};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -80,6 +83,10 @@ pub struct EngineConfig {
     pub clipboard: Arc<dyn ClipboardBackend>,
     pub media: Arc<dyn MediaController>,
     pub remote_control: Arc<dyn RemoteControlHost>,
+    /// Acts on `Message::ScreenLockRequest`s from peers — see
+    /// `ScreenLockController`. `NoopScreenLockController` for any shell
+    /// that can't (or shouldn't) be locked/unlocked remotely.
+    pub screen_lock: Arc<dyn ScreenLockController>,
     pub received_files_dir: PathBuf,
 }
 
@@ -235,6 +242,7 @@ struct SharedState {
     clipboard: Arc<dyn ClipboardBackend>,
     media: Arc<dyn MediaController>,
     remote_control: Arc<dyn RemoteControlHost>,
+    screen_lock: Arc<dyn ScreenLockController>,
     /// One entry per peer with a remote-control session in flight or
     /// active — a peer can only ever be in *one* session (either role) at
     /// a time, so keying by `peer_crypto_id` (rather than `session_id`) is
@@ -630,6 +638,7 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
         clipboard: config.clipboard,
         media: config.media,
         remote_control: config.remote_control,
+        screen_lock: config.screen_lock,
         remote_control_sessions: Mutex::new(HashMap::new()),
         pending_remote_control_requests: Mutex::new(HashMap::new()),
         pending_screen_stream_peers: Mutex::new(HashSet::new()),
@@ -641,6 +650,7 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
     });
 
     state.emit(SyncEvent::Listening { port });
+    emit_initial_unlock_permissions(&state);
 
     let mut tasks = Vec::new();
 
@@ -1146,6 +1156,50 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                     EngineCommand::EndRemoteControlSession { peer_crypto_id } => {
                         end_remote_control_session(&state, &peer_crypto_id, None, true);
                     }
+                    EngineCommand::RequestScreenLock { peer_crypto_id, action } => {
+                        if let Some(tx) = state.peer_senders.lock().unwrap().get(&peer_crypto_id) {
+                            let _ = tx.send(Message::ScreenLockRequest { action });
+                        }
+                    }
+                    EngineCommand::SetUnlockAllowed { peer_crypto_id, allowed } => {
+                        let (result, peer_name, now_allowed) = {
+                            let mut trust_store = state.trust_store.lock().unwrap();
+                            let result = trust_store.set_unlock_allowed(&peer_crypto_id, allowed);
+                            let peer_name = trust_store.get(&peer_crypto_id).map(|d| d.name.clone());
+                            (result, peer_name, trust_store.is_unlock_allowed(&peer_crypto_id))
+                        };
+                        if let Err(e) = result {
+                            tracing::warn!("couldn't persist unlock permission for '{peer_crypto_id}': {e}");
+                            state.emit(SyncEvent::Error(format!("Couldn't save the remote unlock setting: {e}")));
+                        }
+                        // Reports what the trust store actually holds now,
+                        // not what was asked for — allowing an unpaired
+                        // peer is refused there, and a failed save above
+                        // shouldn't leave a shell showing a checkmark the
+                        // next restart would quietly drop.
+                        if let Some(peer_name) = peer_name {
+                            if state.screen_lock.is_available() {
+                                state.emit(SyncEvent::UnlockPermissionChanged {
+                                    peer_id: peer_crypto_id,
+                                    peer_name,
+                                    allowed: now_allowed,
+                                });
+                            }
+                        }
+                    }
+                    EngineCommand::SendText { peer_crypto_id, text } => {
+                        if text.is_empty() {
+                            continue;
+                        }
+                        if let Some(tx) = state.peer_senders.lock().unwrap().get(&peer_crypto_id) {
+                            let _ = tx.send(Message::ClipboardUpdate {
+                                origin_device: state.my_device.id.clone(),
+                                content_hash: content_hash(text.as_bytes()),
+                                mime: "text/plain".to_string(),
+                                data: text.into_bytes(),
+                            });
+                        }
+                    }
                 }
             }
         })
@@ -1162,6 +1216,73 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
         tasks,
         state,
     })
+}
+
+/// Tells the shell about every peer already allowed to unlock this device,
+/// right at startup — see `SyncEvent::UnlockPermissionChanged` for why this
+/// can't wait for each one to connect.
+fn emit_initial_unlock_permissions(state: &Arc<SharedState>) {
+    if !state.screen_lock.is_available() {
+        return;
+    }
+    let allowed: Vec<(String, String)> = {
+        let trust_store = state.trust_store.lock().unwrap();
+        trust_store
+            .unlock_allowed_devices()
+            .filter_map(|id| trust_store.get(id).map(|d| (id.clone(), d.name.clone())))
+            .collect()
+    };
+    for (peer_id, peer_name) in allowed {
+        state.emit(SyncEvent::UnlockPermissionChanged { peer_id, peer_name, allowed: true });
+    }
+}
+
+/// Acts on a peer's `ScreenLockRequest` and answers it. Refusals (nothing
+/// to do it with, or unlock not allowed for this peer) are decided right
+/// here; an allowed request runs the controller on the blocking pool,
+/// since it makes synchronous D-Bus calls and then waits to see whether
+/// the lock screen actually responded — none of which can hold up this
+/// connection's reader loop.
+fn handle_screen_lock_request(state: &Arc<SharedState>, peer: &DeviceInfo, action: ScreenLockAction) {
+    let refusal = if !state.screen_lock.is_available() {
+        Some(ScreenLockOutcome::Unsupported)
+    } else if action == ScreenLockAction::Unlock && !state.trust_store.lock().unwrap().is_unlock_allowed(&peer.id) {
+        Some(ScreenLockOutcome::NotAllowed)
+    } else {
+        None
+    };
+    if let Some(outcome) = refusal {
+        finish_screen_lock_request(state, peer, action, outcome);
+        return;
+    }
+
+    let state = state.clone();
+    let peer = peer.clone();
+    tokio::spawn(async move {
+        let controller = state.screen_lock.clone();
+        let result = tokio::task::spawn_blocking(move || match action {
+            ScreenLockAction::Lock => controller.lock(),
+            ScreenLockAction::Unlock => controller.unlock(),
+        })
+        .await;
+        let outcome = match result {
+            Ok(Ok(())) => ScreenLockOutcome::Done,
+            Ok(Err(ScreenLockError::Unsupported(reason))) => {
+                tracing::debug!("screen {action:?} for '{}' unsupported: {reason}", peer.name);
+                ScreenLockOutcome::Unsupported
+            }
+            Ok(Err(ScreenLockError::Failed(reason))) => ScreenLockOutcome::Failed { reason },
+            Err(e) => ScreenLockOutcome::Failed { reason: format!("the {action:?} attempt crashed: {e}") },
+        };
+        finish_screen_lock_request(&state, &peer, action, outcome);
+    });
+}
+
+fn finish_screen_lock_request(state: &Arc<SharedState>, peer: &DeviceInfo, action: ScreenLockAction, outcome: ScreenLockOutcome) {
+    if let Some(tx) = state.peer_senders.lock().unwrap().get(&peer.id) {
+        let _ = tx.send(Message::ScreenLockResult { action, outcome: outcome.clone() });
+    }
+    state.emit(SyncEvent::ScreenLockRequested { peer_id: peer.id.clone(), peer_name: peer.name.clone(), action, outcome });
 }
 
 async fn handle_connection(
@@ -1253,6 +1374,10 @@ async fn handle_connection_inner(
     };
 
     state.emit(SyncEvent::Connected { peer: peer.clone() });
+    if state.screen_lock.is_available() {
+        let allowed = state.trust_store.lock().unwrap().is_unlock_allowed(&peer.id);
+        state.emit(SyncEvent::UnlockPermissionChanged { peer_id: peer.id.clone(), peer_name: peer.name.clone(), allowed });
+    }
 
     let (mut read_half, mut write_half) = tokio::io::split(conn);
     let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
@@ -1503,7 +1628,28 @@ async fn handle_connection_inner(
                     // than treated as fatal.
                     tracing::debug!("ignoring ScreenStreamHandshake on the mesh connection from '{}'", peer.name);
                 }
+                Ok(Message::ScreenLockRequest { action }) => {
+                    handle_screen_lock_request(state, &peer, action);
+                }
+                Ok(Message::ScreenLockResult { action, outcome }) => {
+                    state.emit(SyncEvent::ScreenLockResult {
+                        peer_id: peer.id.clone(),
+                        peer_name: peer.name.clone(),
+                        action,
+                        outcome,
+                    });
+                }
                 Ok(other) => tracing::debug!("ignoring unhandled message from '{}': {other:?}", peer.name),
+                // A well-framed message this version can't parse — almost
+                // always a message type from a newer peer. The length
+                // prefix means the whole payload is already consumed, so
+                // the stream is still in sync; skipping it here (instead
+                // of the old blanket `break`) is what lets a newer peer
+                // add message types without disconnecting every older
+                // peer that receives one (see `PROTOCOL_VERSION`).
+                Err(FramingError::Json(e)) => {
+                    tracing::debug!("skipping a message from '{}' this version doesn't understand: {e}", peer.name);
+                }
                 Err(_) => break,
             }
         }

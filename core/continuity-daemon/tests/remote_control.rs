@@ -61,6 +61,15 @@ impl RemoteControlHost for FakeRemoteControlHost {
                 seq += 1;
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
+            // Go quiet but keep `tx` alive until `stop_capture`. Letting it
+            // drop here closes the stream, which the engine rightly reads
+            // as capture having ended and tears the session down on its
+            // own — racing the explicit end this test checks for, and
+            // failing whenever the self-end happened to land while an
+            // earlier step was still draining B's events.
+            while capturing.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
         });
         Some(rx)
     }
@@ -92,6 +101,7 @@ async fn make_engine(
         clipboard: Arc::new(NoopClipboard),
         media: Arc::new(NoopMediaController) as Arc<dyn MediaController>,
         remote_control,
+        screen_lock: Arc::new(continuity_daemon::NoopScreenLockController),
         received_files_dir: dir,
     };
     continuity_daemon::start(config).await

@@ -112,6 +112,25 @@ mod tests {
         assert!(matches!(err, FramingError::Closed));
     }
 
+    /// What makes it safe for a reader to *skip* a `FramingError::Json`
+    /// rather than drop the connection (see `PROTOCOL_VERSION` in
+    /// continuity-proto): the length prefix means the whole unparseable
+    /// payload has already been consumed by the time parsing fails, so
+    /// the very next read starts cleanly at the following message.
+    #[tokio::test]
+    async fn an_unknown_message_type_leaves_the_stream_in_sync() {
+        let (mut a, mut b) = tokio::io::duplex(4096);
+
+        let unknown = br#"{"type":"some_future_message","field":1}"#;
+        a.write_all(&(unknown.len() as u32).to_be_bytes()).await.unwrap();
+        a.write_all(unknown).await.unwrap();
+        write_message(&mut a, &Message::Ping).await.unwrap();
+
+        let err = read_message(&mut b).await.unwrap_err();
+        assert!(matches!(err, FramingError::Json(_)), "expected a JSON error, got {err:?}");
+        assert!(matches!(read_message(&mut b).await.unwrap(), Message::Ping));
+    }
+
     #[tokio::test]
     async fn frame_bytes_round_trip_over_an_in_memory_duplex_stream() {
         let (mut a, mut b) = tokio::io::duplex(4096);

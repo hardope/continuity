@@ -26,5 +26,24 @@
          the status-bar icon continuityd itself creates. -->
     <key>LSUIElement</key>
     <true/>
+    <!-- Puts Continuity in Finder's right-click "Open With" menu for any
+         file, which hands the file to the running app to send to a device
+         (see core/continuityd/src/share.rs). "Alternate" rank: listed, but
+         never chosen as any file type's default app. -->
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>Any file</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>public.data</string>
+            </array>
+        </dict>
+    </array>
 </dict>
 </plist>

@@ -29,6 +29,11 @@ struct TrustFile {
     /// failing to load.
     #[serde(default)]
     remote_control_allowed: std::collections::HashSet<String>,
+    /// Peers allowed to unlock this device's screen — see
+    /// `TrustStore::set_unlock_allowed`. `#[serde(default)]` for the same
+    /// reason as `remote_control_allowed`.
+    #[serde(default)]
+    unlock_allowed: std::collections::HashSet<String>,
 }
 
 /// The set of paired devices this one accepts connections from — the whole
@@ -86,6 +91,7 @@ impl TrustStore {
     pub fn revoke(&mut self, device_id: &str) -> Result<(), TrustError> {
         self.file.devices.remove(device_id);
         self.file.remote_control_allowed.remove(device_id);
+        self.file.unlock_allowed.remove(device_id);
         self.save()
     }
 
@@ -94,6 +100,7 @@ impl TrustStore {
     pub fn clear(&mut self) -> Result<(), TrustError> {
         self.file.devices.clear();
         self.file.remote_control_allowed.clear();
+        self.file.unlock_allowed.clear();
         self.save()
     }
 
@@ -119,6 +126,38 @@ impl TrustStore {
     /// a device forgets everything about it, including this.
     pub fn allow_remote_control(&mut self, device_id: &str) -> Result<(), TrustError> {
         self.file.remote_control_allowed.insert(device_id.to_string());
+        self.save()
+    }
+
+    /// Whether this peer may unlock this device's screen remotely — `false`
+    /// unless the local user has explicitly turned it on for this exact
+    /// peer via `set_unlock_allowed`.
+    pub fn is_unlock_allowed(&self, device_id: &str) -> bool {
+        self.file.unlock_allowed.contains(device_id)
+    }
+
+    /// Ids of every peer currently allowed to unlock this device.
+    pub fn unlock_allowed_devices(&self) -> impl Iterator<Item = &String> {
+        self.file.unlock_allowed.iter()
+    }
+
+    /// Turns remote unlock on or off for one paired peer. Off by default and
+    /// never implied by anything else — not by pairing, and not by remote
+    /// control consent: unlocking skips this device's own password
+    /// entirely, so it needs its own explicit, local opt-in (the host
+    /// shell should confirm before turning it on). Like remote control
+    /// trust, `revoke`/`clear` drop it too. Allowing a peer that isn't
+    /// paired is refused rather than stored, so a stale grant can never
+    /// outlive the pairing it was given under.
+    pub fn set_unlock_allowed(&mut self, device_id: &str, allowed: bool) -> Result<(), TrustError> {
+        if allowed {
+            if !self.is_trusted(device_id) {
+                return Ok(());
+            }
+            self.file.unlock_allowed.insert(device_id.to_string());
+        } else {
+            self.file.unlock_allowed.remove(device_id);
+        }
         self.save()
     }
 
@@ -208,6 +247,43 @@ mod tests {
 
         store.revoke("abc123").unwrap();
         assert!(!store.is_remote_control_allowed("abc123"), "forgetting a device should forget its remote-control trust too");
+    }
+
+    #[test]
+    fn unlock_permission_is_opt_in_per_peer_persists_and_is_cleared_on_revoke() {
+        let (mut store, dir) = temp_store();
+        let path = store_path(&store);
+        store
+            .trust(TrustedDevice { id: "abc123".into(), name: "Test Pixel".into(), paired_at_unix: 1 })
+            .unwrap();
+        store
+            .trust(TrustedDevice { id: "def456".into(), name: "Test iPhone".into(), paired_at_unix: 2 })
+            .unwrap();
+        assert!(!store.is_unlock_allowed("abc123"), "off until explicitly allowed");
+        store.allow_remote_control("abc123").unwrap();
+        assert!(!store.is_unlock_allowed("abc123"), "remote control consent must not imply unlock");
+
+        store.set_unlock_allowed("abc123", true).unwrap();
+        assert!(store.is_unlock_allowed("abc123"));
+        assert!(!store.is_unlock_allowed("def456"), "allowing one peer shouldn't allow another");
+
+        let mut reloaded = TrustStore::load(path).unwrap();
+        assert!(reloaded.is_unlock_allowed("abc123"));
+
+        reloaded.set_unlock_allowed("abc123", false).unwrap();
+        assert!(!reloaded.is_unlock_allowed("abc123"));
+
+        reloaded.set_unlock_allowed("def456", true).unwrap();
+        reloaded.revoke("def456").unwrap();
+        assert!(!reloaded.is_unlock_allowed("def456"), "forgetting a device should forget its unlock permission too");
+        drop(dir);
+    }
+
+    #[test]
+    fn unlock_cannot_be_allowed_for_an_unpaired_device() {
+        let (mut store, _dir) = temp_store();
+        store.set_unlock_allowed("stranger", true).unwrap();
+        assert!(!store.is_unlock_allowed("stranger"));
     }
 
     fn store_path(store: &TrustStore) -> PathBuf {

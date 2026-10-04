@@ -2,6 +2,44 @@
 
 All notable user-facing changes to Continuity are documented here.
 
+## [Unreleased]
+
+### Added
+
+- **A page for every device on Android.** Tap a device to open it: the full
+  media player (usable even when nothing is playing — play resumes whatever
+  was last playing), send files, remote control, lock/unlock, disconnect and
+  forget, all in one place. The device list shows a now-playing line and a
+  quick play/pause (or Reconnect) button per device, and a banner when
+  syncing is paused.
+- **Remote lock and unlock (Linux).** Lock or unlock a Linux desktop from
+  its page on Android. Unlock is off for every device until you turn it on
+  for that device from the computer's tray menu (**Allow Remote Unlock**,
+  which asks you to confirm), and the computer notifies you every time it's
+  locked or unlocked remotely, or someone tries without permission. Works
+  with GNOME and KDE Plasma lock screens. Not available on macOS or Windows,
+  which have no supported way for an app to do this.
+- **Share to your devices.** On Android, Continuity appears in every app's
+  share sheet: pick a device, or all of them. Files are sent as usual;
+  shared text and links land on that device's clipboard. On the desktop,
+  send files from the file manager: right-click → Send to on Windows,
+  Files/Dolphin/Nemo right-click entries on Linux (one per connected
+  device, present only while Continuity is running), and Open With →
+  Continuity on macOS.
+- Send several files at once from the Android app's own file picker.
+
+### Fixed
+
+- **Newer and older versions no longer disconnect each other over new
+  features.** A device used to drop the whole connection when it received a
+  message type it didn't recognize; it now skips it. (This protects
+  connections from this version on — an older version still disconnects,
+  so new features are only offered to devices that support them.)
+- **Android: the device list no longer comes back empty** after leaving the
+  app and reopening it while Continuity kept running in the background.
+- **Android: picking a large file to send no longer freezes the app** while
+  it's being prepared.
+
 ## [0.1.5] - 2026-09-10
 
 The first stable release since 0.1.4 — nineteen betas' worth of work, mainly

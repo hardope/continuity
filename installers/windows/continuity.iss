@@ -83,6 +83,10 @@ Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName} now"; Flags
 ; (not just the `config` subfolder) is safe and complete.
 [UninstallDelete]
 Type: filesandordirs; Name: "{userappdata}\continuity"
+; The per-device "Send to" shortcuts continuityd creates while it's running
+; (core/continuityd/src/share.rs) — normally removed when it quits, but not
+; if it was killed or crashed instead.
+Type: files; Name: "{usersendto}\Continuity - *.lnk"
 
 [UninstallRun]
 ; cmdkey exits non-zero if the credential doesn't exist (e.g. the app was

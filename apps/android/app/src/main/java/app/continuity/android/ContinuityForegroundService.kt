@@ -49,6 +49,9 @@ class ContinuityForegroundService : Service() {
         // of time, and Service.onCreate() runs on the main thread, so
         // calling it inline here freezes the whole app (no ANR crash, just
         // a silently frozen UI) until it finishes. Off the main thread instead.
+        // Staged copies of files sent earlier (see OutgoingFiles) — kept a
+        // day in case a send was still waiting on the other side to accept.
+        serviceScope.launch { OutgoingFiles.deleteStale(this@ContinuityForegroundService) }
         serviceScope.launch {
             try {
                 startEngine()
@@ -62,7 +65,7 @@ class ContinuityForegroundService : Service() {
                 // launches and immediately closes" with no indication why.
                 // Surface it as a normal in-app error instead.
                 android.util.Log.e("ContinuityService", "engine startup failed", e)
-                EngineHolder.events.tryEmit(
+                ContinuityStore.onEvent(
                     FfiSyncEvent.Error("Couldn't start Continuity: ${e.message ?: e.javaClass.simpleName}"),
                 )
             }
@@ -91,16 +94,11 @@ class ContinuityForegroundService : Service() {
         val deviceName = SecureIdentity.deviceName(this)
         val receivedDir = (getExternalFilesDir("Continuity") ?: filesDir).also { it.mkdirs() }
 
-        // Set before starting the engine, not after — `ContinuityEngine.start`
-        // doesn't return until its background thread is fully up, by which
-        // point it may have already emitted (and a collector already
-        // consumed) the first `Listening` event. Reading deviceId reactively
-        // inside that event's handling would race against this assignment.
-        EngineHolder.deviceId = uniffi.continuity_ffi.deviceIdFor(identityDer)
+        ContinuityStore.setDeviceId(uniffi.continuity_ffi.deviceIdFor(identityDer))
 
         val listener = object : EventListener {
             override fun onEvent(event: FfiSyncEvent) {
-                EngineHolder.events.tryEmit(event)
+                ContinuityStore.onEvent(event)
                 notifyForEvent(event)
             }
         }
@@ -217,6 +215,12 @@ class ContinuityForegroundService : Service() {
             is FfiSyncEvent.RemoteControlSessionStarted,
             is FfiSyncEvent.RemoteControlSessionEnded,
             is FfiSyncEvent.ScreenFrameReceived,
+            // The answer to a lock/unlock tapped in the app a moment ago —
+            // shown in-app (see ContinuityStore). The other two are only
+            // ever about this device being unlocked, which a phone never is.
+            is FfiSyncEvent.ScreenLockResult,
+            is FfiSyncEvent.ScreenLockRequested,
+            is FfiSyncEvent.UnlockPermissionChanged,
             -> return
         }
 

@@ -10,6 +10,7 @@ mod engine;
 mod events;
 mod media;
 mod remote_control;
+mod screen_lock;
 
 pub use clipboard::ClipboardBackend;
 #[cfg(feature = "arboard-clipboard")]
@@ -18,6 +19,7 @@ pub use engine::{start, EngineConfig, EngineHandle};
 pub use events::{EngineCommand, FileTransferDirection, RemoteControlRole, SyncEvent};
 pub use media::{MediaController, NoopMediaController};
 pub use remote_control::{NoopRemoteControlHost, RemoteControlHost};
+pub use screen_lock::{NoopScreenLockController, ScreenLockController, ScreenLockError};
 
 pub fn default_device_name() -> String {
     hostname::get()

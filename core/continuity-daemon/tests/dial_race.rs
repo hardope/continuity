@@ -51,6 +51,7 @@ async fn make_engine(name: &str, identity: Identity, peer_id: &str, peer_name: &
         clipboard: Arc::new(NoopClipboard),
         media: Arc::new(NoopMediaController) as Arc<dyn MediaController>,
         remote_control: Arc::new(continuity_daemon::NoopRemoteControlHost),
+        screen_lock: Arc::new(continuity_daemon::NoopScreenLockController),
         received_files_dir: dir,
     };
     continuity_daemon::start(config).await

@@ -54,6 +54,14 @@ directories = "5"
 tray-icon = "0.24"
 tao = "0.34"
 notify-rust = "4"
+# `share.rs`'s hand-off between `continuityd --share-to` (what the file
+# manager's "Send with Continuity" entries run) and the already-running
+# instance: a one-line JSON request over loopback, authenticated with a
+# random token. All three are already in the dependency tree; listed
+# directly for the derive macros, the JSON codec, and the token.
+serde = { workspace = true }
+serde_json = { workspace = true }
+rand = "0.8"
 # Both power the remote-control *viewer* window (any desktop platform can
 # be the controlling side, not just macOS/Windows — those two are just
 # the only ones that can currently be the *controlled* side, which is
@@ -125,6 +133,9 @@ windows = { version = "0.58", features = [
     "Win32_Graphics_Gdi",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_HiDpi",
+    # IShellLinkW — share.rs writes Explorer "Send to" shortcuts, one per
+    # connected device.
+    "Win32_UI_Shell",
 ] }
 
 # MPRIS media control/reads over D-Bus — see src/media_linux.rs. Also
@@ -155,7 +166,8 @@ rfd = { version = "0.15", default-features = false, features = ["gtk3"] }
 # not something zbus itself re-exports a combinator for).
 futures-util = "0.3"
 pipewire = "0.8"
-# `call_portal_method`'s generic bound (`B: serde::Serialize + ...`) names
-# `serde` directly — already pulled in transitively via zbus/continuity-proto,
-# but a trait bound needs the crate declared here to resolve `serde::` at all.
-serde = "1"
+# getuid() for screen_lock_linux.rs's fallback lookup of this user's
+# logind display session. (`serde`, which remote_control_linux.rs's
+# `call_portal_method` bound names directly, is now an all-platform
+# dependency above.)
+libc = "0.2"

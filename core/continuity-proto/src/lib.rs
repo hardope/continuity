@@ -33,7 +33,15 @@ mod b64 {
 /// `DeviceAnnounce` / mDNS TXT records and should refuse to pair on mismatch
 /// once the protocol leaves v1 (v1 stays permissive while things are still
 /// moving).
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// **v2** adds `ScreenLockRequest`/`ScreenLockResult`, and — more
+/// importantly for every future addition — a v2 peer skips a message type
+/// it doesn't recognize instead of dropping the whole connection over it.
+/// A v1 peer still does drop it (its reader treats any parse failure as
+/// fatal), so a sender should only send a message newer than v1 to a peer
+/// that announced `protocol_version >= 2` — that's what the version number
+/// is actually for now, a capability check rather than a pairing gate.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Hex-encoded Ed25519 public key. This is the device's permanent identity.
 pub type DeviceId = String;
@@ -186,6 +194,39 @@ pub enum Message {
     /// write_frame`/`read_frame` for the leaner raw-bytes framing the
     /// video path uses instead, once this handshake completes.
     ScreenStreamHandshake { session_id: String },
+
+    /// Asks the receiving device to lock or unlock its own screen (v2+,
+    /// see `PROTOCOL_VERSION`). Unlike remote control there's no prompt on
+    /// the receiving side at request time — for unlock, by definition,
+    /// nobody's there to answer one. Consent is given ahead of time
+    /// instead: the receiving device's user explicitly allows unlock for
+    /// this specific peer (see `TrustStore::set_unlock_allowed` in
+    /// continuity-crypto), and it's off by default. Lock needs no such
+    /// grant — any paired peer can lock the screen, since that only ever
+    /// makes the device *more* secure.
+    ScreenLockRequest { action: ScreenLockAction },
+    /// The receiving device's answer to a `ScreenLockRequest`, sent once
+    /// the action has actually been attempted (or refused).
+    ScreenLockResult { action: ScreenLockAction, outcome: ScreenLockOutcome },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScreenLockAction {
+    Lock,
+    Unlock,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ScreenLockOutcome {
+    Done,
+    /// The receiving device's user hasn't allowed this peer to unlock it.
+    NotAllowed,
+    /// The receiving platform has no supported way to do this at all
+    /// (today: everything except Linux with a systemd-logind session).
+    Unsupported,
+    Failed { reason: String },
 }
 
 /// One remote-control input event, carried by `Message::InputEvent`.
@@ -300,5 +341,31 @@ mod tests {
             Message::ClipboardUpdate { mime, .. } => assert_eq!(mime, "text/plain"),
             other => panic!("unexpected variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn screen_lock_messages_round_trip_through_json() {
+        let msg = Message::ScreenLockResult {
+            action: ScreenLockAction::Unlock,
+            outcome: ScreenLockOutcome::Failed { reason: "nope".into() },
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        let back: Message = serde_json::from_str(&json).expect("deserialize");
+        match back {
+            Message::ScreenLockResult { action, outcome } => {
+                assert_eq!(action, ScreenLockAction::Unlock);
+                assert_eq!(outcome, ScreenLockOutcome::Failed { reason: "nope".into() });
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    /// Pins down *why* the engine's reader has to treat a parse failure as
+    /// skippable rather than fatal (see `PROTOCOL_VERSION`): a message type
+    /// added in a newer version is simply an error to an older `Message`.
+    #[test]
+    fn an_unknown_message_type_is_a_parse_error_not_a_panic() {
+        let result = serde_json::from_str::<Message>(r#"{"type":"some_future_message","field":1}"#);
+        assert!(result.is_err());
     }
 }

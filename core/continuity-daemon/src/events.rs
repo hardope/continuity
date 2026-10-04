@@ -1,4 +1,4 @@
-use continuity_proto::{DeviceInfo, InputEventKind, MediaCommand, NowPlayingInfo};
+use continuity_proto::{DeviceInfo, InputEventKind, MediaCommand, NowPlayingInfo, ScreenLockAction, ScreenLockOutcome};
 
 /// Which side of an active remote-control session this device is on —
 /// tells a shell which UI to show: `Controlling` gets the live screen
@@ -138,6 +138,24 @@ pub enum SyncEvent {
     /// "arrives over one TCP connection," so a shell should just always
     /// show the latest one, not queue a backlog.
     ScreenFrameReceived { peer_id: String, session_id: String, frame: Vec<u8> },
+    /// The answer to this device's own `EngineCommand::RequestScreenLock`.
+    ScreenLockResult { peer_id: String, peer_name: String, action: ScreenLockAction, outcome: ScreenLockOutcome },
+    /// A peer asked to lock or unlock *this* device's screen, and this is
+    /// what happened — emitted for refusals too, not just successes. A
+    /// shell should always tell the local user about an unlock (it's the
+    /// one thing here that happens without anyone at this device saying
+    /// yes in the moment), and especially about a refused one, which is
+    /// either a peer that needs to be allowed first or someone trying
+    /// something they shouldn't.
+    ScreenLockRequested { peer_id: String, peer_name: String, action: ScreenLockAction, outcome: ScreenLockOutcome },
+    /// Current remote-unlock permission for one paired peer — emitted once
+    /// per already-allowed peer at startup (so a shell can list, and turn
+    /// off, a permission for a device that isn't even connected right
+    /// now, e.g. a lost phone), on every `Connected`, and after every
+    /// `EngineCommand::SetUnlockAllowed`. Only emitted at all when this
+    /// device's `ScreenLockController` is available, since there's
+    /// nothing to allow otherwise.
+    UnlockPermissionChanged { peer_id: String, peer_name: String, allowed: bool },
 }
 
 /// Requests a shell makes of the engine. Sent over the channel returned by
@@ -231,4 +249,21 @@ pub enum EngineCommand {
     /// side revoking access mid-session both go through this same
     /// command. A no-op if no session is active with that peer.
     EndRemoteControlSession { peer_crypto_id: String },
+    /// Asks `peer_crypto_id` to lock or unlock its screen. The answer
+    /// comes back as `SyncEvent::ScreenLockResult`. Only send this to a
+    /// peer that announced `protocol_version >= 2` — a v1 peer doesn't
+    /// know this message and drops the connection on it (see
+    /// `continuity_proto::PROTOCOL_VERSION`); the engine itself doesn't
+    /// guard against that, a shell decides which buttons to show.
+    RequestScreenLock { peer_crypto_id: String, action: ScreenLockAction },
+    /// Turns remote unlock of *this* device on or off for one paired peer
+    /// (see `TrustStore::set_unlock_allowed`). The shell is responsible for
+    /// confirming with the local user before turning it on.
+    SetUnlockAllowed { peer_crypto_id: String, allowed: bool },
+    /// Puts `text` on one peer's clipboard — a targeted, one-off version of
+    /// the clipboard sync that normally broadcasts to everyone, for
+    /// "share this text to that device" (a link shared from a phone's
+    /// share sheet, say). Goes out as an ordinary `ClipboardUpdate`, so
+    /// even a v1 peer understands it.
+    SendText { peer_crypto_id: String, text: String },
 }
