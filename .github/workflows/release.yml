@@ -233,7 +233,12 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - uses: android-actions/setup-android@v3
+      # v4, not v3: v3 always installs the SDK's old `tools` package, which
+      # Google stopped serving in September 2026 — every v3 run now fails
+      # with "Failed to find package 'tools'" before anything is built.
+      # v4 dropped it from its defaults and exports the same
+      # ANDROID_SDK_ROOT/ANDROID_HOME and sdkmanager PATH the steps below use.
+      - uses: android-actions/setup-android@v4
 
       - name: Install NDK
         run: sdkmanager --install "ndk;27.0.12077973"
