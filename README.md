@@ -1,73 +1,159 @@
-# Continuity
+<p align="center">
+  <img src="assets/logo.svg" width="88" height="88" alt="">
+</p>
 
-[![Release](https://github.com/hardope/continuity/actions/workflows/release.yml/badge.svg)](https://github.com/hardope/continuity/actions/workflows/release.yml)
+<h1 align="center">Continuity</h1>
 
-Clipboard sync, file sharing, media control, and full remote control (keyboard, mouse and screen) across macOS, Windows, Linux, Android, and iOS — the gap Apple's own Continuity leaves at the edge of its own ecosystem, without a cloud relay or an account system. Every paired device talks directly to every other paired device on the local network (mesh, not hub-and-spoke); pairing is trust-on-first-use with a human-verified confirmation code, the same trust model SSH host keys use.
+<p align="center">
+  Clipboard, files, media and full remote control across macOS, Windows, Linux and Android —<br>
+  directly over your own network. No cloud, no account.
+</p>
+
+<p align="center">
+  <a href="https://github.com/hardope/continuity/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/hardope/continuity"></a>
+  <a href="https://github.com/hardope/continuity/actions/workflows/release.yml"><img alt="Release build" src="https://github.com/hardope/continuity/actions/workflows/release.yml/badge.svg"></a>
+  <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-blue"></a>
+</p>
+
+Continuity fills the gap Apple's own Continuity leaves at the edge of its ecosystem. Copy on one device and paste on another, send files, control what's playing on a computer from your phone, or take over a computer's keyboard, mouse and screen — between any mix of Macs, PCs, Linux machines and Android phones. Every paired device talks directly to every other one on the local network: nothing passes through a server, and there's no account to make.
+
+## Screenshots
+
+**macOS** — the settings window, and its ⓘ panel before and after granting what remote control needs:
+
+<p align="center">
+  <img src="docs/screenshots/macos-settings.png" width="760" alt="The settings window on macOS: this Mac's page, with its paired computers and phone and their connection status in the sidebar">
+</p>
+<table>
+  <tr>
+    <td><img src="docs/screenshots/macos-permissions-needed.png" width="400" alt="The ⓘ panel on macOS with Screen Recording and Accessibility not yet granted, each with a Grant… button, and where to find them in System Settings"></td>
+    <td><img src="docs/screenshots/macos-permissions-granted.png" width="400" alt="The same panel with both permissions allowed"></td>
+  </tr>
+</table>
+
+**Windows** and **Linux** — the same window in the system's own web view, styled for each:
+
+<table>
+  <tr>
+    <td><img src="docs/screenshots/windows-settings.png" width="400" alt="The settings window on Windows: this PC's page, with a Mac, a MacBook Pro and a phone nearby, ready to pair"></td>
+    <td><img src="docs/screenshots/linux-settings.png" width="400" alt="The settings window on Ubuntu: this computer's page, with two Macs and a phone connected"></td>
+  </tr>
+  <tr>
+    <td align="center">Windows</td>
+    <td align="center">Linux (Ubuntu)</td>
+  </tr>
+</table>
+<p align="center">
+  <img src="docs/screenshots/linux-about.png" width="560" alt="The ⓘ panel on Linux: the version, how remote control and remote unlock work on Linux, and tips">
+</p>
+
+**Android** — your devices, and one device's page: its actions, and a player for whatever it's playing, all on one screen:
+
+<p align="center">
+  <img src="docs/screenshots/android-devices.jpg" width="280" alt="The Android app's device list: two Macs, one of them playing music with a pause button beside it, and a computer nearby to connect to">
+  &nbsp;&nbsp;
+  <img src="docs/screenshots/android-device-page.jpg" width="280" alt="A Mac's page in the Android app: Send files, Control and Lock, then the track playing on the Mac with seek, previous, pause, next and volume">
+</p>
+
+## What it does
+
+- **Clipboard** — copy text on one device and paste it on any other; each copy goes to every connected device.
+- **Files** — send from a device's page (in the settings window or on your phone), from the tray menu, from your file manager — right-click → Send to on Windows, a Send with Continuity entry in Files, Dolphin and Nemo on Linux, Open With → Continuity in Finder — or from any Android app's share sheet. They arrive in `Downloads/Continuity`.
+- **Media** — see what's playing on a computer and control it from your phone: play and pause, previous and next, seek, volume, with the artwork, title and artist.
+- **Remote control** — use a computer's keyboard and mouse, and see its screen, from your phone. The computer asks you first, unless you've told it to trust that device.
+- **Lock and unlock** — lock any of your computers from your phone. A Linux computer can be unlocked too, once you've allowed that phone to.
+- **A settings window** — tray menu → **Settings…** on every desktop: paired and nearby devices, pairing, sending files, what each device is allowed to do, pausing sync, and an **ⓘ** panel with what Continuity has done since it started and what remote control needs on that computer.
+- **Private by design** — devices find each other with mDNS and talk directly over TLS 1.3 with mutual authentication. Pairing is trust-on-first-use, confirmed by comparing a 6-digit code on both screens — the same trust model as SSH host keys.
+
+## Download
+
+Get the file for each device from the [latest release](https://github.com/hardope/continuity/releases/latest):
+
+| | File | Install | Needs |
+|---|---|---|---|
+| **macOS** | `continuity-macos.dmg` | Open it and drag Continuity to Applications. | macOS 11 or later, Apple silicon or Intel. The settings window needs macOS 12. |
+| **Windows** | `continuity-windows-setup.exe` | Run it: Start menu entry, starts at sign-in, uninstalls cleanly. | Windows 10 or 11, 64-bit. On Windows 10 the settings window needs the [WebView2 Runtime](https://go.microsoft.com/fwlink/p/?LinkId=2124703) (Windows 11 has it). |
+| **Linux** | `continuity-linux.deb` | `sudo apt install ./continuity-linux.deb` (it installs the libraries it needs), then run `continuityd`. | Ubuntu 24.04 or Debian 13 or later, x86-64. |
+| **Android** | `continuity-android.apk` | Open it on the phone, allowing installs from unknown sources. | Android 8 or later. |
+
+Nothing is signed with a paid certificate yet, so expect one warning the first time. On **macOS** the app is ad-hoc signed but not notarized: right-click Continuity → **Open** (on macOS 15 and later: System Settings → Privacy & Security → **Open Anyway**). On **Windows**, SmartScreen: **More info** → **Run anyway**.
+
+Continuity lives in the menu bar or system tray. Windows 11 often hides a new tray icon behind the **^** overflow — drag it onto the taskbar to keep it in view. On GNOME the tray icon needs AppIndicator support: Ubuntu has it built in; elsewhere, install the AppIndicator extension.
+
+## Getting started
+
+1. Install Continuity on each device and put them on the same network.
+2. On a computer, open the tray icon → **Settings…**; on the phone, open the app.
+3. Pick the other device under **Nearby** and pair. Both screens show a 6-digit code — confirm on each only if they match. Pairing is always a deliberate step: nothing pairs on its own.
+4. From then on, paired devices reconnect by themselves. Copy something to try the clipboard, or open a device's page to send files, control its music, lock it or take over its screen.
+
+## What remote control needs
+
+- **macOS** — two permissions: **Screen Recording** (otherwise the phone sees only the wallpaper) and **Accessibility** (keyboard and mouse, and your phone's play, pause and skip buttons). **Settings…** → **ⓘ** shows whether each is on, with a **Grant…** button that asks for it and opens the right page of System Settings. macOS applies Screen Recording after Continuity restarts. On macOS 15 and later, also allow Local Network access when asked, or Continuity can't find your devices.
+- **Windows** — nothing to set up. Windows doesn't let one app type into another running as administrator, or into a UAC prompt, so those stay view-only. If your devices can't find the PC, allow Continuity through Windows Defender Firewall on private networks.
+- **Linux** — through the desktop's screen-sharing portal (GNOME and KDE, including Wayland). The first time, the desktop asks you to share the screen: choose it and allow it, and where the desktop supports it, it remembers. Remote unlock works with GNOME's and KDE Plasma's lock screens (some standalone lockers, like swaylock, ignore it) and is off until you allow it for a device.
+- **Every computer** asks before a device takes control, unless you've switched on **Control this computer without asking** for that device in the settings window.
 
 ## Status
 
-| Platform | Status |
-|---|---|
-| macOS / Windows / Linux (`continuityd`) | Core protocol (pairing, clipboard sync, file transfer) verified on macOS and Windows. `continuityd` is tray-icon-only by design (no main window) — on Windows 11, new tray icons often land behind the "^" overflow chevron rather than showing directly. The tray menu has **Nearby Devices** (untrusted devices seen on the network — connecting is manual, on purpose, see below), **Refresh Nearby Devices** (retries any disconnected trusted peer with a cached address; also runs automatically every 45s, and immediately on a detected network change), **Pause Syncing**, **Reset...** (forgets every paired device, confirmed with a dialog first — see [`docs/protocol.md`](docs/protocol.md)), and **Quit**. Ships packaged per platform: macOS as a `.dmg` (universal Intel + Apple Silicon `.app`, ad-hoc signed — an earlier build was Apple-Silicon-only and unsigned, which failed outright on both an Intel Mac and an M1 Mac; fixed but not yet re-confirmed on real hardware), Windows as an installer, Linux as a `.deb`. Linux builds clean in CI but hasn't been run on real hardware yet. Connections no longer sit silently "connected" forever after a wifi drop/sleep — an active ping plus an OS-level `SO_KEEPALIVE` detect a dead connection within a few minutes and free it up to auto-reconnect; a dropped mDNS daemon or a Wi-Fi/VPN change now recovers and retries on their own instead of needing an app restart (see `docs/protocol.md#connection-liveness`). Auto-pairing popups for every device on the network are gone — pairing with a new device is now always a deliberate click from Nearby Devices. Windows installer now cleans up the trust store and stored identity credential on uninstall (previously left behind, needing manual removal). |
-| Android | Core protocol verified — real pairing and bidirectional clipboard sync confirmed against a desktop instance. Outbound sync only runs while the app is in the foreground (Android 10+ blocks background clipboard reads, a platform restriction — see `docs/protocol.md`). Has the same Pause/Reset/Quit/Refresh controls as desktop, in the app's overflow menu, plus a Nearby Devices list mirroring desktop's. The device list shows "Active Ns/Nm/Nh ago" per connected peer instead of a bare Connected dot, updated off the connection's own keepalive ping — no separate polling — with a color-coded status icon and a per-device "Forget" action (closes the connection and unpairs just that one device, unlike the bulk Reset). Quit fully kills the process rather than just stopping the service, so relaunching right after quitting doesn't race the previous instance's teardown. Routine sync activity (connect/disconnect, clipboard sync) no longer pushes a system notification — check the in-app activity feed for that; pairing requests, file transfers, errors, and a peer forgetting this device still notify, and a received file's notification has an "Open" action. Tapping a device opens its own page — the full player (even with nothing playing), send files, remote control, lock (any desktop) and unlock (Linux), disconnect, and forget, all in one place and, on a typical phone held upright, on one screen (the artwork takes whatever height is left; a shorter screen scrolls) — and the device list now survives backing out of the app and reopening it while the service keeps running (it used to rebuild from a short event history and could come back empty). Shows up in every app's share sheet too: see Sharing below. The device page is in use on a real phone; its one-screen layout and the share sheet haven't been confirmed on one yet. |
-| iOS | Source complete, doesn't build yet — gets through code generation and framework packaging in CI but fails on an embedded-extension code-signing step. Not part of CI or releases until that's fixed. See [`docs/ios-build.md`](docs/ios-build.md) for exactly where it stands. |
-| Media control | Android can remote-control Play/Pause/Next/Previous/Volume/Seek on a connected device, with a full player on the device's page: album art, title, artist, live play/pause state, a draggable progress bar (scrub and release to seek), and a volume level bar (read-only — it shows the real current level, but only the up/down buttons can change it). **macOS**: verified against real playback (global media-key injection for transport, private MediaRemote framework for now-playing/seek, raw CoreAudio for volume) — transport control (not volume) needs Accessibility permission granted to `continuityd`; if play/pause/next/previous silently do nothing, check System Settings > Privacy & Security > Accessibility (the app opens this for you and shows a notification the first time it detects it's missing). **Windows** (`SendInput` media keys, WinRT `GlobalSystemMediaTransportControlsSessionManager` for now-playing/seek, `IAudioEndpointVolume` for volume) and **Linux** (MPRIS over D-Bus) are implemented but only compile-checked in CI so far — no real device to confirm behavior against yet. See [`docs/protocol.md`](docs/protocol.md#media-control). |
-| Remote control | Android can request full remote control of a connected macOS, Windows, or Linux device — keyboard, mouse, and a live mirrored view of its screen. The first request from each device needs an explicit accept on the controlled computer, separate from pairing; that answer is then remembered for that device until it's forgotten. Android/iOS are controllers only, never a controllable target (phones running 0.1.6-beta.3 or older announced themselves as Linux, so another phone offered remote control and lock/unlock for them — fixed in 0.1.6-beta.5). A cross-platform desktop viewer exists, but its tray entry is hidden for now: it froze the controlling app in mac-to-mac testing. **macOS**: screen capture confirmed working for real; input injection is confirmed correctly *gated* by the same Accessibility permission media keys need, but not confirmed to land clicks/keystrokes precisely (granting that permission needs a human in System Settings). **Windows**: implemented (`SendInput` injection, GDI screen capture) and confirmed working against a real device, including real-cursor compositing. **Linux**: via xdg-desktop-portal (`RemoteDesktop`/`ScreenCast`, works under Wayland) + PipeWire for capture. Up to 0.1.6-beta.3 a session never actually started — the phone sat on "connecting" forever (reported on Ubuntu 26.04.1) because the portal handshake waited for a reply it could never receive. Fixed in 0.1.6-beta.5, with the D-Bus side tested against a mock portal; not yet confirmed on a real desktop. The desktop also asks the person at the computer to approve screen sharing (GNOME and KDE both do); where it supports it, that approval is remembered after the first time. If it's declined, or nobody answers within 90 seconds, the phone says why instead of waiting. A "lite" build (`--no-default-features` on `continuityd`) compiles all of this out entirely for anyone who doesn't want it. See [`docs/protocol.md`](docs/protocol.md#remote-control). |
-| Remote lock/unlock | Android can lock any connected desktop from its device page, and unlock a **Linux** one (Linux via systemd-logind — works with GNOME and KDE Plasma's lock screens; some standalone lockers like swaylock ignore it, and the app says so if the lock screen doesn't respond). macOS and Windows can be locked too; macOS's lock is confirmed to resolve on a real Mac but hasn't been triggered remotely yet, and Windows' is compile-checked only. Unlock is off for every device until you turn it on, per device, on the computer itself: in the settings window, or tray menu → **Allow Remote Unlock** (both ask for confirmation; the menu also lists allowed devices that are offline, so a lost phone's permission is easy to revoke). The computer shows a notification every time it's locked or unlocked remotely, and for any refused attempt; the phone asks for confirmation before unlocking. Locking needs no permission. macOS and Windows can't be unlocked: neither offers a supported way for an app to dismiss its lock screen, so they answer "unsupported" and the phone doesn't offer it. Needs both sides on 0.1.6-beta.3+ (protocol v2). Engine logic covered by a two-engine test; the logind backend is compile-checked only. See [`docs/protocol.md`](docs/protocol.md#remote-lock-and-unlock). |
-| Sharing | **Android**: "Continuity" appears in every app's share sheet — pick a connected device or all of them; files are sent as normal transfers, shared text/links land on that device's clipboard. **Linux**: right-click → Scripts → Send with Continuity (Files), a Send with Continuity submenu (Dolphin), or per-device actions (Nemo). **Windows**: right-click → Send to → "Continuity - *device*". On both, entries exist only for currently connected devices and only while Continuity is running. **macOS**: Finder → Open With → Continuity, then pick a device. None of this has been tried on a real device yet. See [`docs/protocol.md`](docs/protocol.md#sharing-to-a-device). |
-| Settings window | Tray menu → **Settings…** opens a window on every desktop: your paired and nearby devices, pairing, sending files, disconnecting or forgetting a device, whether each one may control this computer without asking (and, on Linux, unlock it), and pausing sync. Its **ⓘ** button shows the version and system, what Continuity has done since it started (connections, clipboard, files, remote control, locks), where received files and the log are, a few tips, and what remote control needs on that platform — on macOS, the Screen Recording and Accessibility permissions, whether each is granted, and a **Grant…** button for each (the Mac's pages also warn while one is missing). **macOS**: a native SwiftUI app — Liquid Glass on macOS 26, the classic look on 13–15, and a simpler layout on 12; not available on 11. **Linux and Windows**: a window in the system's webview (WebKitGTK, WebView2), Adwaita-like on Linux and Fluent-like on Windows, light or dark with the system; a webview takes a few seconds to start, so the window is prepared hidden a few seconds after Continuity starts and closing it only hides it — **Settings…** shows it at once. Both talk to the running app (see [`docs/protocol.md`](docs/protocol.md#desktop-settings-window)). The macOS window works on a real Mac (Apple silicon), and the Linux and Windows windows open on real machines; the macOS 12 layout hasn't been tried on a real Monterey Mac yet, and neither have the Linux file picker's fix (Send Files… used to freeze the app) or the prepared-in-advance window on Linux and Windows. |
+0.1.6 is the current release. Every platform is built and tested in CI on its own runner; this is what has also been confirmed on real devices so far:
+
+| | Confirmed on real devices | Built and tested, not yet confirmed |
+|---|---|---|
+| Pairing and connections | macOS, Windows, Linux, Android | |
+| Clipboard | macOS, Windows, Android | Linux |
+| Files | macOS, Windows | Linux, Android |
+| Media control from a phone | controlling a Mac | controlling Windows and Linux |
+| Remote control from a phone | Windows; a Mac's screen | clicks and typing on a Mac; Linux |
+| Remote lock and unlock | | lock on macOS and Windows; lock and unlock on Linux |
+| Settings window | macOS (Apple silicon), Windows, Linux (Ubuntu) | macOS 12; the Linux file picker fixed in 0.1.6 |
+| Android device page | fits one screen on a Galaxy A05 | |
+| Sharing (share sheet, file managers) | | Android, Windows, Linux, macOS |
+| iOS app | | doesn't build yet — see [`docs/ios-build.md`](docs/ios-build.md) |
+
+- The Mac app is universal: it runs on Apple silicon (an M1) and on Intel (a Mac on macOS 12).
+- Android only sends its clipboard while the app is open: Android 10 and later don't let apps read the clipboard in the background.
+- Controlling one computer from another is built but hidden from the tray menu for now: the viewer froze the controlling app in testing.
+
+The full write-up — protocol, security model, every bug worth remembering and what's still unverified — is in [`docs/protocol.md`](docs/protocol.md).
 
 ## How it works
 
 - **Discovery**: mDNS/DNS-SD (`_continuity._tcp`) on the local network.
 - **Transport**: TLS 1.3, mutual certificate auth tied to each device's Ed25519 identity — no CA, no cloud.
 - **Pairing**: trust-on-first-use with a 6-digit confirmation code shown on both devices; only trusted devices can connect at all.
-- **Sync engine**: one shared Rust core (`continuity-daemon`) drives every shell — the desktop tray app, the CLI, and (via UniFFI) the Android/iOS apps all sit on top of the same discovery/pairing/sync logic rather than reimplementing it per platform.
-- **Remote control**: a separate, explicit consent step per session (not implied by pairing) starts keyboard/mouse relay over the existing connection and a dedicated, lower-overhead connection for the screen stream — kept apart from clipboard/file sync traffic on purpose, so a continuous frame stream can never delay a clipboard update or a keepalive ping.
+- **Sync engine**: one shared Rust core (`continuity-daemon`) drives every app — the desktop tray app, the CLI, and (via UniFFI) the Android and iOS apps all sit on the same discovery, pairing and sync logic rather than reimplementing it per platform.
+- **Remote control**: a separate, explicit consent step per session (not implied by pairing) starts keyboard and mouse relay over the existing connection, and a dedicated connection for the screen stream — kept apart on purpose, so a continuous frame stream can never delay a clipboard update or a keepalive ping.
 
-Full protocol and security-model writeup: [`docs/protocol.md`](docs/protocol.md).
+## Building
 
-## Download
+**Desktop** (macOS, Windows, Linux), with stable Rust:
 
-Each [release](https://github.com/hardope/continuity/releases) has four files attached, no zipping, no raw binaries — download the one you need:
+```bash
+cargo build --release -p continuityd
+```
 
-- `continuity-macos.dmg` — universal (Intel + Apple Silicon), mount it, drag Continuity to Applications
-- `continuity-windows-setup.exe` — Windows installer (Start Menu entry, autostart on sign-in, proper uninstall). Run it, follow the prompts, discard the installer afterward.
-- `continuity-linux.deb` — `sudo apt install ./continuity-linux.deb`, which also pulls in the runtime libraries `continuityd` needs (GTK, AppIndicator, libxdo) so it doesn't fail with "error while loading shared libraries" the way a raw binary can if those aren't already on your system. Installs to `/usr/bin/continuityd` — just run `continuityd`.
-- `continuity-android.apk` — sideload with `adb install` or by opening the file on-device
+On Linux, install the development packages first — the list is in [`.github/scripts/install-linux-deps.sh`](.github/scripts/install-linux-deps.sh). `cargo build -p continuityd --no-default-features` builds a "lite" desktop app with remote control compiled out entirely. `continuityctl`, a command-line tool for testing, isn't released; build it with `-p continuityctl`.
 
-(`continuityctl`, the CLI test tool, isn't part of releases — it's a dev-only tool, see Building below if you want it.)
+**macOS settings window** (needs Xcode): `apps/macos/ContinuitySettings/build-app.sh <output dir>`; CI puts it inside Continuity.app.
 
-No paid code-signing certificate yet on any platform. Windows SmartScreen will warn once on the installer — click "More info" → "Run anyway". The macOS app is ad-hoc signed (required just to *run* on Apple Silicon — a completely unsigned binary fails there with "app is damaged and can't be opened", not a bypassable warning) but not notarized, so Gatekeeper still shows the normal "unidentified developer" warning on first launch — right-click → Open to get the bypass dialog. On Android: enable "install from unknown sources" for a sideloaded APK.
+**Android**: see [`docs/android-build.md`](docs/android-build.md). **iOS**: see [`docs/ios-build.md`](docs/ios-build.md) — it doesn't build cleanly yet.
 
-The workflow can also be triggered by hand without cutting a release — see the "Run workflow" button on [Actions](https://github.com/hardope/continuity/actions/workflows/release.yml) — which builds the same binaries from whatever's on `master` and attaches them to that run's Artifacts section, no tag needed.
+**Tests**: `cargo test --workspace --lib --bins` (unit tests), `cargo test -p continuity-daemon --tests` (two real engines over loopback mDNS), and `swift test` in `apps/macos/ContinuitySettings`.
 
-## Repo layout
+CI ([`.github/workflows/release.yml`](.github/workflows/release.yml)) runs one lane per platform — its tests, then its build — on that platform's own runner for every `v*` tag, and publishes the release only when every lane passes. It can also be run by hand from [Actions](https://github.com/hardope/continuity/actions/workflows/release.yml), which builds the same files from `master` without making a release.
 
 ```
 core/            Rust workspace — protocol, crypto, networking, the shared
                  sync engine, the desktop app (continuityd), the CLI
                  (continuityctl), and the mobile FFI layer (continuity-ffi)
 apps/android/    Android app (Kotlin, Jetpack Compose)
+apps/macos/      The macOS settings window (SwiftUI)
 apps/ios/        iOS app (Swift, SwiftUI) + Share Extension
+installers/      macOS app bundle, Windows installer, Linux desktop entry
 assets/          Brand mark source (assets/logo.svg)
-docs/            Protocol spec and per-platform build notes
+docs/            Protocol and security write-up, build notes, screenshots
 ```
-
-## Building
-
-**Desktop** (macOS/Windows/Linux):
-```bash
-cargo build --release -p continuityd -p continuityctl
-```
-
-**Android**: see [`docs/android-build.md`](docs/android-build.md) — cross-compiling the Rust core with `cargo-ndk` and building the APK with Gradle.
-
-**iOS**: see [`docs/ios-build.md`](docs/ios-build.md) — needs full Xcode, and doesn't build cleanly yet regardless (see Status above).
-
-CI (`.github/workflows/release.yml`) tests and builds every platform on its own native GitHub-hosted runner for each tagged release, one lane per platform — its tests, then its build: unit tests on Linux, macOS (plus the settings window's Swift tests) and Windows, and the engine's two-device integration tests ahead of the Android build. A release is only published once every lane passes.
-
-**Tests** locally: `cargo test --workspace --lib --bins` (unit tests), `cargo test -p continuity-daemon --tests` (integration tests: two real engines over loopback mDNS), and `swift test` in `apps/macos/ContinuitySettings`.
 
 ## License
 
