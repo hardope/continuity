@@ -90,7 +90,8 @@ impl RemoteControlHost for LinuxRemoteControlHost {
         let Some(run) = self.current.lock().unwrap().clone() else {
             return;
         };
-        if let Some(input) = run.input.lock().unwrap().as_ref() {
+        let input = run.input.lock().unwrap().clone();
+        if let Some(input) = input {
             let _ = input.send(event);
         }
     }
