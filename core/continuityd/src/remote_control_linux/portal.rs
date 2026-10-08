@@ -500,3 +500,7 @@ impl PortalSession {
 fn no_options() -> HashMap<&'static str, Value<'static>> {
     HashMap::new()
 }
+
+#[cfg(test)]
+#[path = "portal_tests.rs"]
+mod tests;

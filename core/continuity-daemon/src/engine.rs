@@ -1198,6 +1198,12 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                             let _ = tx.send(Message::ScreenLockRequest { action });
                         }
                     }
+                    EngineCommand::SetRemoteControlAllowed { peer_crypto_id, allowed } => {
+                        if let Err(e) = state.trust_store.lock().unwrap().set_remote_control_allowed(&peer_crypto_id, allowed) {
+                            tracing::warn!("couldn't persist remote-control consent for '{peer_crypto_id}': {e}");
+                            state.emit(SyncEvent::Error(format!("Couldn't save the remote control setting: {e}")));
+                        }
+                    }
                     EngineCommand::SetUnlockAllowed { peer_crypto_id, allowed } => {
                         let (result, peer_name, now_allowed) = {
                             let mut trust_store = state.trust_store.lock().unwrap();
@@ -1281,7 +1287,7 @@ fn emit_initial_unlock_permissions(state: &Arc<SharedState>) {
 /// the lock screen actually responded — none of which can hold up this
 /// connection's reader loop.
 fn handle_screen_lock_request(state: &Arc<SharedState>, peer: &DeviceInfo, action: ScreenLockAction) {
-    let refusal = if !state.screen_lock.is_available() {
+    let refusal = if !state.screen_lock.is_available() || (action == ScreenLockAction::Unlock && !state.screen_lock.can_unlock()) {
         Some(ScreenLockOutcome::Unsupported)
     } else if action == ScreenLockAction::Unlock && !state.trust_store.lock().unwrap().is_unlock_allowed(&peer.id) {
         Some(ScreenLockOutcome::NotAllowed)

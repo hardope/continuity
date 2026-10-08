@@ -22,8 +22,10 @@
 //! Each Linux/Windows entry just runs `continuityd --share-to <device id>
 //! <files...>`, which hands the files to the already-running instance over a
 //! loopback TCP socket guarded by a random token in a user-private file (see
-//! `start_server`) and exits — it never starts a second tray app.
+//! `start_server`) and exits — it never starts a second tray app. The same
+//! socket also serves the settings window's requests (see `control.rs`).
 
+use crate::control::{ControlOp, ControlState};
 use continuity_daemon::EngineCommand;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -135,9 +137,16 @@ impl ShareServer {
 
 /// Listens on a random loopback port and publishes `{port, token}` in a
 /// file only this user can read. Every request has to carry that token, so
-/// another local account can't push files out through this device — the
-/// same boundary the trust store and identity files already rely on.
-pub fn start_server(profile: &str, commands: UnboundedSender<EngineCommand>, connected: ConnectedPeers) -> Option<ShareServer> {
+/// another local account can't push files out through this device (or
+/// change its settings) — the same boundary the trust store and identity
+/// files already rely on. Each connection gets its own thread, since a
+/// settings window's `watch` keeps one open.
+pub fn start_server(
+    profile: &str,
+    commands: UnboundedSender<EngineCommand>,
+    connected: ConnectedPeers,
+    control: Arc<ControlState>,
+) -> Option<ShareServer> {
     let endpoint = endpoint_path(profile)?;
     let listener = match TcpListener::bind(("127.0.0.1", 0)) {
         Ok(l) => l,
@@ -153,29 +162,74 @@ pub fn start_server(profile: &str, commands: UnboundedSender<EngineCommand>, con
         return None;
     }
 
+    let token = Arc::new(token);
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
-            if let Err(e) = serve_one(stream, &token, &commands, &connected) {
-                tracing::debug!("share request failed: {e}");
-            }
+            let (token, commands, connected, control) = (token.clone(), commands.clone(), connected.clone(), control.clone());
+            std::thread::spawn(move || {
+                if let Err(e) = serve_one(stream, &token, &commands, &connected, &control) {
+                    tracing::debug!("local request failed: {e}");
+                }
+            });
         }
     });
     Some(ShareServer { endpoint })
 }
 
-fn serve_one(stream: TcpStream, token: &str, commands: &UnboundedSender<EngineCommand>, connected: &ConnectedPeers) -> std::io::Result<()> {
+/// One request: `--share-to`'s (no `op` — a target and files), or a
+/// settings window's (tagged by `op`, see `ControlOp`).
+fn serve_one(
+    stream: TcpStream,
+    token: &str,
+    commands: &UnboundedSender<EngineCommand>,
+    connected: &ConnectedPeers,
+    control: &ControlState,
+) -> std::io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let _ = stream.set_nodelay(true);
     let mut line = String::new();
     BufReader::new((&stream).take(1024 * 1024)).read_line(&mut line)?;
-    let response = match serde_json::from_str::<ShareRequest>(&line) {
-        Ok(request) if request.token == token => dispatch(&request.target, &request.paths, commands, connected),
-        Ok(_) => ShareResponse { ok: false, message: "rejected: wrong token".to_string() },
-        Err(e) => ShareResponse { ok: false, message: format!("malformed request: {e}") },
+    let mut request: serde_json::Value = match serde_json::from_str(&line) {
+        Ok(request) => request,
+        Err(e) => return send_line(&stream, &ShareResponse { ok: false, message: format!("malformed request: {e}") }),
     };
-    let mut out = serde_json::to_vec(&response)?;
+    if request.get("token").and_then(|t| t.as_str()) != Some(token) {
+        return send_line(&stream, &ShareResponse { ok: false, message: "rejected: wrong token".to_string() });
+    }
+    if request.get("op").is_none() {
+        let response = match serde_json::from_value::<ShareRequest>(request) {
+            Ok(share) => dispatch(&share.target, &share.paths, commands, connected),
+            Err(e) => ShareResponse { ok: false, message: format!("malformed request: {e}") },
+        };
+        return send_line(&stream, &response);
+    }
+    if let Some(fields) = request.as_object_mut() {
+        fields.remove("token");
+    }
+    match serde_json::from_value::<ControlOp>(request) {
+        Ok(ControlOp::Status) => send_line(&stream, &serde_json::json!({ "ok": true, "status": control.status() })),
+        Ok(ControlOp::Watch) => {
+            control.watch(|status| send_line(&stream, &serde_json::json!({ "ok": true, "status": status })));
+            Ok(())
+        }
+        Ok(ControlOp::SendFiles { device, paths }) => send_line(&stream, &dispatch(&device, &paths, commands, connected)),
+        Ok(op) => {
+            let response = match control.apply(op, commands) {
+                Ok(()) => ShareResponse { ok: true, message: String::new() },
+                Err(message) => ShareResponse { ok: false, message },
+            };
+            send_line(&stream, &response)
+        }
+        Err(e) => send_line(&stream, &ShareResponse { ok: false, message: format!("unknown request: {e}") }),
+    }
+}
+
+fn send_line(stream: &TcpStream, value: &impl Serialize) -> std::io::Result<()> {
+    let mut out = serde_json::to_vec(value)?;
     out.push(b'\n');
-    (&stream).write_all(&out)
+    let mut writer = stream;
+    writer.write_all(&out)
 }
 
 /// Writes `contents` to a freshly created file only this user can read —
@@ -586,12 +640,42 @@ mod tests {
         assert_eq!(several.last().unwrap().target, ALL_DEVICES);
     }
 
+    fn control_state(dir: &tempfile::TempDir) -> Arc<ControlState> {
+        let device = crate::control::ThisDevice {
+            name: "Desk".into(),
+            id: "me".into(),
+            platform: continuity_proto::Platform::Linux,
+            version: "test".into(),
+        };
+        ControlState::new(device, dir.path().join("trust.json"), dir.path().join("Received"))
+    }
+
+    /// Sends one request line to the running server and returns its first
+    /// response line, plus the connection (for reading further lines).
+    fn request(profile: &str, request: serde_json::Value) -> (serde_json::Value, BufReader<TcpStream>) {
+        let endpoint: Endpoint = serde_json::from_slice(&std::fs::read(endpoint_path(profile).unwrap()).unwrap()).unwrap();
+        let mut request = request;
+        if request.get("token").is_none() {
+            request["token"] = serde_json::Value::String(endpoint.token);
+        }
+        let stream = TcpStream::connect(("127.0.0.1", endpoint.port)).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut line = serde_json::to_vec(&request).unwrap();
+        line.push(b'\n');
+        (&stream).write_all(&line).unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut response = String::new();
+        reader.read_line(&mut response).unwrap();
+        (serde_json::from_str(&response).unwrap(), reader)
+    }
+
     #[test]
     fn share_requests_go_through_the_loopback_listener_and_need_the_token() {
         let (commands, mut sent) = tokio::sync::mpsc::unbounded_channel();
         let connected: ConnectedPeers = Arc::new(Mutex::new(peers(&[("peer1", "Pixel")])));
         let profile = format!("share-test-{}", rand::random::<u32>());
-        let server = start_server(&profile, commands, connected).expect("server starts");
+        let dir = tempfile::tempdir().unwrap();
+        let server = start_server(&profile, commands, connected, control_state(&dir)).expect("server starts");
 
         let file = std::env::temp_dir().join(format!("continuity-share-test-{}.txt", rand::random::<u32>()));
         std::fs::write(&file, b"hi").unwrap();
@@ -625,5 +709,42 @@ mod tests {
         server.shutdown();
         assert!(request_share(&profile, "peer1", vec![file.clone()]).is_err(), "no endpoint once shut down");
         let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    fn the_settings_api_answers_on_the_same_socket_and_needs_the_token_too() {
+        let (commands, mut sent) = tokio::sync::mpsc::unbounded_channel();
+        let connected: ConnectedPeers = Arc::new(Mutex::new(HashMap::new()));
+        let profile = format!("control-test-{}", rand::random::<u32>());
+        let dir = tempfile::tempdir().unwrap();
+        let control = control_state(&dir);
+        let server = start_server(&profile, commands, connected, control.clone()).expect("server starts");
+
+        let (status, _) = request(&profile, serde_json::json!({ "op": "status" }));
+        assert_eq!(status["ok"], true);
+        assert_eq!(status["status"]["device"]["name"], "Desk");
+        assert_eq!(status["status"]["paused"], false);
+
+        let (refused, _) = request(&profile, serde_json::json!({ "op": "set_paused", "paused": true, "token": "guess" }));
+        assert_eq!(refused["ok"], false);
+        assert!(sent.try_recv().is_err(), "a wrong token changes nothing");
+
+        let (paused, _) = request(&profile, serde_json::json!({ "op": "set_paused", "paused": true }));
+        assert_eq!(paused["ok"], true);
+        assert!(matches!(sent.try_recv(), Ok(EngineCommand::SetPaused(true))));
+
+        let (unknown, _) = request(&profile, serde_json::json!({ "op": "format_disk" }));
+        assert_eq!(unknown["ok"], false);
+
+        // A watch gets the status straight away, then again on a change.
+        let (first, mut watch) = request(&profile, serde_json::json!({ "op": "watch" }));
+        assert_eq!(first["status"]["paused"], false);
+        control.observe(&continuity_daemon::SyncEvent::PausedStateChanged { paused: true });
+        let mut next = String::new();
+        watch.read_line(&mut next).unwrap();
+        let next: serde_json::Value = serde_json::from_str(&next).unwrap();
+        assert_eq!(next["status"]["paused"], true);
+
+        server.shutdown();
     }
 }

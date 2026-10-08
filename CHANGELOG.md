@@ -30,6 +30,14 @@ All notable user-facing changes to Continuity are documented here.
 - **Remote control says why it stopped.** If the computer declines, times out
   or stops sharing its screen, the phone now shows the reason instead of
   closing (or waiting) without explanation.
+- **Lock a Mac or a Windows PC from your phone**, from the computer's page,
+  just like a Linux one. Unlocking stays Linux-only: macOS and Windows don't
+  let apps unlock the screen.
+- **A settings window on macOS.** Tray menu → Settings… opens a proper
+  window with your paired and nearby devices: pair with one, send it files,
+  disconnect or forget it, and choose whether it may control this Mac
+  without asking you each time. It uses Liquid Glass on macOS 26, and needs
+  macOS 13 or newer.
 
 ### Fixed
 

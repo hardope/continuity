@@ -18,3 +18,6 @@ apps/ios/*.xcodeproj/
 apps/ios/ContinuityFFI.xcframework/
 apps/ios/include/
 apps/ios/DerivedData/
+
+# SwiftPM build output for the macOS settings app (apps/macos/ContinuitySettings).
+apps/macos/ContinuitySettings/.build/

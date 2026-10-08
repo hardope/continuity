@@ -43,11 +43,17 @@ data class DeviceStatus(
     val supportsMedia: Boolean get() = isDesktop
     val supportsRemoteControl: Boolean get() = isDesktop
 
-    /** Lock/unlock is Linux-only (core/continuityd/src/screen_lock_linux.rs),
-     * and only a peer announcing protocol v2+ understands the message at all
-     * — a v1 peer drops the whole connection on a message it doesn't know
-     * (see `continuity_proto::PROTOCOL_VERSION`). */
-    val supportsScreenLock: Boolean get() = platform == "linux" && protocolVersion >= 2u
+    /** Every desktop can be locked (core/continuityd/src/screen_lock_*.rs;
+     * macOS and Windows since 0.1.6-beta.6 — an older one answers
+     * "unsupported", which the result notice explains). Only a peer
+     * announcing protocol v2+ understands the message at all — a v1 peer
+     * drops the whole connection on a message it doesn't know (see
+     * `continuity_proto::PROTOCOL_VERSION`). */
+    val supportsLock: Boolean get() = isDesktop && protocolVersion >= 2u
+
+    /** Unlock is Linux-only: macOS and Windows have no supported way for an
+     * app to dismiss their lock screens. */
+    val supportsUnlock: Boolean get() = platform == "linux" && protocolVersion >= 2u
 }
 
 /** An [FfiNowPlayingInfo] plus the wall-clock moment it arrived — the
@@ -311,7 +317,11 @@ object ContinuityStore {
             is FfiScreenLockOutcome.Done -> if (action == FfiScreenLockAction.LOCK) "Locked '$peerName'" else "Unlocked '$peerName'"
             is FfiScreenLockOutcome.NotAllowed ->
                 "'$peerName' hasn't allowed this phone to unlock it. On that computer, open the Continuity menu and turn on Allow Remote Unlock for this phone."
-            is FfiScreenLockOutcome.Unsupported -> "'$peerName' can't be ${verb}ed remotely"
+            // Every desktop can lock as of 0.1.6-beta.6, so a lock coming
+            // back unsupported means that computer's Continuity is older.
+            is FfiScreenLockOutcome.Unsupported ->
+                if (action == FfiScreenLockAction.LOCK) "'$peerName' can't be locked remotely yet. Update Continuity on it."
+                else "'$peerName' can't be unlocked remotely"
             is FfiScreenLockOutcome.Failed -> "Couldn't $verb '$peerName': ${outcome.reason}"
         }
     }

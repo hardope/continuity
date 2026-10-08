@@ -1,26 +1,27 @@
-# Builds every platform on its own native GitHub-hosted runner and attaches
-# the results to a GitHub Release when a `v*` tag is pushed. Also runnable
-# by hand (workflow_dispatch) without creating a release, so a PR can be
-# checked on every platform before tagging.
+# Tests and builds every platform on its own native GitHub-hosted runner,
+# and attaches the builds to a GitHub Release when a `v*` tag is pushed.
+# Also runnable by hand (workflow_dispatch) without creating a release, so
+# a change can be checked on every platform before tagging.
 #
-# Why this matters beyond "automate the build": this dev machine (macOS,
-# no sudo, no full Xcode) could locally verify macOS and Android, but not
-# Windows or Linux (missing system headers/toolchains for cross-compiling
-# TLS's C dependencies — see docs/protocol.md and continuity-crypto's
-# Cargo.toml). CI sidesteps that by building on each platform's own real
-# runner. (There's no ios job — see the comment above the release job.)
+# Each platform's code only compiles (let alone runs) on that platform —
+# media, remote control, screen lock and sharing all go through OS APIs —
+# and the dev machine can't stand in for Windows, Linux or Android. So each
+# OS gets its own test job and its own build job, all in parallel. Separate
+# jobs rather than one matrix job: almost every step is platform-specific
+# (packaging especially), and a matrix spent most of its lines on
+# `if: matrix.name == ...`. (There's no iOS job — see below.)
 #
-# The Android artifact here is unsigned (debug APK) — real distribution
-# needs Play Store signing secrets this repo doesn't have configured.
-# Still valuable as continuous "does it even build" verification.
+# A release needs every build *and* every unit-test job to pass. The engine's
+# integration tests (two real engines over loopback mDNS) run on every
+# release too, but don't hold it back yet — see that job.
 #
 # Release assets are one properly-packaged file per platform, not a raw
 # binary — continuityctl (the dev/test CLI) is deliberately not shipped:
 #   - macOS: continuity-macos.dmg — a real .app bundle (Info.plist, icon
-#     generated from assets/logo.svg) inside a .dmg with a drag-to-
-#     Applications symlink. A bare Mach-O executable isn't something
-#     Finder recognizes as an app; double-clicking it opened it as an
-#     unknown/text file instead of running it. See installers/macos/.
+#     generated from assets/logo.svg, the SwiftUI settings window in
+#     Contents/Helpers) inside a .dmg with a drag-to-Applications symlink.
+#     A bare Mach-O executable isn't something Finder recognizes as an app.
+#     See installers/macos/ and apps/macos/.
 #   - Windows: continuity-windows-setup.exe — an Inno Setup installer
 #     (installers/windows/continuity.iss). A portable exe has no Start
 #     Menu entry, no autostart, and no uninstall.
@@ -29,10 +30,9 @@
 #     (libxdo3, libayatana-appindicator3-1, ...) is why this exists at
 #     all — a raw binary fails with "error while loading shared
 #     libraries" unless those happen to already be installed.
-#   - Android: continuity-android.apk (unsigned debug build — real
-#     distribution needs Play Store signing secrets this repo doesn't
-#     have configured, but it's still valuable as continuous "does it
-#     even build" verification).
+#   - Android: continuity-android.apk — an unsigned debug build. Real
+#     distribution needs Play Store signing secrets this repo doesn't have
+#     configured; it's still the only place the Kotlin code gets compiled.
 
 name: Release
 
@@ -45,58 +45,93 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  desktop:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-latest
-            name: macos
-          - os: windows-latest
-            name: windows
-          - os: ubuntu-latest
-            name: linux
-    runs-on: ${{ matrix.os }}
+  # ─── Tests ──────────────────────────────────────────────────────────────
+
+  test-linux:
+    name: Test (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Install Linux system dependencies (tray-icon, secret-service, rustls)
-        if: matrix.name == 'linux'
-        run: |
-          sudo apt-get update
-          # libappindicator3-dev doesn't exist on Ubuntu 24.04 (ubuntu-latest)
-          # anymore — libayatana-appindicator3-dev is its replacement and
-          # what's actually needed. libxdo-dev is for muda (tray-icon's
-          # menu library) — it links against libxdo for keyboard-accelerator
-          # handling even though we don't set any menu accelerators yet.
-          # dpkg-dev provides dpkg-shlibdeps, which cargo-deb's "$auto"
-          # depends resolution (core/continuityd/Cargo.toml) needs to
-          # compute the .deb's Depends: field — without it, cargo-deb
-          # silently produces a .deb with no dependency information at
-          # all, defeating the reason it exists. libpipewire-0.3-dev/
-          # libspa-0.2-dev are for remote_control_linux.rs's screen
-          # capture (the pipewire/libspa-sys crates link against them via
-          # pkg-config); libclang-dev is for the bindgen build step those
-          # two crates run against pipewire/spa's C headers.
-          sudo apt-get install -y \
-            libgtk-3-dev libayatana-appindicator3-dev \
-            libdbus-1-dev libxdo-dev pkg-config dpkg-dev \
-            libpipewire-0.3-dev libspa-0.2-dev libclang-dev
+      - name: Install system dependencies
+        run: bash .github/scripts/install-linux-deps.sh
+
+      - name: Unit tests
+        # Every crate's own tests. On Linux, continuityd's include the
+        # remote-control portal client against a mock xdg-desktop-portal
+        # (src/remote_control_linux/portal_tests.rs) and the PipeWire frame
+        # conversion — code nothing else ever runs short of a real desktop.
+        run: cargo test --workspace --lib --bins
+
+  test-macos:
+    name: Test (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Unit tests
+        run: cargo test --workspace --lib --bins
+
+      - name: Settings window tests
+        # The SwiftUI settings window's client, against a fake continuityd
+        # on a real loopback socket, plus its half of the JSON contract
+        # (Tests/SettingsUITests/Fixtures/status.json — continuityd's own
+        # tests check the other half). No window is opened. This uses the
+        # runner's default Xcode, the build job the newest one, so both of
+        # the Glass.swift code paths get compiled.
+        working-directory: apps/macos/ContinuitySettings
+        run: swift test
+
+  test-windows:
+    name: Test (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Unit tests
+        run: cargo test --workspace --lib --bins
+
+  integration-linux:
+    name: Engine integration tests (Linux)
+    # Pairs of real engines finding each other over loopback mDNS:
+    # connection races, revocation, remote-control sessions and their end
+    # reasons, remote lock (core/continuity-daemon/tests/). They depend on
+    # the runner's networking more than unit tests do, so the release
+    # doesn't wait on this job until it has a record of passing here.
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
 
       - name: Build
-        # Still building continuityctl too (cheap, shares most deps) even
-        # though it isn't released — catches regressions in it via CI. On
-        # macOS, continuityd itself isn't built here — see "Build
-        # universal continuityd" below.
-        shell: bash
-        run: |
-          if [ "${{ matrix.name }}" = "macos" ]; then
-            cargo build --release -p continuityctl
-          else
-            cargo build --release -p continuityd -p continuityctl
-          fi
+        run: cargo test -p continuity-daemon --tests --no-run
+
+      - name: Run
+        # A test that fails by panicking can hang instead of exiting (the
+        # engine's blocking watchers only stop on `shutdown()`), so this is
+        # capped, and --nocapture shows the failure even then.
+        run: timeout 900 cargo test -p continuity-daemon --tests -- --nocapture
+
+  # ─── Builds ─────────────────────────────────────────────────────────────
+
+  macos:
+    name: Build (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build continuityctl
+        # Not released (it's the dev/test CLI), but cheap — this keeps it
+        # building.
+        run: cargo build --release -p continuityctl
 
       - name: Build universal continuityd (Intel + Apple Silicon)
         # GitHub's macos-latest runner is Apple Silicon, so a plain
@@ -105,8 +140,6 @@ jobs:
         # both targets and merging with lipo is the standard fix; this is
         # the same technique already used for the iOS XCFramework (see
         # docs/ios-build.md).
-        if: matrix.name == 'macos'
-        shell: bash
         run: |
           rustup target add x86_64-apple-darwin aarch64-apple-darwin
           cargo build --release --target x86_64-apple-darwin -p continuityd
@@ -118,16 +151,11 @@ jobs:
             -output target/release/continuityd
           lipo -info target/release/continuityd
 
-      - name: Build macOS .app bundle + .dmg
-        # A bare Mach-O executable isn't something Finder recognizes as an
-        # app — double-clicking it opens it as a text/unknown file instead
-        # of running it. Wrapping it as a real .app (Info.plist, icon) and
-        # shipping that inside a .dmg (with a drag-to-Applications
-        # symlink) is the standard macOS distribution shape and fixes
-        # that. LSUIElement=true in Info.plist also means no Dock icon,
-        # matching the tray-only design.
-        if: matrix.name == 'macos'
-        shell: bash
+      - name: Build .app bundle + .dmg
+        # Wrapping the binary as a real .app (Info.plist, icon) inside a
+        # .dmg (with a drag-to-Applications symlink) is the standard macOS
+        # distribution shape. LSUIElement=true in Info.plist means no Dock
+        # icon, matching the tray-only design.
         run: |
           APP=Continuity.app
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -158,6 +186,18 @@ jobs:
           done
           iconutil -c icns AppIcon.iconset -o "$APP/Contents/Resources/AppIcon.icns"
 
+          # The settings window (apps/macos/ContinuitySettings), a SwiftUI
+          # app the tray's "Settings…" opens from Contents/Helpers. Built
+          # with the newest non-beta Xcode on the runner: the macOS 26 SDK
+          # is what gives it Liquid Glass (an older SDK still builds it,
+          # with the classic look).
+          XCODE=$(ls -d /Applications/Xcode_2[6-9]*.app 2>/dev/null | grep -vi beta | tail -1 || true)
+          if [ -n "$XCODE" ]; then sudo xcode-select -s "$XCODE"; fi
+          xcodebuild -version
+          echo "macOS SDK $(xcrun --sdk macosx --show-sdk-version)"
+          mkdir -p "$APP/Contents/Helpers"
+          apps/macos/ContinuitySettings/build-app.sh "$APP/Contents/Helpers" "$VERSION" "$APP/Contents/Resources/AppIcon.icns"
+
           # Ad-hoc signing (no paid Apple Developer ID, just a local
           # self-signature) isn't enough to satisfy Gatekeeper's "verified
           # developer" check, but it IS required for the binary to run at
@@ -173,46 +213,29 @@ jobs:
           ln -s /Applications dmg-src/Applications
           hdiutil create -volname Continuity -srcfolder dmg-src -ov -format UDZO continuity-macos.dmg
 
-      - name: Upload macOS .dmg
-        if: matrix.name == 'macos'
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: continuity-macos.dmg
           path: continuity-macos.dmg
 
-      - name: Build Linux .deb package
-        # The raw binary dynamically links libxdo, libayatana-appindicator3,
-        # etc. (see the apt-get step above) — fine in CI where they're
-        # installed, but a user running the raw binary on their own machine
-        # hits "error while loading shared libraries" unless they happen to
-        # already have the same packages. A .deb's Depends: field fixes
-        # this by making apt/dpkg pull them in automatically. cargo-deb's
-        # default ("$auto", see core/continuityd/Cargo.toml) computes that
-        # list itself by running ldd against the built binary — no need to
-        # hand-maintain a package list here that would drift from the one
-        # above.
-        if: matrix.name == 'linux'
-        shell: bash
-        run: |
-          cargo install cargo-deb --locked
-          cargo deb -p continuityd --no-build
-          cp target/debian/*.deb continuity-linux.deb
+  windows:
+    name: Build (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
 
-      - name: Upload Linux .deb
-        if: matrix.name == 'linux'
-        uses: actions/upload-artifact@v4
-        with:
-          name: continuity-linux.deb
-          path: continuity-linux.deb
+      - name: Build
+        # continuityctl isn't released, but cheap — this keeps it building.
+        run: cargo build --release -p continuityd -p continuityctl
 
-      - name: Build Windows installer
+      - name: Build installer
         # A raw .exe has no Start Menu entry, no autostart registration,
         # and no clean uninstall — wrap it with Inno Setup so it installs
         # like a normal Windows app instead of being a file you have to
         # keep around and relaunch by hand. windows-latest ships
         # Chocolatey preinstalled, so this doesn't need a separate
         # runner setup.
-        if: matrix.name == 'windows'
         shell: pwsh
         run: |
           choco install innosetup -y --no-progress
@@ -223,14 +246,46 @@ jobs:
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DMyAppVersion=$version" installers\windows\continuity.iss
           Copy-Item installers\windows\continuity-windows-setup.exe .
 
-      - name: Upload Windows installer
-        if: matrix.name == 'windows'
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: continuity-windows-setup.exe
           path: continuity-windows-setup.exe
 
+  linux:
+    name: Build (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: bash .github/scripts/install-linux-deps.sh
+
+      - name: Build
+        # continuityctl isn't released, but cheap — this keeps it building.
+        run: cargo build --release -p continuityd -p continuityctl
+
+      - name: Build .deb package
+        # The raw binary dynamically links libxdo, libayatana-appindicator3,
+        # etc. — fine here where they're installed, but a user running the
+        # raw binary hits "error while loading shared libraries" unless they
+        # happen to have the same packages. A .deb's Depends: field fixes
+        # this by making apt/dpkg pull them in automatically. cargo-deb's
+        # default ("$auto", see core/continuityd/Cargo.toml) computes that
+        # list itself by running ldd against the built binary — no
+        # hand-maintained package list to drift.
+        run: |
+          cargo install cargo-deb --locked
+          cargo deb -p continuityd --no-build
+          cp target/debian/*.deb continuity-linux.deb
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: continuity-linux.deb
+          path: continuity-linux.deb
+
   android:
+    name: Build (Android)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -279,7 +334,7 @@ jobs:
           name: continuity-android.apk
           path: continuity-android.apk
 
-  # No ios job — it doesn't build cleanly yet (an embedded-extension
+  # No iOS job — it doesn't build cleanly yet (an embedded-extension
   # code-signing validation failure survived two rounds of real fixes:
   # a missing XCFramework simulator architecture and a Homebrew
   # tap-trust check on the runner, both fixed, but a third distinct
@@ -287,9 +342,11 @@ jobs:
   # this app. See docs/ios-build.md for the manual build path and
   # what's left to chase down; re-add a job here once it's sorted out.
 
+  # ─── Release ────────────────────────────────────────────────────────────
+
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [desktop, android]
+    needs: [test-linux, test-macos, test-windows, macos, windows, linux, android]
     runs-on: ubuntu-latest
     # The default GITHUB_TOKEN is read-only unless a job explicitly asks
     # for more — softprops/action-gh-release needs contents: write to
@@ -305,14 +362,12 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
-          # Each artifact is already exactly one file (see the desktop/
-          # android jobs' "Upload ..."/"Stage release ..." steps) — merge
-          # them into one flat directory instead of one subdirectory per
-          # artifact name, so the release gets raw files, not a zip per
-          # platform. Every asset is now a packaged format (.dmg, the
-          # installer .exe, .deb, .apk) whose permissions are set inside
-          # the package itself at build time, so there's no separate
-          # executable-bit step needed here anymore.
+          # Each artifact is already exactly one file (see each build job's
+          # upload step) — merge them into one flat directory instead of one
+          # subdirectory per artifact name, so the release gets raw files,
+          # not a zip per platform. Every asset is a packaged format (.dmg,
+          # the installer .exe, .deb, .apk) whose permissions are set inside
+          # the package itself at build time.
           merge-multiple: true
 
       # Pulls this exact version's section out of CHANGELOG.md (between

@@ -62,6 +62,30 @@ impl ScreenLockController for FakeScreenLock {
     }
 }
 
+/// What macOS and Windows have: a screen that can be locked remotely but
+/// never unlocked.
+#[derive(Clone, Default)]
+struct LockOnlyScreenLock {
+    locks: Arc<AtomicUsize>,
+    unlocks: Arc<AtomicUsize>,
+}
+
+impl ScreenLockController for LockOnlyScreenLock {
+    fn can_unlock(&self) -> bool {
+        false
+    }
+
+    fn lock(&self) -> Result<(), ScreenLockError> {
+        self.locks.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn unlock(&self) -> Result<(), ScreenLockError> {
+        self.unlocks.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
 fn now_unix() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
 }
@@ -191,6 +215,42 @@ async fn unlock_is_opt_in_and_lock_unlock_and_text_share_are_routed_correctly() 
     a.command_sender().send(EngineCommand::SendText { peer_crypto_id: b_id.clone(), text: "https://example.com/shared".to_string() }).unwrap();
     wait_for(&mut b.events, "B receiving the shared text", |e| matches!(e, SyncEvent::ClipboardReceived { .. })).await;
     assert_eq!(b_clipboard.written.lock().unwrap().as_slice(), ["https://example.com/shared".to_string()]);
+
+    a.shutdown();
+    b.shutdown();
+}
+
+/// A device that can lock but not unlock (macOS, Windows) answers an unlock
+/// `Unsupported` — not `NotAllowed`, which would send the user hunting for
+/// an "Allow Remote Unlock" setting that doesn't exist there — and does so
+/// even if a permission somehow got recorded, without ever calling the
+/// controller. Locking it works as usual.
+#[tokio::test]
+async fn a_lock_only_device_answers_unlock_unsupported_even_when_allowed() {
+    let a_identity = Identity::generate();
+    let b_identity = Identity::generate();
+    let a_id = a_identity.device_id();
+    let b_id = b_identity.device_id();
+
+    let b_lock = LockOnlyScreenLock::default();
+    let mut a = make_engine("LockOnlyA", a_identity, &b_id, "LockOnlyB", Arc::new(NoopScreenLockController), Arc::new(RecordingClipboard::default()))
+        .await
+        .expect("start engine A");
+    let mut b = make_engine("LockOnlyB", b_identity, &a_id, "LockOnlyA", Arc::new(b_lock.clone()), Arc::new(RecordingClipboard::default()))
+        .await
+        .expect("start engine B");
+
+    wait_for(&mut a.events, "A connecting to B", |e| matches!(e, SyncEvent::Connected { .. })).await;
+
+    assert_eq!(request_and_await_result(&mut a, &b_id, ScreenLockAction::Unlock).await, ScreenLockOutcome::Unsupported);
+
+    b.command_sender().send(EngineCommand::SetUnlockAllowed { peer_crypto_id: a_id.clone(), allowed: true }).unwrap();
+    wait_for(&mut b.events, "B recording an unlock permission for A", |e| matches!(e, SyncEvent::UnlockPermissionChanged { allowed: true, .. })).await;
+    assert_eq!(request_and_await_result(&mut a, &b_id, ScreenLockAction::Unlock).await, ScreenLockOutcome::Unsupported);
+    assert_eq!(b_lock.unlocks.load(Ordering::Relaxed), 0, "an unlock must never reach a lock-only controller");
+
+    assert_eq!(request_and_await_result(&mut a, &b_id, ScreenLockAction::Lock).await, ScreenLockOutcome::Done);
+    assert_eq!(b_lock.locks.load(Ordering::Relaxed), 1);
 
     a.shutdown();
     b.shutdown();

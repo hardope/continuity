@@ -34,6 +34,11 @@ mod remote_control_linux;
 mod remote_viewer;
 #[cfg(target_os = "linux")]
 mod screen_lock_linux;
+#[cfg(target_os = "macos")]
+mod screen_lock_mac;
+#[cfg(target_os = "windows")]
+mod screen_lock_windows;
+mod control;
 mod share;
 
 use continuity_crypto::{Identity, TrustStore};
@@ -108,6 +113,12 @@ fn main() -> anyhow::Result<()> {
     let pause_item = MenuItem::new("Pause Syncing", true, None);
     let reset_item = MenuItem::new("Reset...", true, None);
     let about_item = MenuItem::new(format!("About Continuity ({})", env!("CARGO_PKG_VERSION")), true, None);
+    // The settings window — so far a native SwiftUI app on macOS only
+    // (apps/macos/ContinuitySettings); Linux and Windows keep the menu.
+    #[cfg(target_os = "macos")]
+    let settings_item = MenuItem::new("Settings…", true, None);
+    #[cfg(target_os = "macos")]
+    let settings_item_id = settings_item.id().clone();
     let quit_item = MenuItem::new("Quit", true, None);
     let refresh_item_id = refresh_item.id().clone();
     let pause_item_id = pause_item.id().clone();
@@ -195,6 +206,8 @@ fn main() -> anyhow::Result<()> {
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&pause_item)?;
     menu.append(&reset_item)?;
+    #[cfg(target_os = "macos")]
+    menu.append(&settings_item)?;
     menu.append(&about_item)?;
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&quit_item)?;
@@ -205,12 +218,25 @@ fn main() -> anyhow::Result<()> {
         .with_icon(build_icon(false))
         .build()?;
 
-    let commands = start_engine_thread(profile(), device_name, proxy)?;
+    let (commands, device_id) = start_engine_thread(profile(), device_name.clone(), proxy)?;
+    // What the settings window reads and changes, over the same local
+    // socket as "Send with Continuity" (see control.rs).
+    let control = control::ControlState::new(
+        control::ThisDevice {
+            name: device_name,
+            id: device_id,
+            platform: control::this_platform(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        },
+        TrustStore::default_path(&profile()).unwrap_or_default(),
+        received_files_dir(&profile()),
+    );
+    control.spawn_trust_watcher();
     // Entries left behind by a previous run that didn't quit cleanly would
     // point at devices that may not be connected now — start from none and
     // let `Connected` events add them back.
     share::remove_menu_entries();
-    let share_server = share::start_server(&profile(), commands.clone(), connected_peers.clone());
+    let share_server = share::start_server(&profile(), commands.clone(), connected_peers.clone(), control.clone());
     let is_paused: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
     // The open remote-control viewer window, if any — at most one at a
     // time (mirrors the engine's own one-Controlled-session-device-wide
@@ -271,6 +297,7 @@ fn main() -> anyhow::Result<()> {
         }
 
         if let tao::event::Event::UserEvent(sync_event) = event {
+            control.observe(&sync_event);
             #[cfg(feature = "remote-control")]
             handle_remote_control_sync_event(&sync_event, target, &viewer, &connected_peer_platforms, &commands);
             #[cfg(target_os = "linux")]
@@ -310,6 +337,10 @@ fn main() -> anyhow::Result<()> {
         }
 
         if let Ok(event) = MenuEvent::receiver().try_recv() {
+            #[cfg(target_os = "macos")]
+            if event.id == settings_item_id {
+                open_settings(&profile());
+            }
             if event.id == pause_item_id {
                 let currently_paused = *is_paused.lock().unwrap();
                 let _ = commands.send(EngineCommand::SetPaused(!currently_paused));
@@ -1087,6 +1118,32 @@ fn confirm(
 /// can't (macOS requires a proper .app bundle with an Info.plist for
 /// reliable notification delivery), so this always logs too — the tray
 /// menu/dialogs are the guaranteed-visible UI; notifications are a bonus.
+/// Opens the settings window: the SwiftUI app bundled inside Continuity.app
+/// (`Contents/Helpers/Continuity Settings.app`, built from
+/// apps/macos/ContinuitySettings), which talks to this process over the
+/// local control socket. `CONTINUITY_SETTINGS_APP` points a development
+/// build (no bundle around it) at a locally built copy.
+#[cfg(target_os = "macos")]
+fn open_settings(profile: &str) {
+    let bundled = std::env::current_exe().ok().and_then(|exe| Some(exe.parent()?.parent()?.join("Helpers/Continuity Settings.app")));
+    let app = std::env::var_os("CONTINUITY_SETTINGS_APP").map(PathBuf::from).or(bundled).filter(|app| app.exists());
+    let Some(app) = app else {
+        notify("The settings window isn't included in this build of Continuity.");
+        return;
+    };
+    let mut open = std::process::Command::new("/usr/bin/open");
+    open.arg("-a").arg(&app);
+    if profile != "default" {
+        open.args(["--args", "--profile", profile]);
+    }
+    std::thread::spawn(move || match open.status() {
+        Ok(status) if status.success() => {}
+        // LaunchServices refuses an app whose minimum macOS is newer.
+        Ok(_) => notify("Couldn't open Continuity's settings window — it needs macOS 13 or newer."),
+        Err(e) => tracing::warn!("couldn't run open for the settings window: {e}"),
+    });
+}
+
 fn notify(body: &str) {
     tracing::info!("{body}");
     if let Err(e) = notify_rust::Notification::new()
@@ -1174,7 +1231,7 @@ fn start_engine_thread(
     profile: String,
     device_name: String,
     proxy: tao::event_loop::EventLoopProxy<SyncEvent>,
-) -> anyhow::Result<tokio::sync::mpsc::UnboundedSender<EngineCommand>> {
+) -> anyhow::Result<(tokio::sync::mpsc::UnboundedSender<EngineCommand>, String)> {
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
 
     std::thread::spawn(move || {
@@ -1190,6 +1247,7 @@ fn start_engine_thread(
             let setup = async {
                 let identity = Identity::load_or_create(&profile)?;
                 tracing::info!("device id: {}", identity.device_id());
+                let device_id = identity.device_id();
                 let trust_store = TrustStore::load_default(&profile)?;
                 #[cfg(target_os = "macos")]
                 let media: Arc<dyn continuity_daemon::MediaController> = Arc::new(media_mac::MacMediaController);
@@ -1220,12 +1278,17 @@ fn start_engine_thread(
                 #[cfg(not(all(feature = "remote-control", any(target_os = "macos", target_os = "windows", target_os = "linux"))))]
                 let remote_control: Arc<dyn continuity_daemon::RemoteControlHost> = Arc::new(continuity_daemon::NoopRemoteControlHost);
 
-                // Remote lock/unlock: Linux only. macOS and Windows have no
-                // supported API for an ordinary app to dismiss their lock
-                // screens, so they answer `Unsupported` instead.
+                // Remote lock everywhere; remote unlock on Linux only —
+                // macOS and Windows have no supported API for an ordinary
+                // app to dismiss their lock screens, so they answer an
+                // unlock `Unsupported` (see `ScreenLockController::can_unlock`).
                 #[cfg(target_os = "linux")]
                 let screen_lock: Arc<dyn continuity_daemon::ScreenLockController> = Arc::new(screen_lock_linux::LinuxScreenLock);
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(target_os = "macos")]
+                let screen_lock: Arc<dyn continuity_daemon::ScreenLockController> = Arc::new(screen_lock_mac::MacScreenLock);
+                #[cfg(target_os = "windows")]
+                let screen_lock: Arc<dyn continuity_daemon::ScreenLockController> = Arc::new(screen_lock_windows::WindowsScreenLock);
+                #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
                 let screen_lock: Arc<dyn continuity_daemon::ScreenLockController> = Arc::new(continuity_daemon::NoopScreenLockController);
 
                 let config = EngineConfig {
@@ -1238,12 +1301,12 @@ fn start_engine_thread(
                     screen_lock,
                     received_files_dir: received_files_dir(&profile),
                 };
-                continuity_daemon::start(config).await
+                continuity_daemon::start(config).await.map(|engine| (engine, device_id))
             };
 
             match setup.await {
-                Ok(mut engine) => {
-                    let _ = ready_tx.send(Ok(engine.command_sender()));
+                Ok((mut engine, device_id)) => {
+                    let _ = ready_tx.send(Ok((engine.command_sender(), device_id)));
                     while let Some(event) = engine.events.recv().await {
                         if proxy.send_event(event).is_err() {
                             break;

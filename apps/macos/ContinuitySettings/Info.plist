@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>Continuity Settings</string>
+    <key>CFBundleDisplayName</key>
+    <string>Continuity Settings</string>
+    <key>CFBundleIdentifier</key>
+    <string>app.continuity.settings</string>
+    <!-- Stamped with the release version by build-app.sh. -->
+    <key>CFBundleVersion</key>
+    <string>0.0.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.0.0</string>
+    <key>CFBundleExecutable</key>
+    <string>ContinuitySettings</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <!-- NavigationSplitView and the grouped form style need macOS 13;
+         Continuity itself still runs on 11 and 12, without this window. -->
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+</dict>
+</plist>

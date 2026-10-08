@@ -125,7 +125,24 @@ impl TrustStore {
     /// `trust()`. `revoke`/`clear` above both also drop this — forgetting
     /// a device forgets everything about it, including this.
     pub fn allow_remote_control(&mut self, device_id: &str) -> Result<(), TrustError> {
-        self.file.remote_control_allowed.insert(device_id.to_string());
+        self.set_remote_control_allowed(device_id, true)
+    }
+
+    /// Sets or clears the remembered remote-control consent for one paired
+    /// peer — clearing it means that peer's next request asks again. Like
+    /// `set_unlock_allowed`, allowing a peer that isn't paired is refused
+    /// rather than stored. Turning it *on* without a request having been
+    /// answered is for a desktop settings window, which confirms with the
+    /// local user first.
+    pub fn set_remote_control_allowed(&mut self, device_id: &str, allowed: bool) -> Result<(), TrustError> {
+        if allowed {
+            if !self.is_trusted(device_id) {
+                return Ok(());
+            }
+            self.file.remote_control_allowed.insert(device_id.to_string());
+        } else {
+            self.file.remote_control_allowed.remove(device_id);
+        }
         self.save()
     }
 
@@ -161,12 +178,18 @@ impl TrustStore {
         self.save()
     }
 
+    /// Writes a sibling temp file and renames it into place, so anything
+    /// reading the trust file at the same time (a desktop settings window
+    /// does) sees either the old contents or the new, never half of one.
     fn save(&self) -> Result<(), TrustError> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let raw = serde_json::to_string_pretty(&self.file)?;
-        std::fs::write(&self.path, raw)?;
+        let mut temp = self.path.clone().into_os_string();
+        temp.push(".tmp");
+        std::fs::write(&temp, raw)?;
+        std::fs::rename(&temp, &self.path)?;
         Ok(())
     }
 }
@@ -284,6 +307,30 @@ mod tests {
         let (mut store, _dir) = temp_store();
         store.set_unlock_allowed("stranger", true).unwrap();
         assert!(!store.is_unlock_allowed("stranger"));
+    }
+
+    #[test]
+    fn remembered_remote_control_consent_can_be_withdrawn_but_not_granted_to_strangers() {
+        let (mut store, dir) = temp_store();
+        let path = store_path(&store);
+        store.trust(TrustedDevice { id: "abc123".into(), name: "Test Phone".into(), paired_at_unix: 1 }).unwrap();
+        store.allow_remote_control("abc123").unwrap();
+
+        store.set_remote_control_allowed("abc123", false).unwrap();
+        assert!(!store.is_remote_control_allowed("abc123"), "withdrawn consent means the next request asks again");
+        assert!(!TrustStore::load(path.clone()).unwrap().is_remote_control_allowed("abc123"), "and that persists");
+
+        store.set_remote_control_allowed("stranger", true).unwrap();
+        assert!(!store.is_remote_control_allowed("stranger"));
+        drop(dir);
+    }
+
+    #[test]
+    fn saving_leaves_no_temp_file_behind() {
+        let (mut store, dir) = temp_store();
+        store.trust(TrustedDevice { id: "abc123".into(), name: "Test Phone".into(), paired_at_unix: 1 }).unwrap();
+        let names: Vec<String> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, ["trusted_devices.json"]);
     }
 
     fn store_path(store: &TrustStore) -> PathBuf {

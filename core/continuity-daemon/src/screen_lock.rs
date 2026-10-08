@@ -12,10 +12,12 @@ pub enum ScreenLockError {
 }
 
 /// Locks or unlocks this device's own screen on request from a paired peer
-/// (`Message::ScreenLockRequest`). Pluggable like `MediaController` — only
-/// Linux has a real implementation (`continuityd`'s `LinuxScreenLock`,
-/// which asks systemd-logind, the same thing `loginctl lock-session` /
-/// `unlock-session` do). Every other shell wires in
+/// (`Message::ScreenLockRequest`). Pluggable like `MediaController` —
+/// `continuityd` implements it on Linux (`LinuxScreenLock`: lock and
+/// unlock through systemd-logind, the same thing `loginctl lock-session` /
+/// `unlock-session` do), macOS (`MacScreenLock`) and Windows
+/// (`WindowsScreenLock`) — the last two lock only, since neither lets an
+/// app dismiss its lock screen. Every other shell wires in
 /// `NoopScreenLockController`, and the engine answers `Unsupported` for it
 /// without bothering anyone.
 ///
@@ -29,6 +31,14 @@ pub enum ScreenLockError {
 pub trait ScreenLockController: Send + Sync {
     /// `false` means this device can't be locked/unlocked remotely at all.
     fn is_available(&self) -> bool {
+        true
+    }
+
+    /// `false` for a device that can be locked but never unlocked (macOS,
+    /// Windows). The engine then answers an unlock request `Unsupported`
+    /// straight away — not `NotAllowed`, which would send the requester
+    /// looking for an "Allow Remote Unlock" setting that can't exist here.
+    fn can_unlock(&self) -> bool {
         true
     }
 

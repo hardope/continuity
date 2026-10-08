@@ -244,8 +244,10 @@ private fun QuickActions(device: DeviceStatus, onSendFiles: () -> Unit, onUnlock
                 },
             )
         }
-        if (device.supportsScreenLock) {
+        if (device.supportsLock) {
             add(DeviceAction(Icons.Default.Lock, "Lock") { EngineHolder.engine?.requestScreenLock(device.id, FfiScreenLockAction.LOCK) })
+        }
+        if (device.supportsUnlock) {
             add(DeviceAction(Icons.Default.LockOpen, "Unlock", onUnlock))
         }
     }

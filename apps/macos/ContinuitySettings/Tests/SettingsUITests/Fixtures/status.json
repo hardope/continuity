@@ -1,0 +1,31 @@
+{
+  "ok": true,
+  "status": {
+    "device": { "name": "MacBook Air", "id": "0f3a9c", "platform": "mac_os", "version": "0.1.6-beta.6" },
+    "paused": false,
+    "devices": [
+      {
+        "id": "pixel",
+        "name": "Pixel 8",
+        "platform": "android",
+        "connected": true,
+        "paired_at_unix": 1756000000,
+        "remote_control_allowed": true,
+        "unlock_allowed": false
+      },
+      {
+        "id": "office",
+        "name": "Office PC",
+        "platform": null,
+        "connected": false,
+        "paired_at_unix": 1757500000,
+        "remote_control_allowed": false,
+        "unlock_allowed": false
+      }
+    ],
+    "nearby": [{ "id": "tab", "name": "Galaxy Tab S9", "platform": "android" }],
+    "received_files_dir": "/Users/me/Downloads/Continuity",
+    "can_be_controlled": true,
+    "can_be_unlocked": false
+  }
+}

@@ -260,6 +260,12 @@ pub enum EngineCommand {
     /// (see `TrustStore::set_unlock_allowed`). The shell is responsible for
     /// confirming with the local user before turning it on.
     SetUnlockAllowed { peer_crypto_id: String, allowed: bool },
+    /// Sets or clears the remembered "allowed to control this device"
+    /// answer for one paired peer (see `TrustStore::set_remote_control_allowed`)
+    /// — cleared, that peer's next remote-control request asks again. For
+    /// a desktop settings window; no event confirms it, since nothing on
+    /// the wire changes (the settings window re-reads the trust store).
+    SetRemoteControlAllowed { peer_crypto_id: String, allowed: bool },
     /// Puts `text` on one peer's clipboard — a targeted, one-off version of
     /// the clipboard sync that normally broadcasts to everyone, for
     /// "share this text to that device" (a link shared from a phone's

@@ -93,6 +93,15 @@ image = { version = "0.25", default-features = false, features = ["jpeg"], optio
 # `features = ["gtk3"]` override below would both end up requested at
 # once on Linux. Each platform gets its own complete, target-scoped
 # declaration instead — see below.
+[dev-dependencies]
+tempfile = "3"
+
+# The portal client's tests (src/remote_control_linux/portal_tests.rs) stand
+# a mock xdg-desktop-portal up on a peer-to-peer connection, which needs
+# these two zbus features. Test builds only — the app itself doesn't get them.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+zbus = { version = "4", features = ["p2p", "bus-impl"] }
+
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 rfd = "0.15"
 
@@ -144,6 +153,8 @@ windows = { version = "0.58", features = [
     # IShellLinkW — share.rs writes Explorer "Send to" shortcuts, one per
     # connected device.
     "Win32_UI_Shell",
+    # LockWorkStation — screen_lock_windows.rs, remote lock.
+    "Win32_System_Shutdown",
 ] }
 
 # MPRIS media control/reads over D-Bus — see src/media_linux.rs. Also
