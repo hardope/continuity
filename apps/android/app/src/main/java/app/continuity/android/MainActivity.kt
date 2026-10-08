@@ -609,9 +609,7 @@ private fun RemoteControlScreen(
                                 )
                             }
                         } else {
-                            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                                CircularProgressIndicator(color = androidx.compose.ui.graphics.Color.White)
-                            }
+                            WaitingForFirstFrame(peerName = peerName, platform = platform)
                         }
                     }
                 }
@@ -769,6 +767,39 @@ private fun RemoteControlScreen(
                     Icon(Icons.Default.Keyboard, contentDescription = "Toggle keyboard")
                 }
             }
+        }
+    }
+}
+
+/// Shown until the first frame arrives. A Linux computer asks its own user
+/// to allow screen sharing before it can send anything — and may be
+/// unattended — so this says so rather than spinning without explanation.
+/// If it's declined or nobody answers, the session ends with the
+/// computer's reason (shown as a notice) instead of waiting forever.
+@Composable
+private fun WaitingForFirstFrame(peerName: String, platform: String) {
+    Column(
+        modifier = Modifier.fillMaxSize().padding(32.dp),
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        CircularProgressIndicator(color = androidx.compose.ui.graphics.Color.White)
+        Spacer(Modifier.height(20.dp))
+        Text(
+            "Connecting to $peerName...",
+            color = androidx.compose.ui.graphics.Color.White,
+            style = MaterialTheme.typography.titleMedium,
+            textAlign = TextAlign.Center,
+        )
+        if (platform == "linux") {
+            Spacer(Modifier.height(8.dp))
+            Text(
+                "$peerName may ask to allow screen sharing first. Approve it on that computer.",
+                color = androidx.compose.ui.graphics.Color.White.copy(alpha = 0.7f),
+                style = MaterialTheme.typography.bodyMedium,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.widthIn(max = 360.dp),
+            )
         }
     }
 }

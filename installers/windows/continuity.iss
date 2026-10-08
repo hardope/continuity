@@ -13,7 +13,12 @@
 ; scaffolding users expect from a background sync tool.
 
 #define MyAppName "Continuity"
-#define MyAppVersion "0.1.5-beta.14"
+; CI passes the workspace version (ISCC /DMyAppVersion=...) so the installer
+; can't fall behind the app the way a hand-edited number did; this default
+; only applies to a manual compile.
+#ifndef MyAppVersion
+  #define MyAppVersion "0.1.6-beta.4"
+#endif
 #define MyAppPublisher "hardope"
 #define MyAppURL "https://github.com/hardope/continuity"
 #define MyAppExeName "continuityd.exe"

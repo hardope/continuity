@@ -1,503 +1,453 @@
-//! Linux remote control via the xdg-desktop-portal `RemoteDesktop` +
-//! `ScreenCast` portals — Wayland-compatible (works under both native
-//! Wayland and X11-via-XWayland), unlike classic X11/XTest, which simply
-//! doesn't function at all under a native Wayland session (the default
-//! on current GNOME/Ubuntu/Fedora). This is why Linux never had a real
-//! `RemoteControlHost` before now: unlike macOS/Windows's synchronous,
-//! pre-granted-once permission model, this is an inherently async,
-//! D-Bus-based flow that prompts the user with a real system dialog on
-//! *every* session (mitigated somewhat by requesting `persist_mode`, see
-//! below).
+//! Linux remote control: the controlled side's screen capture and input
+//! injection, through the xdg-desktop-portal `RemoteDesktop` + `ScreenCast`
+//! portals (the `portal` module) and the PipeWire stream they hand back.
+//! Works under native Wayland (GNOME, KDE Plasma) — where XTest, the
+//! classic X11 route, doesn't work at all — and on X11 sessions that run a
+//! portal.
 //!
-//! Every D-Bus/portal call in this file (session setup, permission
-//! negotiation, input injection) is checked against the real, versioned
-//! xdg-desktop-portal D-Bus interface specification (freedesktop.org's
-//! own XML — `RemoteDesktop` interface v2, `ScreenCast` interface v6),
-//! using `zbus` (a pure-Rust D-Bus client with no system library
-//! dependency). The PipeWire video-capture half (`run_pipewire_capture`)
-//! is written against the `pipewire` crate's own real source (its
-//! `examples/streams.rs`, plus `libspa`'s `buffer`/`param::video`
-//! modules) rather than general knowledge. Both halves have been
-//! compiled for real — not just reviewed — against a genuine
-//! `libpipewire`/`libspa` (0.3.65, via a Linux container with the real
-//! dev packages installed) and real D-Bus headers, which caught and
-//! fixed three real bugs a plain read wouldn't have: a `pw` alias scoped
-//! too narrowly to reach `CaptureUserData`/`encode_video_frame_to_jpeg`,
-//! and a `.cloned()` call on `zbus::zvariant::OwnedValue`, which doesn't
-//! implement `Clone` in zbus 4.4 (fixed to `HashMap::remove` instead,
-//! which needs no clone at all). What remains unverified is *runtime
-//! behavior*: none of this has actually been run against a live
-//! compositor, since there's no real Wayland session in this dev
-//! environment. Format negotiation in particular (the
-//! `SPA_PARAM_EnumFormat` POD built in `run_pipewire_capture`) is the
-//! kind of binary, easy-to-get-subtly-wrong code that's best confirmed
-//! on the user's own Linux box even so.
+//! Unlike macOS and Windows, the desktop asks its own user to approve each
+//! session (on top of Continuity's per-device consent), and that dialog
+//! can take as long as it takes someone to walk over, or never be answered.
+//! So capture here can still fail after `start_capture` has returned a
+//! channel: the engine waits for the first frame before opening the screen
+//! stream, and asks `capture_failure_reason` if one never comes. Portals
+//! that support it (`RemoteDesktop` v2) can remember the approval, so after
+//! the first time a session can start without the dialog; the token for
+//! that lives next to the trust store.
+
+mod portal;
 
 use continuity_daemon::RemoteControlHost;
 use continuity_proto::{InputEventKind, MouseButton as ProtoMouseButton};
-use futures_util::StreamExt;
 use pipewire as pw;
 use pw::spa;
-use std::collections::HashMap;
+use std::cell::{Cell, RefCell};
 use std::os::fd::OwnedFd;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc;
-use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
-use zbus::{Connection, MatchRule, MessageStream};
-
-const PORTAL_DEST: &str = "org.freedesktop.portal.Desktop";
-const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
-const REMOTE_DESKTOP_IFACE: &str = "org.freedesktop.portal.RemoteDesktop";
-const SCREEN_CAST_IFACE: &str = "org.freedesktop.portal.ScreenCast";
-const REQUEST_IFACE: &str = "org.freedesktop.portal.Request";
+use std::time::{Duration, Instant};
+use tokio::sync::{mpsc, oneshot, watch};
 
 // Evdev button codes (linux/input-event-codes.h) — `NotifyPointerButton`
-// takes these directly; they're a different numbering entirely from
-// Windows' `MOUSEEVENTF_*`/macOS's `CGMouseButton`.
+// takes these directly; a different numbering entirely from Windows'
+// `MOUSEEVENTF_*`/macOS's `CGMouseButton`.
 const BTN_LEFT: i32 = 0x110;
 const BTN_RIGHT: i32 = 0x111;
 const BTN_MIDDLE: i32 = 0x112;
 
+/// The same rate macOS and Windows capture at. Negotiated with the
+/// compositor as the stream's *maximum* framerate, so it throttles at the
+/// source — GNOME then sends a follow-up frame for any change it held
+/// back, where dropping frames here could lose the last one.
+const MAX_FRAMES_PER_SECOND: u32 = 10;
+
+/// Frames wider than this are scaled down by a whole factor before
+/// encoding. A phone can't show more than this across anyway, and
+/// JPEG-encoding a 4K frame ten times a second would keep a core busy.
+const MAX_ENCODED_WIDTH: usize = 1920;
+
+const JPEG_QUALITY: u8 = 40;
+
+/// A stream that has connected but produced no picture in this long is
+/// treated as broken, rather than leaving the other device on a spinner.
+const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(20);
+
 pub struct LinuxRemoteControlHost {
-    capturing: Arc<AtomicBool>,
-    session: Arc<Mutex<Option<PortalSession>>>,
+    restore_token_path: Option<PathBuf>,
+    /// The session currently being set up or captured, if any.
+    current: Mutex<Option<Arc<CaptureRun>>>,
+    /// Why the latest capture stopped on its own — see
+    /// `capture_failure_reason`.
+    failure: Arc<Mutex<Option<String>>>,
 }
 
-/// What `inject` needs to actually deliver an event once a session is
-/// live — cloned out to the async task that makes the D-Bus call, since
-/// `inject` itself is a synchronous trait method.
-#[derive(Clone)]
-struct PortalSession {
-    connection: Connection,
-    session_handle: OwnedObjectPath,
-    /// Needed for `NotifyPointerMotionAbsolute`, which is defined
-    /// relative to a specific stream's own logical coordinate space —
-    /// there's no session-wide "the screen" to move against directly.
-    stream_node_id: u32,
+/// One `start_capture`'s worth of state, so a session that's still winding
+/// down can't be mistaken for the next one.
+struct CaptureRun {
+    stop: watch::Sender<bool>,
+    /// Feeds the single task that delivers this session's input, once the
+    /// portal session exists.
+    input: Mutex<Option<mpsc::UnboundedSender<InputEventKind>>>,
 }
 
 impl LinuxRemoteControlHost {
-    pub fn new() -> Self {
-        Self { capturing: Arc::new(AtomicBool::new(false)), session: Arc::new(Mutex::new(None)) }
+    pub fn new(restore_token_path: Option<PathBuf>) -> Self {
+        Self { restore_token_path, current: Mutex::new(None), failure: Arc::new(Mutex::new(None)) }
     }
 }
 
-impl Default for LinuxRemoteControlHost {
-    fn default() -> Self {
-        Self::new()
-    }
+/// Where the portal's restore token is kept: next to the trust store, one
+/// per profile, readable only by this user.
+pub fn restore_token_path(profile: &str) -> Option<PathBuf> {
+    let dirs = directories::ProjectDirs::from("app", "continuity", "continuity")?;
+    Some(dirs.config_dir().join(format!("remote-desktop-restore-token.{profile}")))
 }
 
 impl RemoteControlHost for LinuxRemoteControlHost {
     fn inject(&self, event: InputEventKind) {
-        let Some(session) = self.session.lock().unwrap().clone() else {
+        let Some(run) = self.current.lock().unwrap().clone() else {
             return;
         };
-        tokio::spawn(async move {
-            if let Err(e) = notify_input(&session, event).await {
-                tracing::debug!("couldn't deliver input event to the portal: {e}");
-            }
-        });
+        if let Some(input) = run.input.lock().unwrap().as_ref() {
+            let _ = input.send(event);
+        }
     }
 
     fn start_capture(&self) -> Option<mpsc::Receiver<Vec<u8>>> {
-        self.capturing.store(true, Ordering::Relaxed);
-        let capturing = self.capturing.clone();
-        let session_slot = self.session.clone();
-        let (tx, rx) = mpsc::channel(2);
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let run = Arc::new(CaptureRun { stop: stop_tx, input: Mutex::new(None) });
+        if let Some(previous) = self.current.lock().unwrap().replace(run.clone()) {
+            let _ = previous.stop.send(true);
+        }
+        *self.failure.lock().unwrap() = None;
 
-        // The whole negotiation (D-Bus session setup, the portal's own
-        // permission dialog, opening the PipeWire remote) is async and
-        // can take an arbitrary amount of real human time to complete —
-        // this can't block the engine's command loop the way macOS/
-        // Windows's quick, already-granted-once permission checks do.
-        // Runs on its own thread with its own current-thread runtime; if
-        // negotiation fails or the user denies the portal prompt, `tx`
-        // is simply dropped, closing the channel the same way an
-        // outright capture failure does on the other two platforms.
-        std::thread::spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-                Ok(rt) => rt,
+        let (frames_tx, frames_rx) = mpsc::channel(2);
+        let failure = self.failure.clone();
+        let token_path = self.restore_token_path.clone();
+        // Portal setup is async D-Bus traffic that can wait minutes on a
+        // person, so it gets its own thread and runtime instead of
+        // borrowing the engine's.
+        let spawned = std::thread::Builder::new().name("remote-desktop".to_string()).spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                Ok(runtime) => runtime,
                 Err(e) => {
-                    tracing::warn!("couldn't start a runtime for the Linux remote-control session: {e}");
+                    *failure.lock().unwrap() = Some(format!("couldn't start screen sharing: {e}"));
                     return;
                 }
             };
-            rt.block_on(async move {
-                match negotiate_portal_session().await {
-                    Ok((connection, session_handle, stream_node_id, pw_fd)) => {
-                        *session_slot.lock().unwrap() =
-                            Some(PortalSession { connection, session_handle: session_handle.clone(), stream_node_id });
-                        // PipeWire's own event loop is not tokio-based —
-                        // it needs its own dedicated OS thread, separate
-                        // from the D-Bus negotiation above.
-                        let tx_for_pw = tx.clone();
-                        let capturing_for_pw = capturing.clone();
-                        let pw_thread = std::thread::spawn(move || {
-                            run_pipewire_capture(pw_fd, stream_node_id, capturing_for_pw, tx_for_pw);
-                        });
-                        let _ = pw_thread.join();
-                        *session_slot.lock().unwrap() = None;
-                        if let Err(e) = end_portal_session(&session_slot).await {
-                            tracing::debug!("couldn't cleanly close the portal session: {e}");
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Linux remote-control session negotiation failed: {e}");
-                    }
-                }
-            });
+            runtime.block_on(run_session(run, stop_rx, frames_tx, failure, token_path));
         });
-
-        Some(rx)
+        if let Err(e) = spawned {
+            tracing::warn!("couldn't start the remote-desktop thread: {e}");
+            return None;
+        }
+        Some(frames_rx)
     }
 
     fn stop_capture(&self) {
-        self.capturing.store(false, Ordering::Relaxed);
+        if let Some(run) = self.current.lock().unwrap().take() {
+            let _ = run.stop.send(true);
+        }
+    }
+
+    fn capture_failure_reason(&self) -> Option<String> {
+        self.failure.lock().unwrap().clone()
     }
 }
 
-async fn end_portal_session(_session_slot: &Arc<Mutex<Option<PortalSession>>>) -> zbus::Result<()> {
-    // The session is already cleared from `session_slot` by the time
-    // this runs (see `start_capture`) — closing the underlying D-Bus
-    // `Session` object itself happens implicitly when its `Connection`
-    // is dropped along with the negotiation thread's runtime, since nothing
-    // else references it afterward. Kept as a named async fn (rather than
-    // inlined) as the natural place to add an explicit
-    // `org.freedesktop.portal.Session.Close` call if session cleanup
-    // ever needs to be more deliberate than "let it drop."
-    Ok(())
-}
-
-/// Runs the full portal negotiation: create a combined remote-desktop +
-/// screen-cast session, request keyboard+pointer control and monitor
-/// capture (cursor embedded directly in the stream — Linux is the only
-/// one of the three platforms where the real system cursor just comes
-/// along for free, no manual compositing needed the way Windows'
-/// `GetCursorInfo`/macOS's synthetic marker do), start it (this is what
-/// actually shows the user the system permission dialog), and open the
-/// PipeWire remote. Returns the connection (needed later for input
-/// injection), the session handle, the first stream's node ID, and the
-/// PipeWire remote's file descriptor.
-async fn negotiate_portal_session() -> zbus::Result<(Connection, OwnedObjectPath, u32, OwnedFd)> {
-    let connection = Connection::session().await?;
-
-    let session_token = format!("continuity_session_{}", std::process::id());
-    let session_path_str = format!("/org/freedesktop/portal/desktop/session/{session_token}");
-
-    let mut create_options: HashMap<&str, Value> = HashMap::new();
-    create_options.insert("session_handle_token", Value::from(session_token.as_str()));
-    let (_, create_results) =
-        call_portal_method(&connection, REMOTE_DESKTOP_IFACE, "CreateSession", PORTAL_PATH, &(create_options,)).await?;
-    let _ = create_results; // session_handle is also derivable from the token above; kept for clarity.
-    let session_handle = OwnedObjectPath::try_from(session_path_str.as_str())
-        .map_err(|e| zbus::Error::Failure(format!("invalid session object path: {e}")))?;
-
-    // KEYBOARD (1) | POINTER (2) — no TOUCHSCREEN (4), Android/iOS-style
-    // touch input already normalizes to mouse events before it ever
-    // reaches here (see `InputEventKind`'s own doc comment).
-    let mut device_options: HashMap<&str, Value> = HashMap::new();
-    device_options.insert("types", Value::from(3u32));
-    call_portal_method(
-        &connection,
-        REMOTE_DESKTOP_IFACE,
-        "SelectDevices",
-        PORTAL_PATH,
-        &(ObjectPath::try_from(session_handle.as_str())?, device_options),
-    )
-    .await?;
-
-    // types: MONITOR (1); cursor_mode: Embedded (2) — the compositor
-    // draws the real cursor directly into the stream's pixel buffers,
-    // so there's nothing here analogous to the Windows/macOS cursor
-    // compositing code at all.
-    let mut source_options: HashMap<&str, Value> = HashMap::new();
-    source_options.insert("types", Value::from(1u32));
-    source_options.insert("cursor_mode", Value::from(2u32));
-    call_portal_method(
-        &connection,
-        SCREEN_CAST_IFACE,
-        "SelectSources",
-        PORTAL_PATH,
-        &(ObjectPath::try_from(session_handle.as_str())?, source_options),
-    )
-    .await?;
-
-    // This call is what actually shows the user the real system "Share
-    // your screen and control input?" dialog — everything before this
-    // point is silent setup.
-    let start_options: HashMap<&str, Value> = HashMap::new();
-    let (_, mut start_results) = call_portal_method(
-        &connection,
-        REMOTE_DESKTOP_IFACE,
-        "Start",
-        PORTAL_PATH,
-        &(ObjectPath::try_from(session_handle.as_str())?, "", start_options),
-    )
-    .await?;
-
-    let streams: Vec<(u32, HashMap<String, OwnedValue>)> = start_results
-        .remove("streams")
-        .map(OwnedValue::try_into)
-        .transpose()
-        .map_err(|e: zbus::zvariant::Error| zbus::Error::Failure(format!("couldn't read streams from portal response: {e}")))?
-        .unwrap_or_default();
-    let (stream_node_id, _) =
-        streams.into_iter().next().ok_or_else(|| zbus::Error::Failure("portal accepted the session but offered no streams".to_string()))?;
-
-    let pw_options: HashMap<&str, Value> = HashMap::new();
-    let reply = connection
-        .call_method(
-            Some(PORTAL_DEST),
-            PORTAL_PATH,
-            Some(SCREEN_CAST_IFACE),
-            "OpenPipeWireRemote",
-            &(ObjectPath::try_from(session_handle.as_str())?, pw_options),
-        )
-        .await?;
-    let pw_fd: zbus::zvariant::OwnedFd = reply.body().deserialize()?;
-    let pw_fd: OwnedFd = pw_fd.into();
-
-    Ok((connection, session_handle, stream_node_id, pw_fd))
-}
-
-/// Calls a portal method and waits for its `Request::Response` signal —
-/// every portal method that can involve user interaction works this way
-/// (the method call itself only returns a `Request` object path; the
-/// real result arrives later as a signal on that path). Subscribes to
-/// the *predicted* response path before making the call, not after —
-/// otherwise a fast-responding portal backend could send the signal
-/// before anything is listening for it yet.
-async fn call_portal_method<B>(
-    connection: &Connection,
-    interface: &str,
-    method: &str,
-    path: &str,
-    body: &B,
-) -> zbus::Result<(u32, HashMap<String, OwnedValue>)>
-where
-    B: serde::Serialize + zbus::zvariant::DynamicType,
-{
-    let handle_token = format!("continuity_{}_{}", method.to_lowercase(), std::process::id());
-    let unique_name = connection.unique_name().ok_or_else(|| zbus::Error::Failure("no unique bus name for this connection".to_string()))?;
-    let sanitized = unique_name.trim_start_matches(':').replace('.', "_");
-    let request_path = format!("/org/freedesktop/portal/desktop/request/{sanitized}/{handle_token}");
-
-    let rule = MatchRule::builder().interface(REQUEST_IFACE)?.member("Response")?.path(request_path.as_str())?.build();
-    let mut stream = MessageStream::for_match_rule(rule, connection, Some(1)).await?;
-
-    connection.call_method(Some(PORTAL_DEST), path, Some(interface), method, body).await?;
-
-    let msg = stream.next().await.ok_or_else(|| zbus::Error::Failure("portal closed without ever responding".to_string()))??;
-    let (code, results): (u32, HashMap<String, OwnedValue>) = msg.body().deserialize()?;
-    if code != 0 {
-        return Err(zbus::Error::Failure(format!("portal request for {method} ended with response code {code} (denied or cancelled)")));
-    }
-    Ok((code, results))
-}
-
-async fn notify_input(session: &PortalSession, event: InputEventKind) -> zbus::Result<()> {
-    let path = ObjectPath::try_from(session.session_handle.as_str())?;
-    let empty_options: HashMap<&str, Value> = HashMap::new();
-    match event {
-        InputEventKind::KeyDown { code } => {
-            session
-                .connection
-                .call_method(
-                    Some(PORTAL_DEST),
-                    PORTAL_PATH,
-                    Some(REMOTE_DESKTOP_IFACE),
-                    "NotifyKeyboardKeycode",
-                    &(&path, &empty_options, code as i32, 1u32),
-                )
-                .await?;
+/// One session start to finish: set it up with the portal, capture until
+/// told to stop (or the stream fails), then close the portal session. The
+/// engine's frame channel only closes at the very end, after any failure
+/// reason has been recorded — that ordering is what lets the engine say
+/// *why* a session ended.
+async fn run_session(
+    run: Arc<CaptureRun>,
+    stop: watch::Receiver<bool>,
+    frames: mpsc::Sender<Vec<u8>>,
+    failure: Arc<Mutex<Option<String>>>,
+    token_path: Option<PathBuf>,
+) {
+    let restore_token = token_path.as_deref().and_then(read_restore_token);
+    let negotiated = match portal::negotiate(restore_token.as_deref(), &stop).await {
+        Ok(negotiated) => negotiated,
+        Err(e) => {
+            if e.kind == portal::ErrorKind::Cancelled {
+                tracing::debug!("remote-desktop setup cancelled: {e}");
+            } else {
+                tracing::warn!("remote-desktop setup failed: {e}");
+                *failure.lock().unwrap() = Some(e.reason);
+            }
+            return;
         }
-        InputEventKind::KeyUp { code } => {
-            session
-                .connection
-                .call_method(
-                    Some(PORTAL_DEST),
-                    PORTAL_PATH,
-                    Some(REMOTE_DESKTOP_IFACE),
-                    "NotifyKeyboardKeycode",
-                    &(&path, &empty_options, code as i32, 0u32),
-                )
-                .await?;
-        }
-        InputEventKind::MouseMove { x, y } => {
-            session
-                .connection
-                .call_method(
-                    Some(PORTAL_DEST),
-                    PORTAL_PATH,
-                    Some(REMOTE_DESKTOP_IFACE),
-                    "NotifyPointerMotionAbsolute",
-                    &(&path, &empty_options, session.stream_node_id, x, y),
-                )
-                .await?;
-        }
-        InputEventKind::MouseButton { button, down } => {
-            let evdev_button = match button {
-                ProtoMouseButton::Left => BTN_LEFT,
-                ProtoMouseButton::Right => BTN_RIGHT,
-                ProtoMouseButton::Middle => BTN_MIDDLE,
-            };
-            session
-                .connection
-                .call_method(
-                    Some(PORTAL_DEST),
-                    PORTAL_PATH,
-                    Some(REMOTE_DESKTOP_IFACE),
-                    "NotifyPointerButton",
-                    &(&path, &empty_options, evdev_button, if down { 1u32 } else { 0u32 }),
-                )
-                .await?;
-        }
-        InputEventKind::MouseScroll { delta_x, delta_y } => {
-            session
-                .connection
-                .call_method(
-                    Some(PORTAL_DEST),
-                    PORTAL_PATH,
-                    Some(REMOTE_DESKTOP_IFACE),
-                    "NotifyPointerAxis",
-                    &(&path, &empty_options, delta_x, delta_y),
-                )
-                .await?;
+    };
+    if negotiated.persistence_requested {
+        if let Some(path) = &token_path {
+            store_restore_token(path, negotiated.restore_token.as_deref());
         }
     }
-    Ok(())
+
+    let session = Arc::new(negotiated.session);
+    // The size of the frames PipeWire delivers (width << 32 | height):
+    // written by the capture thread, read when placing the pointer.
+    let frame_size = Arc::new(AtomicU64::new(0));
+
+    // One task delivers all of this session's input, so events reach the
+    // compositor in the order they were sent — a click has to land after
+    // the move before it.
+    let (input_tx, input_rx) = mpsc::unbounded_channel();
+    *run.input.lock().unwrap() = Some(input_tx);
+    let input_task = tokio::spawn(forward_input(session.clone(), input_rx, frame_size.clone()));
+
+    // The portal closes the session when sharing is stopped from this
+    // computer's own controls (GNOME's "Stop" button in the top bar).
+    let portal_closed = Arc::new(AtomicBool::new(false));
+    let closed_watch = tokio::spawn({
+        let session = session.clone();
+        let portal_closed = portal_closed.clone();
+        async move {
+            session.closed().await;
+            portal_closed.store(true, Ordering::Relaxed);
+        }
+    });
+
+    // PipeWire runs its own (non-tokio) loop, so it gets its own thread;
+    // this runtime stays free to deliver input in the meantime.
+    let (done_tx, done_rx) = oneshot::channel();
+    let capture = Capture {
+        node_id: session.node_id,
+        stop: stop.clone(),
+        portal_closed,
+        frames: frames.clone(),
+        frame_size,
+    };
+    let pipewire_fd = negotiated.pipewire_fd;
+    let spawned = std::thread::Builder::new()
+        .name("remote-desktop-capture".to_string())
+        .spawn(move || {
+            let _ = done_tx.send(run_pipewire_capture(pipewire_fd, capture));
+        });
+    let outcome = match spawned {
+        Ok(_) => done_rx.await.unwrap_or_else(|_| Err("screen capture stopped unexpectedly".to_string())),
+        Err(e) => Err(format!("couldn't start screen capture: {e}")),
+    };
+    if let Err(reason) = outcome {
+        if !*stop.borrow() {
+            tracing::warn!("screen capture ended: {reason}");
+            *failure.lock().unwrap() = Some(reason);
+        }
+    }
+
+    input_task.abort();
+    closed_watch.abort();
+    run.input.lock().unwrap().take();
+    session.close().await;
+    // Only now does the engine see its frame channel close — after any
+    // failure reason above is in place.
+    drop(frames);
 }
 
-/// Shared between the `param_changed` and `process` callbacks via
-/// `add_local_listener_with_user_data` — PipeWire dispatches both on the
-/// same thread/loop iteration, so a plain field (no `Mutex`) is enough.
-struct CaptureUserData {
-    format: pw::spa::param::video::VideoInfoRaw,
-    tx: mpsc::Sender<Vec<u8>>,
-    capturing: Arc<AtomicBool>,
+async fn forward_input(session: Arc<portal::PortalSession>, mut events: mpsc::UnboundedReceiver<InputEventKind>, frame_size: Arc<AtomicU64>) {
+    // Which size `NotifyPointerMotionAbsolute`'s coordinates are measured
+    // against differs by desktop. GNOME's compositor (mutter) divides them
+    // by the monitor's scale — they're in the stream's own pixels, the size
+    // of the frames PipeWire delivers, which under display scaling is
+    // larger than the logical size. KDE Plasma's portal adds them to the
+    // output's logical position instead, i.e. the size the portal
+    // reported. Using the matching one is what makes a tap on the phone
+    // land where it was tapped.
+    let logical = std::env::var("XDG_CURRENT_DESKTOP").is_ok_and(|desktop| desktop.to_ascii_uppercase().contains("KDE"));
+    while let Some(event) = events.recv().await {
+        let result = match event {
+            InputEventKind::KeyDown { code } => session.notify_keyboard_keycode(code as i32, true).await,
+            InputEventKind::KeyUp { code } => session.notify_keyboard_keycode(code as i32, false).await,
+            InputEventKind::MouseMove { x, y } => {
+                let Some((width, height)) = pointer_space(&session, &frame_size, logical) else {
+                    continue;
+                };
+                session.notify_pointer_motion_absolute(x.clamp(0.0, 1.0) * width, y.clamp(0.0, 1.0) * height).await
+            }
+            InputEventKind::MouseButton { button, down } => {
+                let button = match button {
+                    ProtoMouseButton::Left => BTN_LEFT,
+                    ProtoMouseButton::Right => BTN_RIGHT,
+                    ProtoMouseButton::Middle => BTN_MIDDLE,
+                };
+                session.notify_pointer_button(button, down).await
+            }
+            // The controller sends tao's "content moves" convention
+            // (positive = scroll up/left); the portal takes libinput's
+            // (positive = down/right).
+            InputEventKind::MouseScroll { delta_x, delta_y } => session.notify_pointer_axis(-delta_x, -delta_y).await,
+        };
+        if let Err(e) = result {
+            tracing::debug!("couldn't deliver input to the portal: {e}");
+        }
+    }
 }
 
-/// Runs PipeWire's own (non-tokio) event loop on the calling thread for
-/// as long as `capturing` stays true, encoding each captured frame to
-/// JPEG and forwarding it through `tx` — mirroring the capture-thread
-/// shape `remote_control_mac.rs`/`remote_control_windows.rs` both use,
-/// just driven by PipeWire's callback-based stream API instead of a
-/// simple poll-in-a-loop. Follows the `pipewire` crate's own
-/// `examples/streams.rs` pattern (verified against its real source —
-/// see the module doc comment).
-fn run_pipewire_capture(pw_fd: OwnedFd, node_id: u32, capturing: Arc<AtomicBool>, tx: mpsc::Sender<Vec<u8>>) {
+fn pointer_space(session: &portal::PortalSession, frame_size: &AtomicU64, logical: bool) -> Option<(f64, f64)> {
+    let packed = frame_size.load(Ordering::Relaxed);
+    let frame = (packed != 0).then(|| ((packed >> 32) as f64, (packed & 0xffff_ffff) as f64));
+    let reported = session.logical_size.filter(|&(w, h)| w > 0 && h > 0).map(|(w, h)| (f64::from(w), f64::from(h)));
+    if logical {
+        reported.or(frame)
+    } else {
+        frame.or(reported)
+    }
+}
+
+fn read_restore_token(path: &Path) -> Option<String> {
+    let token = std::fs::read_to_string(path).ok()?;
+    let token = token.trim();
+    (!token.is_empty()).then(|| token.to_string())
+}
+
+/// A restore token is single-use: the session that used one hands back its
+/// replacement (or nothing, if the person here didn't allow it to persist).
+fn store_restore_token(path: &Path, token: Option<&str>) {
+    let result = match token {
+        Some(token) => crate::share::write_private_file(path, token.as_bytes()),
+        None => match std::fs::remove_file(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        },
+    };
+    if let Err(e) = result {
+        tracing::debug!("couldn't update {}: {e}", path.display());
+    }
+}
+
+/// Everything the capture thread needs besides the PipeWire remote itself.
+struct Capture {
+    node_id: u32,
+    stop: watch::Receiver<bool>,
+    portal_closed: Arc<AtomicBool>,
+    frames: mpsc::Sender<Vec<u8>>,
+    frame_size: Arc<AtomicU64>,
+}
+
+/// What the stream callbacks share — PipeWire runs them all on this thread.
+struct CaptureState {
+    format: spa::param::video::VideoInfoRaw,
+    frames: mpsc::Sender<Vec<u8>>,
+    frame_size: Arc<AtomicU64>,
+    progress: Rc<CaptureProgress>,
+    warned_unreadable: bool,
+}
+
+/// What the callbacks report back to the loop driving them.
+#[derive(Default)]
+struct CaptureProgress {
+    frames_sent: Cell<u64>,
+    /// The engine stopped listening — the session is over.
+    receiver_gone: Cell<bool>,
+    /// The stream failed or went away; why, worded for the other device.
+    ended: RefCell<Option<String>>,
+}
+
+/// Runs PipeWire's own event loop on this thread until the session is
+/// stopped or the stream fails, encoding each frame to JPEG for the engine.
+/// `Err` carries a reason for the controlling device.
+fn run_pipewire_capture(pipewire_fd: OwnedFd, capture: Capture) -> Result<(), String> {
     pw::init();
 
-    let mainloop = match pw::main_loop::MainLoop::new(None) {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::warn!("couldn't create PipeWire main loop: {e}");
-            return;
-        }
-    };
-    let context = match pw::context::Context::new(&mainloop) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!("couldn't create PipeWire context: {e}");
-            return;
-        }
-    };
-    // Connects to the *specific* PipeWire remote the portal opened for
-    // us (only the screen-cast stream nodes are visible through it),
-    // not the system-wide PipeWire instance.
-    let core = match context.connect_fd(pw_fd, None) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!("couldn't connect to the portal's PipeWire remote: {e}");
-            return;
-        }
-    };
+    let mainloop = pw::main_loop::MainLoop::new(None).map_err(|e| format!("couldn't start PipeWire: {e}"))?;
+    let context = pw::context::Context::new(&mainloop).map_err(|e| format!("couldn't start PipeWire: {e}"))?;
+    // The portal's own PipeWire remote — only this session's stream is
+    // visible through it.
+    let core = context.connect_fd(pipewire_fd, None).map_err(|e| format!("couldn't connect to the shared screen: {e}"))?;
+    let stream = pw::stream::Stream::new(
+        &core,
+        "continuity-remote-control",
+        pw::properties::properties! {
+            *pw::keys::MEDIA_TYPE => "Video",
+            *pw::keys::MEDIA_CATEGORY => "Capture",
+            *pw::keys::MEDIA_ROLE => "Screen",
+        },
+    )
+    .map_err(|e| format!("couldn't open the shared screen: {e}"))?;
 
-    let stream = match pw::stream::Stream::new(&core, "continuity-remote-control", pw::properties::properties! {
-        *pw::keys::MEDIA_TYPE => "Video",
-        *pw::keys::MEDIA_CATEGORY => "Capture",
-        *pw::keys::MEDIA_ROLE => "Screen",
-    }) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!("couldn't create PipeWire stream: {e}");
-            return;
-        }
+    let progress = Rc::new(CaptureProgress::default());
+    let state = CaptureState {
+        format: Default::default(),
+        frames: capture.frames,
+        frame_size: capture.frame_size,
+        progress: progress.clone(),
+        warned_unreadable: false,
     };
-
-    let data = CaptureUserData { format: Default::default(), tx, capturing: capturing.clone() };
-
-    let listener = stream
-        .add_local_listener_with_user_data(data)
-        .state_changed(|_, _, old, new| {
+    let _listener = stream
+        .add_local_listener_with_user_data(state)
+        .state_changed(|_, state, old, new| {
             tracing::debug!("PipeWire stream state: {old:?} -> {new:?}");
+            let ended = match new {
+                pw::stream::StreamState::Error(message) => Some(format!("the shared screen stream failed: {message}")),
+                // The compositor took the stream away.
+                pw::stream::StreamState::Unconnected => Some("screen sharing was stopped on this computer".to_string()),
+                _ => None,
+            };
+            if let Some(reason) = ended {
+                state.progress.ended.borrow_mut().get_or_insert(reason);
+            }
         })
-        .param_changed(|_, user_data, id, param| {
+        .param_changed(|_, state, id, param| {
             let Some(param) = param else { return };
             if id != spa::param::ParamType::Format.as_raw() {
                 return;
             }
-            let (media_type, media_subtype) = match spa::param::format_utils::parse_format(param) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!("couldn't parse PipeWire format param: {e}");
-                    return;
-                }
+            let Ok((media_type, media_subtype)) = spa::param::format_utils::parse_format(param) else {
+                return;
             };
-            if media_type != spa::param::format::MediaType::Video
-                || media_subtype != spa::param::format::MediaSubtype::Raw
-            {
+            if media_type != spa::param::format::MediaType::Video || media_subtype != spa::param::format::MediaSubtype::Raw {
                 return;
             }
-            if let Err(e) = user_data.format.parse(param) {
-                tracing::warn!("couldn't parse negotiated video format: {e}");
+            if let Err(e) = state.format.parse(param) {
+                tracing::warn!("couldn't parse the negotiated video format: {e}");
                 return;
             }
-            let size = user_data.format.size();
+            let size = state.format.size();
+            state.frame_size.store((u64::from(size.width) << 32) | u64::from(size.height), Ordering::Relaxed);
+            let max = state.format.max_framerate();
             tracing::debug!(
-                "PipeWire negotiated {:?} at {}x{}",
-                user_data.format.format(),
+                "PipeWire negotiated {:?} at {}x{}, at most {}/{} fps",
+                state.format.format(),
                 size.width,
-                size.height
+                size.height,
+                max.num,
+                max.denom
             );
         })
-        .process(|stream, user_data| {
-            if !user_data.capturing.load(Ordering::Relaxed) {
+        .process(|stream, state| {
+            // Only the newest queued frame is worth encoding; dropping a
+            // `Buffer` hands it straight back to the compositor.
+            let mut newest = None;
+            while let Some(buffer) = stream.dequeue_buffer() {
+                newest = Some(buffer);
+            }
+            let Some(mut buffer) = newest else { return };
+            let size = state.format.size();
+            if size.width == 0 || size.height == 0 {
+                return; // No format negotiated yet.
+            }
+            let Some(data) = buffer.datas_mut().first_mut() else { return };
+            let chunk = data.chunk();
+            let (offset, len, stride) = (chunk.offset() as usize, chunk.size() as usize, chunk.stride());
+            if len == 0 || chunk.flags().contains(spa::buffer::ChunkFlags::CORRUPTED) {
                 return;
             }
-            let Some(mut buffer) = stream.dequeue_buffer() else { return };
-            let datas = buffer.datas_mut();
-            let Some(data) = datas.first_mut() else { return };
-            let chunk_size = data.chunk().size() as usize;
-            let stride = data.chunk().stride();
-            let Some(raw) = data.data() else { return };
-            let raw = &raw[..chunk_size.min(raw.len())];
-
-            let size = user_data.format.size();
-            if size.width == 0 || size.height == 0 {
-                return; // Format not negotiated yet — first few buffers only.
-            }
-            if let Some(jpeg) = encode_video_frame_to_jpeg(raw, size.width, size.height, stride, user_data.format.format()) {
-                let _ = user_data.tx.try_send(jpeg);
+            let data_type = data.type_();
+            let Some(mapped) = data.data() else {
+                // Only memory PipeWire maps for us is readable here.
+                if !state.warned_unreadable {
+                    tracing::warn!("PipeWire delivered a {data_type:?} screen buffer that can't be read directly");
+                    state.warned_unreadable = true;
+                }
+                return;
+            };
+            let start = offset.min(mapped.len());
+            let pixels = &mapped[start..(start + len).min(mapped.len())];
+            let Some(jpeg) = encode_frame(pixels, size.width as usize, size.height as usize, stride, state.format.format()) else {
+                return;
+            };
+            match state.frames.try_send(jpeg) {
+                Ok(()) => state.progress.frames_sent.set(state.progress.frames_sent.get() + 1),
+                // Still sending the previous frame; this one would be
+                // stale by the time it could go.
+                Err(mpsc::error::TrySendError::Full(_)) => {}
+                Err(mpsc::error::TrySendError::Closed(_)) => state.progress.receiver_gone.set(true),
             }
         })
-        .register();
-    let _listener = match listener {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::warn!("couldn't register the PipeWire stream listener: {e}");
-            return;
-        }
-    };
+        .register()
+        .map_err(|e| format!("couldn't watch the shared screen stream: {e}"))?;
 
-    // Enumerate the pixel formats screen-cast sources actually offer
-    // (overwhelmingly BGRx on a real compositor, but a few also offer
-    // RGBx/RGBA/RGB) — mirrors `pipewire`'s own `examples/streams.rs`,
-    // which builds this same kind of `Choice`/`Enum` POD by hand rather
-    // than relying on any default.
-    let obj = pw::spa::pod::object!(
+    // What this can read: plain 32-bit RGB layouts in memory PipeWire maps
+    // for us. Not offering a DMA-BUF `modifier` is what keeps GNOME on
+    // shared-memory buffers (its DMA-BUF formats require one). The
+    // framerate range accepts anything (GNOME reports a variable 0/1, a
+    // high-refresh monitor may report more); the *maximum* framerate is the
+    // actual throttle, as browsers' screen capture does it.
+    let format = pw::spa::pod::object!(
         spa::utils::SpaTypes::ObjectParamFormat,
         spa::param::ParamType::EnumFormat,
         pw::spa::pod::property!(spa::param::format::FormatProperties::MediaType, Id, spa::param::format::MediaType::Video),
@@ -527,85 +477,145 @@ fn run_pipewire_capture(pw_fd: OwnedFd, node_id: u32, capturing: Arc<AtomicBool>
             Choice,
             Range,
             Fraction,
-            spa::utils::Fraction { num: 15, denom: 1 },
+            spa::utils::Fraction { num: MAX_FRAMES_PER_SECOND, denom: 1 },
             spa::utils::Fraction { num: 0, denom: 1 },
-            spa::utils::Fraction { num: 60, denom: 1 }
+            spa::utils::Fraction { num: 1000, denom: 1 }
+        ),
+        pw::spa::pod::property!(
+            spa::param::format::FormatProperties::VideoMaxFramerate,
+            Choice,
+            Range,
+            Fraction,
+            spa::utils::Fraction { num: MAX_FRAMES_PER_SECOND, denom: 1 },
+            spa::utils::Fraction { num: 0, denom: 1 },
+            spa::utils::Fraction { num: MAX_FRAMES_PER_SECOND, denom: 1 }
         ),
     );
-    let values: Vec<u8> = match pw::spa::pod::serialize::PodSerializer::serialize(
-        std::io::Cursor::new(Vec::new()),
-        &pw::spa::pod::Value::Object(obj),
-    ) {
-        Ok(v) => v.0.into_inner(),
-        Err(e) => {
-            tracing::warn!("couldn't serialize the PipeWire format-negotiation params: {e}");
-            return;
+    let values: Vec<u8> = pw::spa::pod::serialize::PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &pw::spa::pod::Value::Object(format))
+        .map_err(|e| format!("couldn't describe the wanted video format: {e}"))?
+        .0
+        .into_inner();
+    let format_pod = pw::spa::pod::Pod::from_bytes(&values).ok_or_else(|| "couldn't describe the wanted video format".to_string())?;
+
+    stream
+        .connect(
+            spa::utils::Direction::Input,
+            Some(capture.node_id),
+            pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
+            &mut [format_pod],
+        )
+        .map_err(|e| format!("couldn't connect to the shared screen: {e}"))?;
+    tracing::debug!("PipeWire capture started for node {}", capture.node_id);
+
+    let started = Instant::now();
+    loop {
+        if *capture.stop.borrow() || progress.receiver_gone.get() {
+            return Ok(());
         }
-    };
-    let Some(format_pod) = pw::spa::pod::Pod::from_bytes(&values) else {
-        tracing::warn!("couldn't build a Pod from the serialized format params");
-        return;
-    };
-    let mut params = [format_pod];
-
-    if let Err(e) = stream.connect(
-        spa::utils::Direction::Input,
-        Some(node_id),
-        pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
-        &mut params,
-    ) {
-        tracing::warn!("couldn't connect PipeWire stream to node {node_id}: {e}");
-        return;
+        if capture.portal_closed.load(Ordering::Relaxed) {
+            return Err("screen sharing was stopped on this computer".to_string());
+        }
+        if let Some(reason) = progress.ended.borrow_mut().take() {
+            return Err(reason);
+        }
+        if progress.frames_sent.get() == 0 && started.elapsed() > FIRST_FRAME_TIMEOUT {
+            return Err("the shared screen never delivered a picture".to_string());
+        }
+        mainloop.loop_().iterate(Duration::from_millis(100));
     }
-
-    tracing::debug!("PipeWire capture loop starting for node {node_id}");
-    while capturing.load(Ordering::Relaxed) {
-        mainloop.loop_().iterate(std::time::Duration::from_millis(100));
-    }
-    tracing::debug!("PipeWire capture loop ending for node {node_id}");
 }
 
-/// Converts one raw PipeWire video buffer to JPEG, handling the small
-/// handful of pixel formats screen-cast sources actually negotiate (see
-/// the `VideoFormat` choices offered in `run_pipewire_capture`) and
-/// row `stride` (compositors commonly pad each row to a multiple of a
-/// fixed byte alignment, so `stride` can exceed `width * bytes_per_pixel`
-/// — using it instead of assuming tightly-packed rows avoids a
-/// diagonally-skewed image).
-fn encode_video_frame_to_jpeg(raw: &[u8], width: u32, height: u32, stride: i32, format: pw::spa::param::video::VideoFormat) -> Option<Vec<u8>> {
-    let stride = if stride > 0 { stride as usize } else { (width as usize).checked_mul(4)? };
-    let mut rgb = Vec::with_capacity(width as usize * height as usize * 3);
-    for row in 0..height as usize {
-        let row_start = row.checked_mul(stride)?;
-        if row_start >= raw.len() {
-            break;
-        }
-        let row_bytes = &raw[row_start..(row_start + stride).min(raw.len())];
-        for col in 0..width as usize {
-            let px_offset = col * 4;
-            if px_offset + 3 >= row_bytes.len() {
-                break;
-            }
-            let px = &row_bytes[px_offset..px_offset + 4];
-            let (r, g, b) = if format == pw::spa::param::video::VideoFormat::BGRx || format == pw::spa::param::video::VideoFormat::BGRA {
-                (px[2], px[1], px[0])
-            } else if format == pw::spa::param::video::VideoFormat::RGBx || format == pw::spa::param::video::VideoFormat::RGBA {
-                (px[0], px[1], px[2])
-            } else {
-                tracing::debug!("unsupported PipeWire video format {format:?}, skipping frame");
-                return None;
-            };
-            rgb.push(r);
-            rgb.push(g);
-            rgb.push(b);
-        }
-    }
-    let image_buffer = image::RgbImage::from_raw(width, height, rgb)?;
-    let mut jpeg_bytes = Vec::new();
-    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_bytes, 40);
-    if let Err(e) = encoder.encode(image_buffer.as_raw(), image_buffer.width(), image_buffer.height(), image::ExtendedColorType::Rgb8) {
+/// Turns one raw frame into a JPEG: honors the row `stride` (compositors
+/// pad rows, so it can exceed `width * 4`) and scales down by a whole
+/// factor when the frame is wider than `MAX_ENCODED_WIDTH`. Only the
+/// 32-bit layouts offered in `run_pipewire_capture` are handled.
+fn encode_frame(pixels: &[u8], width: usize, height: usize, stride: i32, format: spa::param::video::VideoFormat) -> Option<Vec<u8>> {
+    use spa::param::video::VideoFormat;
+    let channels = if format == VideoFormat::BGRx || format == VideoFormat::BGRA {
+        [2, 1, 0]
+    } else if format == VideoFormat::RGBx || format == VideoFormat::RGBA {
+        [0, 1, 2]
+    } else {
+        tracing::debug!("unsupported PipeWire video format {format:?}");
+        return None;
+    };
+    let (rgb, out_width, out_height) = to_rgb(pixels, width, height, stride, channels)?;
+    let mut jpeg = Vec::new();
+    if let Err(e) = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, JPEG_QUALITY).encode(
+        &rgb,
+        out_width as u32,
+        out_height as u32,
+        image::ExtendedColorType::Rgb8,
+    ) {
         tracing::debug!("JPEG encode failed for a PipeWire frame: {e}");
         return None;
     }
-    Some(jpeg_bytes)
+    Some(jpeg)
+}
+
+/// The pixel-shuffling half of `encode_frame`: picks the R, G and B bytes
+/// (at `channels`) out of each 4-byte pixel, sampling every `factor`th
+/// pixel and row when downscaling. A buffer shorter than the frame it
+/// claims to hold is skipped rather than drawn half-finished.
+fn to_rgb(pixels: &[u8], width: usize, height: usize, stride: i32, channels: [usize; 3]) -> Option<(Vec<u8>, usize, usize)> {
+    let row_bytes = width.checked_mul(4)?;
+    let stride = if stride > 0 { stride as usize } else { row_bytes };
+    if stride < row_bytes {
+        return None;
+    }
+    let factor = width.div_ceil(MAX_ENCODED_WIDTH).max(1);
+    let (out_width, out_height) = (width / factor, height / factor);
+    if out_width == 0 || out_height == 0 {
+        return None;
+    }
+    let mut rgb = Vec::with_capacity(out_width * out_height * 3);
+    for row in 0..out_height {
+        let start = row * factor * stride;
+        let line = pixels.get(start..start + out_width * factor * 4)?;
+        for pixel in line.chunks_exact(4 * factor) {
+            rgb.extend_from_slice(&[pixel[channels[0]], pixel[channels[1]], pixel[channels[2]]]);
+        }
+    }
+    Some((rgb, out_width, out_height))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BGR: [usize; 3] = [2, 1, 0];
+
+    #[test]
+    fn to_rgb_reorders_channels_and_skips_row_padding() {
+        // 2x2 BGRx frame, each row padded to 12 bytes.
+        let pixels = [
+            1, 2, 3, 0, 4, 5, 6, 0, 0xEE, 0xEE, 0xEE, 0xEE, //
+            7, 8, 9, 0, 10, 11, 12, 0, 0xEE, 0xEE, 0xEE, 0xEE,
+        ];
+        let (rgb, width, height) = to_rgb(&pixels, 2, 2, 12, BGR).expect("converts");
+        assert_eq!((width, height), (2, 2));
+        assert_eq!(rgb, vec![3, 2, 1, 6, 5, 4, 9, 8, 7, 12, 11, 10]);
+    }
+
+    #[test]
+    fn to_rgb_downscales_frames_wider_than_the_limit() {
+        let (width, height) = (MAX_ENCODED_WIDTH * 2, 4);
+        let pixels = vec![9u8; width * height * 4];
+        let (rgb, out_width, out_height) = to_rgb(&pixels, width, height, 0, BGR).expect("converts");
+        assert_eq!((out_width, out_height), (MAX_ENCODED_WIDTH, 2));
+        assert_eq!(rgb.len(), out_width * out_height * 3);
+    }
+
+    #[test]
+    fn to_rgb_skips_a_buffer_shorter_than_its_frame() {
+        let pixels = vec![0u8; 2 * 2 * 4 - 1];
+        assert!(to_rgb(&pixels, 2, 2, 8, BGR).is_none());
+    }
+
+    #[test]
+    fn encode_frame_produces_a_jpeg() {
+        let pixels = vec![128u8; 64 * 32 * 4];
+        let jpeg = encode_frame(&pixels, 64, 32, 64 * 4, spa::param::video::VideoFormat::BGRx).expect("encodes");
+        assert_eq!(&jpeg[..2], &[0xFF, 0xD8], "JPEG start-of-image marker");
+    }
 }

@@ -145,12 +145,11 @@ fn main() -> anyhow::Result<()> {
 
     // A connected peer's platform isn't tracked anywhere else on desktop
     // (`connected_peers` above only keeps id->name) — needed both to
-    // gate which peers even get a "Remote Control" entry (any platform
-    // technically *can* be offered one; an Android/iOS/Linux peer just
-    // auto-declines via its `NoopRemoteControlHost`, so this is really
-    // about not offering a button that's guaranteed to do nothing) and,
-    // once a session's open, so the viewer knows which platform's key
-    // codes to translate into.
+    // gate which peers even get a "Remote Control" entry (a phone can
+    // only ever auto-decline via its `NoopRemoteControlHost`, so offering
+    // it would be a button guaranteed to do nothing) and, once a session's
+    // open, so the viewer knows which platform's key codes to translate
+    // into.
     #[cfg(feature = "remote-control")]
     let connected_peer_platforms: Arc<Mutex<HashMap<String, Platform>>> = Arc::new(Mutex::new(HashMap::new()));
     #[cfg(feature = "remote-control")]
@@ -905,29 +904,30 @@ fn rebuild_nearby_menu(
 }
 
 /// Same rebuild-from-scratch approach as `rebuild_send_menu`, same
-/// currently-connected-only scope. Every connected peer gets an entry
-/// regardless of platform (not just macOS/Windows) — an Android/iOS/Linux
-/// peer's `NoopRemoteControlHost` auto-declines with a normal
-/// `RemoteControlDeclined` notification rather than needing to be
-/// filtered out here, and platform isn't even known for certain until a
-/// peer's first `Connected` event carries it in.
+/// currently-connected-only scope, but desktops only — a phone can be the
+/// controlling side, never the controlled one. A peer whose platform isn't
+/// known yet (no `Connected` event seen) is left in rather than hidden.
+/// Phones running 0.1.6-beta.3 or older announce themselves as Linux (see
+/// `detect_platform` in the engine), so they still show up until updated.
 #[cfg(feature = "remote-control")]
 fn rebuild_remote_control_menu(
     submenu: &Submenu,
     connected: &HashMap<String, String>,
-    _platforms: &HashMap<String, Platform>,
+    platforms: &HashMap<String, Platform>,
     target_map: &Arc<Mutex<HashMap<MenuId, String>>>,
 ) {
     while submenu.remove_at(0).is_some() {}
     let mut map = target_map.lock().unwrap();
     map.clear();
 
-    if connected.is_empty() {
-        let _ = submenu.append(&MenuItem::new("No device connected", false, None));
+    let mut peers: Vec<(&String, &String)> = connected
+        .iter()
+        .filter(|(id, _)| !matches!(platforms.get(*id), Some(Platform::Android | Platform::Ios)))
+        .collect();
+    if peers.is_empty() {
+        let _ = submenu.append(&MenuItem::new("No computer connected", false, None));
         return;
     }
-
-    let mut peers: Vec<(&String, &String)> = connected.iter().collect();
     peers.sort_by(|a, b| a.1.cmp(b.1));
     for (id, name) in &peers {
         let item = MenuItem::new(format!("Remote Control {name}..."), true, None);
@@ -1216,7 +1216,7 @@ fn start_engine_thread(
                     Arc::new(remote_control_windows::WindowsRemoteControlHost::new());
                 #[cfg(all(target_os = "linux", feature = "remote-control"))]
                 let remote_control: Arc<dyn continuity_daemon::RemoteControlHost> =
-                    Arc::new(remote_control_linux::LinuxRemoteControlHost::new());
+                    Arc::new(remote_control_linux::LinuxRemoteControlHost::new(remote_control_linux::restore_token_path(&profile)));
                 #[cfg(not(all(feature = "remote-control", any(target_os = "macos", target_os = "windows", target_os = "linux"))))]
                 let remote_control: Arc<dyn continuity_daemon::RemoteControlHost> = Arc::new(continuity_daemon::NoopRemoteControlHost);
 

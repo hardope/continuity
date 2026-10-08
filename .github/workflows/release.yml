@@ -134,6 +134,14 @@ jobs:
           cp target/release/continuityd "$APP/Contents/MacOS/continuityd"
           chmod +x "$APP/Contents/MacOS/continuityd"
           cp installers/macos/Info.plist "$APP/Contents/Info.plist"
+          # Stamp the workspace version into the bundle — the checked-in
+          # plist's number is only a default, and sat at 0.1.5-beta.14
+          # for several releases while it was edited by hand.
+          VERSION=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          /usr/libexec/PlistBuddy \
+            -c "Set :CFBundleVersion $VERSION" \
+            -c "Set :CFBundleShortVersionString $VERSION" \
+            "$APP/Contents/Info.plist"
 
           # `sips` doesn't reliably rasterize SVG, but `qlmanage -t` (the
           # QuickLook thumbnail generator) does — render once at the
@@ -209,7 +217,10 @@ jobs:
         run: |
           choco install innosetup -y --no-progress
           Copy-Item target\release\continuityd.exe installers\windows\continuityd.exe
-          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installers\windows\continuity.iss
+          # The workspace version, so "Apps & features" shows the release
+          # actually installed (see the #ifndef in continuity.iss).
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]*)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DMyAppVersion=$version" installers\windows\continuity.iss
           Copy-Item installers\windows\continuity-windows-setup.exe .
 
       - name: Upload Windows installer

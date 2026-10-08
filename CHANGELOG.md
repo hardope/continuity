@@ -27,9 +27,27 @@ All notable user-facing changes to Continuity are documented here.
   device, present only while Continuity is running), and Open With →
   Continuity on macOS.
 - Send several files at once from the Android app's own file picker.
+- **Remote control says why it stopped.** If the computer declines, times out
+  or stops sharing its screen, the phone now shows the reason instead of
+  closing (or waiting) without explanation.
 
 ### Fixed
 
+- **Remote control of a Linux computer now actually starts.** It never did:
+  the phone sat on "connecting" forever (reported on Ubuntu 26.04), because
+  Continuity was waiting for an answer from the desktop's screen-sharing
+  service that could never arrive. The desktop now asks the person at the
+  computer to allow screen sharing, as GNOME and KDE require, and where it
+  can, it remembers that after the first time. Nobody answering within 90
+  seconds ends the attempt with a message on the phone. Taps and clicks land
+  where they're aimed (they would all have gone to the top-left corner), and
+  the picture is limited to 10 frames a second like on macOS and Windows.
+- **Phones are recognized as phones.** Android (and iOS) devices announced
+  themselves as Linux computers, so another phone offered lock/unlock and
+  remote control for them. Both phones need this version for it to go away.
+- The Linux package's description, the Linux app launcher's tooltip, and the
+  version shown by the macOS app and the Windows installer were all out of
+  date. The latter two are now set from the release itself.
 - **Newer and older versions no longer disconnect each other over new
   features.** A device used to drop the whole connection when it received a
   message type it didn't recognize; it now skips it. (This protects

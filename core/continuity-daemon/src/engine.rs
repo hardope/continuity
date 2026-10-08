@@ -76,6 +76,11 @@ const CONNECTION_READ_TIMEOUT: Duration = Duration::from_secs(180);
 /// bounds how much an unattended auto-accept can write to disk.
 const MAX_AUTO_ACCEPT_BYTES: u64 = 500 * 1024 * 1024;
 
+/// How long the controlling side waits, after its screen stream closes, for
+/// the controlled side's own `RemoteControlEnded` (which says why) before
+/// calling the end unexpected — see `handle_screen_stream_connection`.
+const SCREEN_STREAM_END_GRACE: Duration = Duration::from_millis(750);
+
 pub struct EngineConfig {
     pub identity: Identity,
     pub device_name: String,
@@ -367,7 +372,7 @@ fn end_remote_control_session(state: &Arc<SharedState>, peer_crypto_id: &str, re
     }
     if notify_peer {
         if let Some(tx) = state.peer_senders.lock().unwrap().get(peer_crypto_id) {
-            let _ = tx.send(Message::RemoteControlEnded { session_id: session.session_id.clone() });
+            let _ = tx.send(Message::RemoteControlEnded { session_id: session.session_id.clone(), reason: reason.clone() });
         }
     }
     let peer_name = state
@@ -428,9 +433,14 @@ async fn handle_screen_stream_connection(mut conn: Connection, state: Arc<Shared
     // Reaches here on a real error (peer closed the stream, network died)
     // — an *intentional* end (either side's `EndRemoteControlSession`)
     // aborts this whole task from outside instead, so execution never
-    // gets this far in that case. `end_remote_control_session` is
-    // idempotent, so this is still safe to call even if something else
-    // already did.
+    // gets this far in that case. When the controlled side stops on its
+    // own (its capture ended — say, someone pressed "Stop sharing" on
+    // that desktop), it explains why in a `RemoteControlEnded` sent over
+    // the *mesh* connection — a different TCP connection, which can lose
+    // the race to this stream's close. A short grace period lets that
+    // explanation land first; its handling ends the session and aborts
+    // this task mid-sleep. Only if nothing arrives is this "unexpected".
+    tokio::time::sleep(SCREEN_STREAM_END_GRACE).await;
     end_remote_control_session(&state, &peer_crypto_id, Some("screen stream ended unexpectedly".to_string()), true);
     result
 }
@@ -538,14 +548,23 @@ fn accept_remote_control_session(state: &Arc<SharedState>, peer_crypto_id: Strin
     state.remote_control_stream_handles.lock().unwrap().insert(peer_crypto_id, join.abort_handle());
 }
 
-/// The controlled side's half of the screen stream: dials a fresh
-/// connection to the controlling peer, identifies it with
-/// `ScreenStreamHandshake`, then pushes every frame `start_capture`
-/// produces until the channel closes (the engine dropped its capture
-/// handle — see `end_remote_control_session`'s `stop_capture` call) or a
-/// write fails (the connection died). Always ends by tearing the session
-/// down — there's no path back to "idle but still accepted," a stream
-/// that stops is a session that's over.
+/// The controlled side's half of the screen stream: waits for the first
+/// frame `start_capture` produces, dials a fresh connection to the
+/// controlling peer, identifies it with `ScreenStreamHandshake`, then
+/// pushes every frame until the channel closes (capture stopped — the
+/// engine's own `stop_capture`, or the host giving up) or a write fails
+/// (the connection died). Always ends by tearing the session down —
+/// there's no path back to "idle but still accepted," a stream that stops
+/// is a session that's over.
+///
+/// **Why wait for a frame before dialing:** a host's capture can still
+/// fail after `start_capture` returned a channel. On Linux the desktop
+/// asks its own user to approve screen sharing first, and they can say no
+/// or not be there at all (`LinuxRemoteControlHost` gives up after a
+/// while). Ending such a session over the mesh connection, with the
+/// host's reason, reaches the controlling device intact; the old order
+/// (dial first, then wait) left it only an unexplained closed stream, and
+/// before the Linux host learned to give up, a spinner that never ended.
 async fn push_screen_stream(
     state: Arc<SharedState>,
     peer_crypto_id: String,
@@ -553,6 +572,16 @@ async fn push_screen_stream(
     addr: SocketAddr,
     mut frames: mpsc::Receiver<Vec<u8>>,
 ) {
+    let Some(first_frame) = frames.recv().await else {
+        let reason = state
+            .remote_control
+            .capture_failure_reason()
+            .unwrap_or_else(|| "screen capture stopped before sending anything".to_string());
+        tracing::debug!("screen capture for {peer_crypto_id} ended before its first frame: {reason}");
+        end_remote_control_session(&state, &peer_crypto_id, Some(reason), true);
+        return;
+    };
+
     let mut conn = match connect(addr, &state.tls_identity).await {
         Ok(c) => c,
         Err(e) => {
@@ -566,12 +595,20 @@ async fn push_screen_stream(
         end_remote_control_session(&state, &peer_crypto_id, Some(format!("couldn't start screen stream: {e}")), true);
         return;
     }
-    while let Some(frame) = frames.recv().await {
-        if write_frame(&mut conn, &frame).await.is_err() {
-            break;
+    if write_frame(&mut conn, &first_frame).await.is_ok() {
+        while let Some(frame) = frames.recv().await {
+            if write_frame(&mut conn, &frame).await.is_err() {
+                break;
+            }
         }
     }
-    end_remote_control_session(&state, &peer_crypto_id, None, false);
+    // An *intentional* end aborts this task from outside (see
+    // `end_remote_control_session`), so arriving here means capture
+    // stopped on its own or the stream broke. Tell the controlling side
+    // now, with whatever the host knows — this goes out over the mesh
+    // connection before `conn` closes, and the controlling side gives it
+    // a moment to arrive (`SCREEN_STREAM_END_GRACE`).
+    end_remote_control_session(&state, &peer_crypto_id, state.remote_control.capture_failure_reason(), true);
 }
 
 /// Claims the right to start a single outbound dial to `peer_id` — `true`
@@ -1546,7 +1583,7 @@ async fn handle_connection_inner(
                     if !state.remote_control.is_available() {
                         // Nothing for the local user to decide — this
                         // device genuinely can't be remotely controlled
-                        // (Android/iOS, Linux, or a "lite" build), so
+                        // (Android/iOS, or a "lite" desktop build), so
                         // auto-decline instead of surfacing a prompt for
                         // a capability that doesn't exist.
                         if let Some(tx) = state.peer_senders.lock().unwrap().get(&peer.id) {
@@ -1600,11 +1637,11 @@ async fn handle_connection_inner(
                         role: RemoteControlRole::Controlling,
                     });
                 }
-                Ok(Message::RemoteControlEnded { session_id }) => {
+                Ok(Message::RemoteControlEnded { session_id, reason }) => {
                     let matches_active =
                         state.remote_control_sessions.lock().unwrap().get(&peer.id).is_some_and(|s| s.session_id == session_id);
                     if matches_active {
-                        end_remote_control_session(state, &peer.id, None, false);
+                        end_remote_control_session(state, &peer.id, reason, false);
                     }
                 }
                 Ok(Message::InputEvent { session_id, event }) => {
@@ -2418,11 +2455,22 @@ fn now_unix() -> u64 {
         .as_secs()
 }
 
+/// What this device announces itself as (mDNS TXT record and
+/// `DeviceAnnounce`). Peers decide what to offer from it — media controls,
+/// remote control and lock/unlock only make sense for a desktop — so a
+/// phone must never fall through to `Linux`. It used to: Android's
+/// `target_os` is `"android"`, not `"linux"`, and this only checked for
+/// macOS and Windows, so every phone announced itself as a Linux desktop
+/// and other phones offered lock/unlock and remote control for it.
 fn detect_platform() -> Platform {
     if cfg!(target_os = "macos") {
         Platform::MacOs
     } else if cfg!(target_os = "windows") {
         Platform::Windows
+    } else if cfg!(target_os = "android") {
+        Platform::Android
+    } else if cfg!(target_os = "ios") {
+        Platform::Ios
     } else {
         Platform::Linux
     }

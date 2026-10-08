@@ -280,6 +280,10 @@ object ContinuityStore {
                 val reason = event.reason
                 if (reason != null) {
                     log(ActivityKind.REMOTE_CONTROL, "Remote control of '${event.peerName}' ended: $reason", Tone.WARNING)
+                    // The remote screen just closed under the user; say why
+                    // right away (say, the computer's own sharing prompt was
+                    // declined) instead of only in the activity feed.
+                    notice("Remote control of '${event.peerName}' ended: $reason")
                 } else {
                     log(ActivityKind.REMOTE_CONTROL, "Remote control of '${event.peerName}' ended")
                 }

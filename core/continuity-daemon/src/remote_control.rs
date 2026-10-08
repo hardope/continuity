@@ -3,24 +3,24 @@ use tokio::sync::mpsc;
 
 /// Injects input events and captures the screen on the *controlled* side
 /// of a remote-control session. Pluggable like `ClipboardBackend`/
-/// `MediaController` — only macOS and Windows have real implementations
-/// (`continuityd`'s `MacRemoteControlHost`/`WindowsRemoteControlHost`,
-/// compiled in only behind the `remote-control` Cargo feature there, see
-/// `core/continuityd/Cargo.toml`); every other shell (Android/iOS, Linux,
-/// and any desktop build with that feature disabled for a "lite" release)
-/// wires in `NoopRemoteControlHost`.
+/// `MediaController` — macOS, Windows and Linux have real implementations
+/// (`continuityd`'s `MacRemoteControlHost`/`WindowsRemoteControlHost`/
+/// `LinuxRemoteControlHost`, compiled in only behind the `remote-control`
+/// Cargo feature there, see `core/continuityd/Cargo.toml`); every other
+/// shell (Android/iOS, and any desktop build with that feature disabled
+/// for a "lite" release) wires in `NoopRemoteControlHost`.
 ///
 /// Being a paired, trusted peer is not the same thing as being allowed to
-/// take over this device's keyboard, mouse, and screen — every real
-/// implementation still requires a fresh, explicit accept per session
-/// (see `SyncEvent::RemoteControlRequested` / `EngineCommand::
+/// take over this device's keyboard, mouse, and screen — the engine asks
+/// the local user before the first session with each peer (see
+/// `SyncEvent::RemoteControlRequested` / `EngineCommand::
 /// RespondToRemoteControlRequest` in `engine.rs`); this trait is purely
 /// about *whether the platform is capable at all*, not about consent.
 pub trait RemoteControlHost: Send + Sync {
     /// `false` means this host can't be remotely controlled at all — the
     /// engine auto-declines any `RemoteControlRequest` without bothering
     /// the local user with a prompt for a capability that doesn't exist
-    /// here (Android/iOS, a Linux desktop, or a "lite" build).
+    /// here (Android/iOS, or a "lite" build).
     fn is_available(&self) -> bool {
         true
     }
@@ -41,6 +41,17 @@ pub trait RemoteControlHost: Send + Sync {
     /// Stops any capture in progress. Safe to call even if nothing was
     /// started (e.g. `start_capture` already returned `None`).
     fn stop_capture(&self);
+
+    /// Why the channel from the latest `start_capture` closed, if the host
+    /// knows — the engine asks when that happens and passes the answer on
+    /// to the controlling device, instead of the session just ending
+    /// without explanation. Matters for hosts whose capture can still fail
+    /// *after* `start_capture` returned a channel: on Linux, the desktop
+    /// itself asks its user to approve screen sharing, who can decline or
+    /// not be there at all.
+    fn capture_failure_reason(&self) -> Option<String> {
+        None
+    }
 }
 
 pub struct NoopRemoteControlHost;

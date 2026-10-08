@@ -178,7 +178,9 @@ fn serve_one(stream: TcpStream, token: &str, commands: &UnboundedSender<EngineCo
     (&stream).write_all(&out)
 }
 
-fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+/// Writes `contents` to a freshly created file only this user can read —
+/// also used for the Linux remote-desktop restore token.
+pub(crate) fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }

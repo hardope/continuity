@@ -257,6 +257,105 @@ async fn full_remote_control_session_lifecycle() {
     b.shutdown();
 }
 
+const DECLINED: &str = "screen sharing was declined on this computer";
+
+/// Accepts a session but never produces a frame, then reports why — what
+/// the Linux host does when the desktop's own screen-sharing dialog is
+/// declined or nobody answers it.
+#[derive(Clone, Default)]
+struct DecliningHost {
+    capturing: Arc<AtomicBool>,
+}
+
+impl RemoteControlHost for DecliningHost {
+    fn inject(&self, _event: InputEventKind) {}
+
+    fn start_capture(&self) -> Option<mpsc::Receiver<Vec<u8>>> {
+        self.capturing.store(true, Ordering::Relaxed);
+        let (tx, rx) = mpsc::channel(1);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            drop(tx);
+        });
+        Some(rx)
+    }
+
+    fn stop_capture(&self) {
+        self.capturing.store(false, Ordering::Relaxed);
+    }
+
+    fn capture_failure_reason(&self) -> Option<String> {
+        Some(DECLINED.to_string())
+    }
+}
+
+/// Before the controlled side waited for a first frame, a capture that
+/// never started left the controlling side with no explanation — or, with
+/// the Linux host stuck waiting on its portal, a spinner that never ended.
+#[tokio::test]
+async fn a_capture_that_never_starts_tells_the_controlling_side_why() {
+    let a_identity = Identity::generate();
+    let b_identity = Identity::generate();
+    let a_id = a_identity.device_id();
+    let b_id = b_identity.device_id();
+
+    let b_host = DecliningHost::default();
+    let mut a = make_engine("DeclineA", a_identity, &b_id, "DeclineB", Arc::new(continuity_daemon::NoopRemoteControlHost))
+        .await
+        .expect("start engine A");
+    let mut b = make_engine("DeclineB", b_identity, &a_id, "DeclineA", Arc::new(b_host.clone())).await.expect("start engine B");
+
+    let connect_deadline = tokio::time::sleep(Duration::from_secs(15));
+    tokio::pin!(connect_deadline);
+    loop {
+        tokio::select! {
+            _ = &mut connect_deadline => panic!("A and B never connected"),
+            Some(ev) = a.events.recv() => if matches!(ev, SyncEvent::Connected { .. }) { break },
+            Some(_) = b.events.recv() => {}
+        }
+    }
+
+    a.command_sender().send(EngineCommand::RequestRemoteControl { peer_crypto_id: b_id.clone() }).expect("send request");
+
+    let mut a_started = false;
+    let mut a_ended_reason: Option<Option<String>> = None;
+    let mut a_saw_frame = false;
+    let mut b_ended_reason: Option<Option<String>> = None;
+    let deadline = tokio::time::sleep(Duration::from_secs(20));
+    tokio::pin!(deadline);
+    while a_ended_reason.is_none() || b_ended_reason.is_none() {
+        tokio::select! {
+            _ = &mut deadline => break,
+            Some(ev) = a.events.recv() => match ev {
+                SyncEvent::RemoteControlSessionStarted { role, .. } => {
+                    assert_eq!(role, RemoteControlRole::Controlling);
+                    a_started = true;
+                }
+                SyncEvent::RemoteControlSessionEnded { reason, .. } => a_ended_reason = Some(reason),
+                SyncEvent::ScreenFrameReceived { .. } => a_saw_frame = true,
+                _ => {}
+            },
+            Some(ev) = b.events.recv() => match ev {
+                SyncEvent::RemoteControlRequested { .. } => {
+                    b.command_sender()
+                        .send(EngineCommand::RespondToRemoteControlRequest { peer_crypto_id: a_id.clone(), accept: true })
+                        .expect("send accept");
+                }
+                SyncEvent::RemoteControlSessionEnded { reason, .. } => b_ended_reason = Some(reason),
+                _ => {}
+            }
+        }
+    }
+    assert!(a_started, "A's side of the session should start once B accepts");
+    assert_eq!(a_ended_reason, Some(Some(DECLINED.to_string())), "A should learn why the session ended");
+    assert_eq!(b_ended_reason, Some(Some(DECLINED.to_string())), "B's own shell should say why too");
+    assert!(!a_saw_frame, "no frame was ever captured");
+    assert!(!b_host.capturing.load(Ordering::Relaxed), "B's capture should have been stopped");
+
+    a.shutdown();
+    b.shutdown();
+}
+
 #[tokio::test]
 async fn a_host_that_reports_unavailable_auto_declines_without_bothering_the_user() {
     let a_identity = Identity::generate();
@@ -265,7 +364,7 @@ async fn a_host_that_reports_unavailable_auto_declines_without_bothering_the_use
     let b_id = b_identity.device_id();
 
     // The default Noop host reports `is_available() == false` — matches
-    // Android/iOS/Linux and a "lite" desktop build.
+    // Android/iOS and a "lite" desktop build.
     let mut a = make_engine("UnavailA", a_identity, &b_id, "UnavailB", Arc::new(continuity_daemon::NoopRemoteControlHost))
         .await
         .expect("start engine A");

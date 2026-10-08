@@ -3,7 +3,7 @@ name = "continuityd"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Clipboard, file, and (eventually) keyboard continuity over LAN"
+description = "Clipboard sync, file sharing and remote control between nearby devices"
 
 [[bin]]
 name = "continuityd"
@@ -32,7 +32,15 @@ remote-control = ["dep:softbuffer", "dep:image"]
 [package.metadata.deb]
 maintainer = "hardope"
 copyright = "2026, hardope"
-extended-description = "Cross-platform clipboard, file, and (eventually) keyboard continuity across macOS, Windows, Linux, Android, and iOS over the local network — no cloud relay, no account."
+extended-description = """\
+Continuity connects your computers and phones (Linux, Windows, macOS and \
+Android) directly over the local network, with no cloud relay and no \
+account. Copy on one device and paste on another; send files, including \
+from the file manager's right-click menu; control what's playing on another \
+computer; and control a computer's keyboard, mouse and screen from your \
+phone. A paired phone can also lock this computer, and unlock it if you \
+allow that phone to. Devices pair once, by comparing a code shown on both \
+screens."""
 section = "utils"
 priority = "optional"
 depends = ["$auto"]
