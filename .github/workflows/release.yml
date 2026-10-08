@@ -110,6 +110,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Install system dependencies
+        # The engine needs only D-Bus's headers: continuity-crypto's Linux
+        # keychain backend (keyring → dbus-secret-service) links libdbus.
+        # (The full set in install-linux-deps.sh is for continuityd.)
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+
       - name: Build
         run: cargo test -p continuity-daemon --tests --no-run
 
