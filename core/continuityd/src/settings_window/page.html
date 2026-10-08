@@ -415,8 +415,14 @@ window.continuity = {
     const onAnswer = state.pending.get(message.id);
     state.pending.delete(message.id);
     if (onAnswer) onAnswer(message);
-    if (!message.ok && message.message) toast(message.message);
-    else if (message.ok && message.message) toast(message.message);
+    if (message.message) toast(message.message);
+  },
+  // The window was closed. It's only hidden (settings_window.rs keeps it
+  // for next time), so drop any dialog rather than come back with it open.
+  hidden() {
+    state.dialog = null;
+    state.infoOpen = false;
+    render();
   },
 };
 

@@ -187,6 +187,9 @@ wry = "0.57"
 # requirement.
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = "4"
+# The file picker (file_chooser_linux.rs): GTK's own, shown from the main
+# thread — the GTK tao and wry already use, so nothing new to build.
+gtk = "0.18"
 rfd = { version = "0.15", default-features = false, features = ["gtk3"] }
 # Remote-control screen capture and input injection via xdg-desktop-portal
 # (RemoteDesktop + ScreenCast) — see remote_control_linux.rs's module doc

@@ -20,6 +20,8 @@ mod media_mac;
 mod media_windows;
 #[cfg(target_os = "linux")]
 mod media_linux;
+#[cfg(target_os = "linux")]
+mod file_chooser_linux;
 #[cfg(target_os = "macos")]
 mod permissions_mac;
 #[cfg(all(target_os = "macos", feature = "remote-control"))]
@@ -65,7 +67,17 @@ enum AppEvent {
     /// settings app of its own).
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     Settings(settings_window::Message),
+    /// Time to make the settings window, hidden (see `SETTINGS_PREPARE_DELAY`).
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    PrepareSettings,
 }
+
+/// A webview takes a few seconds to start, so on Linux and Windows the
+/// settings window is made, hidden, this long after Continuity starts — late
+/// enough not to slow its own start (or a login) down — and Settings… then
+/// only has to show it.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+const SETTINGS_PREPARE_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Who a click on a dynamically-built "Send File" submenu entry should
 /// send to — rebuilt every time the connected-device set changes, so the
@@ -115,6 +127,14 @@ fn main() -> anyhow::Result<()> {
     let proxy = event_loop.create_proxy();
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     let settings_route = settings_window::Route { proxy: event_loop.create_proxy(), wrap: AppEvent::Settings };
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    {
+        let prepare = event_loop.create_proxy();
+        std::thread::spawn(move || {
+            std::thread::sleep(SETTINGS_PREPARE_DELAY);
+            let _ = prepare.send_event(AppEvent::PrepareSettings);
+        });
+    }
 
     let device_name = continuity_daemon::default_device_name();
 
@@ -261,7 +281,8 @@ fn main() -> anyhow::Result<()> {
     // tao event loop's own thread, same as everything else in `main()`.
     #[cfg(feature = "remote-control")]
     let viewer: std::rc::Rc<std::cell::RefCell<Option<remote_viewer::RemoteViewer>>> = std::rc::Rc::new(std::cell::RefCell::new(None));
-    // At most one; "Settings…" brings an open one to the front.
+    // Made hidden in the background, then shown by Settings… and hidden
+    // again when closed.
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     let mut settings: Option<settings_window::SettingsWindow> = None;
 
@@ -307,8 +328,8 @@ fn main() -> anyhow::Result<()> {
 
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         if let tao::event::Event::WindowEvent { window_id, event: tao::event::WindowEvent::CloseRequested, .. } = &event {
-            if settings.as_ref().is_some_and(|window| window.window_id() == *window_id) {
-                settings = None;
+            if let Some(window) = settings.as_ref().filter(|window| window.window_id() == *window_id) {
+                window.hide();
             }
         }
 
@@ -367,6 +388,16 @@ fn main() -> anyhow::Result<()> {
                     window.handle(message, &context, &settings_route);
                 }
             }
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            tao::event::Event::UserEvent(AppEvent::PrepareSettings) => {
+                if settings.is_none() {
+                    match settings_window::SettingsWindow::open(target, settings_route.clone(), settings_window_icon(), false) {
+                        Ok(window) => settings = Some(window),
+                        // Settings… tries again, and says so if that fails too.
+                        Err(e) => tracing::warn!("couldn't prepare the settings window: {e}"),
+                    }
+                }
+            }
             _ => {}
         }
 
@@ -376,17 +407,14 @@ fn main() -> anyhow::Result<()> {
                 open_settings(&profile());
                 #[cfg(any(target_os = "linux", target_os = "windows"))]
                 match &settings {
-                    Some(window) => window.focus(),
-                    None => {
-                        let icon = tao::window::Icon::from_rgba(render_icon_rgba(64), 64, 64).ok();
-                        match settings_window::SettingsWindow::open(target, settings_route.clone(), icon) {
-                            Ok(window) => settings = Some(window),
-                            Err(e) => {
-                                tracing::warn!("couldn't open the settings window: {e}");
-                                notify(&settings_window_failed(&e));
-                            }
+                    Some(window) => window.show(),
+                    None => match settings_window::SettingsWindow::open(target, settings_route.clone(), settings_window_icon(), true) {
+                        Ok(window) => settings = Some(window),
+                        Err(e) => {
+                            tracing::warn!("couldn't open the settings window: {e}");
+                            notify(&settings_window_failed(&e));
                         }
-                    }
+                    },
                 }
             }
             if event.id == pause_item_id {
@@ -413,22 +441,21 @@ fn main() -> anyhow::Result<()> {
                 }
                 *control_flow = ControlFlow::Exit;
             } else if let Some(target) = send_target_map.lock().unwrap().get(&event.id).cloned() {
+                // Linux: GTK's chooser, which answers later (see
+                // file_chooser_linux.rs for why not rfd's).
+                #[cfg(target_os = "linux")]
+                {
+                    let commands = commands.clone();
+                    let connected_peers = connected_peers.clone();
+                    file_chooser_linux::choose_files(None, "Send File", false, move |paths| {
+                        for path in &paths {
+                            send_file_to(&target, &path.display().to_string(), &commands, &connected_peers);
+                        }
+                    });
+                }
+                #[cfg(not(target_os = "linux"))]
                 if let Some(path) = rfd::FileDialog::new().pick_file() {
-                    let path = path.display().to_string();
-                    match target {
-                        SendTarget::Peer(peer_id) => {
-                            let _ = commands.send(EngineCommand::SendFile { peer_crypto_id: peer_id, path });
-                        }
-                        SendTarget::All => {
-                            let peers: Vec<String> = connected_peers.lock().unwrap().keys().cloned().collect();
-                            for peer_id in peers {
-                                let _ = commands.send(EngineCommand::SendFile {
-                                    peer_crypto_id: peer_id,
-                                    path: path.clone(),
-                                });
-                            }
-                        }
-                    }
+                    send_file_to(&target, &path.display().to_string(), &commands, &connected_peers);
                 }
             } else if let Some(peer_id) = nearby_target_map.lock().unwrap().get(&event.id).cloned() {
                 let _ = commands.send(EngineCommand::ReconnectPeer { peer_crypto_id: peer_id });
@@ -928,6 +955,23 @@ fn rebuild_send_menu(
     }
 }
 
+/// Queues one file for a "Send File" entry's device, or for every connected
+/// device.
+fn send_file_to(
+    target: &SendTarget,
+    path: &str,
+    commands: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
+    connected_peers: &Arc<Mutex<HashMap<String, String>>>,
+) {
+    let peers: Vec<String> = match target {
+        SendTarget::Peer(peer_id) => vec![peer_id.clone()],
+        SendTarget::All => connected_peers.lock().unwrap().keys().cloned().collect(),
+    };
+    for peer_id in peers {
+        let _ = commands.send(EngineCommand::SendFile { peer_crypto_id: peer_id, path: path.to_string() });
+    }
+}
+
 /// Same rebuild-from-scratch approach as `rebuild_send_menu`, same
 /// currently-connected-only scope — no broadcast option, since forgetting
 /// is inherently per-device and clicking one always shows its own
@@ -1186,6 +1230,11 @@ fn open_settings(profile: &str) {
         Ok(_) => notify("Couldn't open Continuity's settings window — it needs macOS 12 or newer."),
         Err(e) => tracing::warn!("couldn't run open for the settings window: {e}"),
     });
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn settings_window_icon() -> Option<tao::window::Icon> {
+    tao::window::Icon::from_rgba(render_icon_rgba(64), 64, 64).ok()
 }
 
 /// What to tell someone whose settings window didn't open.

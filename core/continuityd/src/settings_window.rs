@@ -9,6 +9,10 @@
 //! `Message::Request`; the answers, and a fresh status whenever anything
 //! changes (from a `ControlState::watch` thread), go back into the page as
 //! calls to `window.continuity.receive`.
+//!
+//! A webview takes a few seconds to start, so the window is made hidden a
+//! few seconds after Continuity starts, and closing it only hides it again:
+//! Settings… then just shows it.
 
 use crate::control::{ControlOp, ControlState};
 use crate::share::ConnectedPeers;
@@ -34,6 +38,10 @@ pub enum Message {
     Request(String),
     /// A status line for the page, from its watch thread.
     Status(String),
+    /// What Send Files… chose, once its dialog closes (see
+    /// file_chooser_linux.rs for why that's later, not in the request).
+    #[cfg(target_os = "linux")]
+    FilesChosen { device: String, paths: Vec<PathBuf> },
 }
 
 /// What the event loop needs to route the page's messages back to it.
@@ -67,12 +75,14 @@ pub struct SettingsWindow {
 }
 
 impl SettingsWindow {
-    pub fn open<T: Send + 'static>(target: &EventLoopWindowTarget<T>, route: Route<T>, icon: Option<Icon>) -> anyhow::Result<Self> {
+    /// `visible: false` prepares the window without showing it.
+    pub fn open<T: Send + 'static>(target: &EventLoopWindowTarget<T>, route: Route<T>, icon: Option<Icon>, visible: bool) -> anyhow::Result<Self> {
         let window = WindowBuilder::new()
             .with_title("Continuity")
             .with_inner_size(LogicalSize::new(880.0, 620.0))
             .with_min_inner_size(LogicalSize::new(680.0, 460.0))
             .with_window_icon(icon)
+            .with_visible(visible)
             .build(target)?;
         // The page paints its own background; this is the color before it
         // does, so a dark desktop doesn't get a white flash.
@@ -106,16 +116,31 @@ impl SettingsWindow {
         self.window.id()
     }
 
-    /// Brings the window back to the front — "Settings…" with it already open.
-    pub fn focus(&self) {
-        self.window.set_minimized(false);
+    /// Shows the window, or brings it back to the front.
+    pub fn show(&self) {
         self.window.set_visible(true);
+        self.window.set_minimized(false);
         self.window.set_focus();
+    }
+
+    /// What closing the window does: it stays ready for next time. The page
+    /// drops any dialog it had open, so it doesn't come back with it.
+    pub fn hide(&self) {
+        self.window.set_visible(false);
+        if let Err(e) = self.webview.evaluate_script("window.continuity && window.continuity.hidden && window.continuity.hidden()") {
+            tracing::debug!("couldn't tell the settings page it was closed: {e}");
+        }
     }
 
     pub fn handle<T: Send + 'static>(&mut self, message: Message, context: &Context, route: &Route<T>) {
         match message {
             Message::Status(line) => self.deliver(&line),
+            // No `id`: the page shows it as a notice of its own.
+            #[cfg(target_os = "linux")]
+            Message::FilesChosen { device, paths } => {
+                let sent = crate::share::dispatch(&device, &paths, context.commands, context.connected);
+                self.deliver(&json!({ "ok": sent.ok, "message": sent.message }).to_string());
+            }
             Message::Request(body) => {
                 let request: Value = match serde_json::from_str(&body) {
                     Ok(request) => request,
@@ -146,14 +171,28 @@ impl SettingsWindow {
             // The page can't see file paths, so the file dialog is ours.
             Some("send_files") => {
                 let device = text("device").ok_or("Which device?")?;
-                let Some(paths) = rfd::FileDialog::new().set_title("Send Files").set_parent(&self.window).pick_files() else {
-                    return Ok(None);
-                };
-                let sent = crate::share::dispatch(&device, &paths, context.commands, context.connected);
-                if sent.ok {
-                    Ok(Some(sent.message))
-                } else {
-                    Err(sent.message)
+                #[cfg(target_os = "linux")]
+                {
+                    use gtk::prelude::*;
+                    use tao::platform::unix::WindowExtUnix;
+                    let route = route.clone();
+                    let parent: &gtk::Window = self.window.gtk_window().upcast_ref();
+                    crate::file_chooser_linux::choose_files(Some(parent), "Send Files", true, move |paths| {
+                        let _ = route.proxy.send_event((route.wrap)(Message::FilesChosen { device: device.clone(), paths }));
+                    });
+                    Ok(None)
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let Some(paths) = rfd::FileDialog::new().set_title("Send Files").set_parent(&self.window).pick_files() else {
+                        return Ok(None);
+                    };
+                    let sent = crate::share::dispatch(&device, &paths, context.commands, context.connected);
+                    if sent.ok {
+                        Ok(Some(sent.message))
+                    } else {
+                        Err(sent.message)
+                    }
                 }
             }
             Some("show_received_files") => {

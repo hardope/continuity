@@ -4,21 +4,24 @@ All notable user-facing changes to Continuity are documented here.
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-10-08
+
 ### Added
 
-- **A page for every device on Android.** Tap a device to open it: a
-  compact media player (usable even when nothing is playing — play resumes
-  whatever was last playing), send files, remote control, lock/unlock,
-  disconnect and forget, all in one place, most of it on one screen. The device list shows a now-playing line and a
-  quick play/pause (or Reconnect) button per device, and a banner when
-  syncing is paused.
-- **Remote lock and unlock (Linux).** Lock or unlock a Linux desktop from
-  its page on Android. Unlock is off for every device until you turn it on
-  for that device from the computer's tray menu (**Allow Remote Unlock**,
-  which asks you to confirm), and the computer notifies you every time it's
-  locked or unlocked remotely, or someone tries without permission. Works
-  with GNOME and KDE Plasma lock screens. Not available on macOS or Windows,
-  which have no supported way for an app to do this.
+- **A page for every device on Android.** Tap a device to open it: the full
+  media player (usable even when nothing is playing — play resumes whatever
+  was last playing), send files, remote control, lock/unlock, disconnect and
+  forget, all in one place and, on a typical phone, all on one screen. The
+  device list shows a now-playing line and a quick play/pause (or Reconnect)
+  button per device, and a banner when syncing is paused.
+- **Remote lock and unlock.** Lock any connected computer from its page on
+  Android, and unlock a Linux one. Unlock is off for every device until you
+  turn it on for that device on the computer itself — in the settings
+  window, or the tray menu's **Allow Remote Unlock** — which asks you to
+  confirm. The computer notifies you every time it's locked or unlocked
+  remotely, or someone tries without permission. Unlocking works with GNOME
+  and KDE Plasma lock screens; macOS and Windows have no supported way for
+  an app to unlock the screen, so there it's lock only.
 - **Share to your devices.** On Android, Continuity appears in every app's
   share sheet: pick a device, or all of them. Files are sent as usual;
   shared text and links land on that device's clipboard. On the desktop,
@@ -30,16 +33,14 @@ All notable user-facing changes to Continuity are documented here.
 - **Remote control says why it stopped.** If the computer declines, times out
   or stops sharing its screen, the phone now shows the reason instead of
   closing (or waiting) without explanation.
-- **Lock a Mac or a Windows PC from your phone**, from the computer's page,
-  just like a Linux one. Unlocking stays Linux-only: macOS and Windows don't
-  let apps unlock the screen.
 - **A settings window.** Tray menu → Settings… opens a proper window with
   your paired and nearby devices: pair with one, send it files, disconnect
   or forget it, and choose whether it may control this computer without
   asking you each time (and, on Linux, unlock it). On macOS it's a native
   app that uses Liquid Glass on macOS 26 and works back to macOS 12; on
   Linux and Windows it opens in the system's own web view, styled to fit
-  each.
+  each (on Windows 10 that needs the WebView2 Runtime, which Windows 11
+  already has).
 - **About, activity and permissions in the settings window.** Its ⓘ button
   shows the version and system, what Continuity has done since it started
   (connections, clipboard, files, remote control, locks), where received
@@ -75,6 +76,9 @@ All notable user-facing changes to Continuity are documented here.
   app and reopening it while Continuity kept running in the background.
 - **Android: picking a large file to send no longer freezes the app** while
   it's being prepared.
+- **Linux: choosing a file to send no longer freezes Continuity.** Send
+  File… in the tray menu could leave the app not responding until it was
+  force-quit; it now uses GTK's own file chooser.
 
 ## [0.1.5] - 2026-09-10
 
