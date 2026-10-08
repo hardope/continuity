@@ -5,9 +5,9 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -46,6 +46,7 @@ import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
@@ -134,7 +135,7 @@ internal fun DeviceDetailScreen(
                 .padding(padding)
                 .padding(horizontal = 16.dp)
                 .verticalScroll(rememberScrollState()),
-            verticalArrangement = Arrangement.spacedBy(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             DeviceHeader(device = device, nowMillis = nowMillis)
 
@@ -155,7 +156,7 @@ internal fun DeviceDetailScreen(
                         )
                     }
                 }
-                Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
                     OutlinedButton(onClick = { EngineHolder.engine?.disconnectPeer(device.id) }, modifier = Modifier.weight(1f)) {
                         Icon(Icons.Default.LinkOff, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(8.dp))
@@ -168,14 +169,13 @@ internal fun DeviceDetailScreen(
                     modifier = Modifier.fillMaxWidth(),
                     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
                 ) {
-                    Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                        Text("Not connected", style = MaterialTheme.typography.titleMedium)
+                    Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Text(
-                            "Media controls, file sending and everything else for '${device.name}' come back once it's connected again — it needs to be on the same Wi-Fi network with Continuity running.",
+                            "Everything for '${device.name}' comes back once it's connected again — on the same Wi-Fi, with Continuity running.",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
-                        Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
                             FilledTonalButton(onClick = { EngineHolder.engine?.reconnectPeer(device.id) }, modifier = Modifier.weight(1f)) {
                                 Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
                                 Spacer(Modifier.width(8.dp))
@@ -186,7 +186,7 @@ internal fun DeviceDetailScreen(
                     }
                 }
             }
-            Spacer(Modifier.height(8.dp))
+            Spacer(Modifier.height(4.dp))
         }
     }
 
@@ -209,19 +209,21 @@ internal fun DeviceDetailScreen(
     }
 }
 
+/** The app bar already names the device; this says what it is and how
+ * it's doing, in one compact line. */
 @Composable
 private fun DeviceHeader(device: DeviceStatus, nowMillis: Long) {
     Row(
-        modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+        modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(16.dp),
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        DeviceAvatar(device = device, statusColor = deviceStatusColor(device, nowMillis), size = 64.dp)
+        DeviceAvatar(device = device, statusColor = deviceStatusColor(device, nowMillis), size = 40.dp)
         Column {
-            Text(device.name, style = MaterialTheme.typography.headlineSmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
+            Text(platformLabel(device.platform), style = MaterialTheme.typography.titleSmall)
             Text(
-                "${platformLabel(device.platform)} · ${statusText(device, nowMillis)}",
-                style = MaterialTheme.typography.bodyMedium,
+                statusText(device, nowMillis),
+                style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
@@ -230,15 +232,17 @@ private fun DeviceHeader(device: DeviceStatus, nowMillis: Long) {
 
 private class DeviceAction(val icon: ImageVector, val label: String, val onClick: () -> Unit)
 
-/** What this particular device can do, two to a row — only the actions
- * its platform (and protocol version) actually supports are shown. */
+/** What this particular device can do — only the actions its platform (and
+ * protocol version) actually supports. Side by side as icon-over-label
+ * tiles (at most four, which is every action a device can have), or one
+ * ordinary button when sending files is all there is (another phone). */
 @Composable
 private fun QuickActions(device: DeviceStatus, onSendFiles: () -> Unit, onUnlock: () -> Unit) {
     val actions = buildList<DeviceAction> {
         add(DeviceAction(Icons.Default.FileUpload, "Send files", onSendFiles))
         if (device.supportsRemoteControl) {
             add(
-                DeviceAction(Icons.AutoMirrored.Filled.ScreenShare, "Remote control") {
+                DeviceAction(Icons.AutoMirrored.Filled.ScreenShare, "Control") {
                     EngineHolder.engine?.requestRemoteControl(device.id)
                     ContinuityStore.notice("Requesting remote control of '${device.name}' — accept on that device if it asks")
                 },
@@ -251,21 +255,32 @@ private fun QuickActions(device: DeviceStatus, onSendFiles: () -> Unit, onUnlock
             add(DeviceAction(Icons.Default.LockOpen, "Unlock", onUnlock))
         }
     }
-    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        actions.chunked(2).forEach { row ->
-            Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
+    if (actions.size == 1) {
+        val action = actions.first()
+        FilledTonalButton(onClick = action.onClick, modifier = Modifier.fillMaxWidth()) {
+            Icon(action.icon, contentDescription = null, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(8.dp))
+            Text(action.label)
+        }
+        return
+    }
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        actions.chunked(4).forEach { row ->
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
                 row.forEach { action ->
                     FilledTonalButton(
                         onClick = action.onClick,
-                        modifier = Modifier.weight(1f).height(56.dp),
-                        shape = RoundedCornerShape(16.dp),
+                        modifier = Modifier.weight(1f).height(64.dp),
+                        shape = RoundedCornerShape(14.dp),
+                        contentPadding = PaddingValues(horizontal = 4.dp, vertical = 8.dp),
                     ) {
-                        Icon(action.icon, contentDescription = null, modifier = Modifier.size(20.dp))
-                        Spacer(Modifier.width(8.dp))
-                        Text(action.label, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Icon(action.icon, contentDescription = null, modifier = Modifier.size(22.dp))
+                            Spacer(Modifier.height(4.dp))
+                            Text(action.label, style = MaterialTheme.typography.labelMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        }
                     }
                 }
-                if (row.size == 1) Spacer(Modifier.weight(1f))
             }
         }
     }
@@ -284,8 +299,10 @@ private fun ForgetButton(onForget: () -> Unit, modifier: Modifier = Modifier) {
     }
 }
 
-/** The full player — always shown for a media-capable device, even with
- * nothing playing, since play can resume whatever was playing last.
+/** The player, compact: artwork, title and artist on one row, then the
+ * seek bar with its times, then the transport and volume buttons — always
+ * shown for a media-capable device, even with nothing playing, since play
+ * can resume whatever was playing last.
  *
  * Volume is only *controlled* via step commands (there's no "set absolute
  * volume" command), so the level bar is a read-only display of what the
@@ -302,58 +319,56 @@ private fun NowPlayingPanel(
     val title = info?.title
     val artist = info?.artist
     val hasTrack = title != null || artist != null
-    Column(
-        modifier = Modifier.fillMaxWidth().padding(16.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-    ) {
-        Text(
-            "Now playing",
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.fillMaxWidth(),
-        )
-        Spacer(Modifier.height(12.dp))
-
-        val artwork = remember(info?.artwork) {
-            info?.artwork?.takeIf { it.isNotEmpty() }
-                ?.let { BitmapFactory.decodeByteArray(it, 0, it.size)?.asImageBitmap() }
-        }
-        Box(
-            modifier = Modifier.fillMaxWidth(0.6f).aspectRatio(1f).clip(RoundedCornerShape(16.dp)),
-            contentAlignment = Alignment.Center,
-        ) {
-            if (artwork != null) {
-                Image(bitmap = artwork, contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
-            } else {
-                Surface(color = MaterialTheme.colorScheme.surface, modifier = Modifier.fillMaxSize()) {
-                    Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxSize()) {
-                        Icon(
-                            Icons.Default.MusicNote,
-                            contentDescription = null,
-                            modifier = Modifier.size(56.dp),
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
+    Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 12.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            val artwork = remember(info?.artwork) {
+                info?.artwork?.takeIf { it.isNotEmpty() }
+                    ?.let { BitmapFactory.decodeByteArray(it, 0, it.size)?.asImageBitmap() }
+            }
+            Box(
+                modifier = Modifier.size(56.dp).clip(RoundedCornerShape(10.dp)),
+                contentAlignment = Alignment.Center,
+            ) {
+                if (artwork != null) {
+                    Image(bitmap = artwork, contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
+                } else {
+                    Surface(color = MaterialTheme.colorScheme.surface, modifier = Modifier.fillMaxSize()) {
+                        Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxSize()) {
+                            Icon(
+                                Icons.Default.MusicNote,
+                                contentDescription = null,
+                                modifier = Modifier.size(28.dp),
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
                     }
                 }
             }
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    "Now playing",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    if (hasTrack) title ?: "Unknown title" else "Nothing playing",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                val subtitle = if (hasTrack) artist else "Play resumes what was last playing on '$deviceName'"
+                if (subtitle != null) {
+                    Text(
+                        subtitle,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
         }
-
-        Spacer(Modifier.height(16.dp))
-        Text(
-            if (hasTrack) title ?: "Unknown title" else "Nothing playing",
-            style = MaterialTheme.typography.titleLarge,
-            fontWeight = FontWeight.SemiBold,
-            textAlign = TextAlign.Center,
-            maxLines = 2,
-            overflow = TextOverflow.Ellipsis,
-        )
-        val subtitle = if (hasTrack) artist else "Press play to resume whatever was last playing on '$deviceName'"
-        if (subtitle != null) {
-            Spacer(Modifier.height(4.dp))
-            Text(subtitle, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center)
-        }
-
-        Spacer(Modifier.height(16.dp))
 
         val durationMs = (info?.durationMs ?: 0uL).toLong()
         val isPlaying = info?.isPlaying == true
@@ -383,82 +398,89 @@ private fun NowPlayingPanel(
         // otherwise fight the gesture.
         val displayedPositionMs = if (isDraggingPosition) dragPositionMs else livePositionMs
 
-        Slider(
-            value = displayedPositionMs.toFloat(),
-            onValueChange = {
-                isDraggingPosition = true
-                dragPositionMs = it.toLong()
-            },
-            onValueChangeFinished = {
-                onMediaCommand(FfiMediaCommand.Seek(dragPositionMs.toULong()))
-                isDraggingPosition = false
-            },
-            valueRange = 0f..durationMs.coerceAtLeast(1).toFloat(),
-            enabled = durationMs > 0,
-        )
-        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-            Text(formatDuration(displayedPositionMs), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            Text(formatDuration(durationMs), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().padding(top = 4.dp)) {
+            Text(
+                formatDuration(displayedPositionMs),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.widthIn(min = 34.dp),
+            )
+            Slider(
+                value = displayedPositionMs.toFloat(),
+                onValueChange = {
+                    isDraggingPosition = true
+                    dragPositionMs = it.toLong()
+                },
+                onValueChangeFinished = {
+                    onMediaCommand(FfiMediaCommand.Seek(dragPositionMs.toULong()))
+                    isDraggingPosition = false
+                },
+                valueRange = 0f..durationMs.coerceAtLeast(1).toFloat(),
+                enabled = durationMs > 0,
+                modifier = Modifier.weight(1f).padding(horizontal = 6.dp),
+            )
+            Text(
+                formatDuration(durationMs),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.End,
+                modifier = Modifier.widthIn(min = 34.dp),
+            )
         }
 
-        Spacer(Modifier.height(8.dp))
-
-        Row(horizontalArrangement = Arrangement.spacedBy(24.dp), verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = { onMediaCommand(FfiMediaCommand.Previous) }, modifier = Modifier.size(56.dp)) {
-                Icon(Icons.Default.SkipPrevious, contentDescription = "Previous", modifier = Modifier.size(36.dp))
-            }
-            FilledIconButton(onClick = { onMediaCommand(FfiMediaCommand.PlayPause) }, modifier = Modifier.size(72.dp)) {
-                Icon(
-                    if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
-                    contentDescription = if (isPlaying) "Pause" else "Play",
-                    modifier = Modifier.size(40.dp),
-                )
-            }
-            IconButton(onClick = { onMediaCommand(FfiMediaCommand.Next) }, modifier = Modifier.size(56.dp)) {
-                Icon(Icons.Default.SkipNext, contentDescription = "Next", modifier = Modifier.size(36.dp))
-            }
-        }
-
-        Spacer(Modifier.height(16.dp))
-
-        // `volumePercent == null` means this peer doesn't report a readable
-        // level — the +/- buttons still work either way, just without a bar.
-        val volumePercent = info?.volumePercent
         Row(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
         ) {
             IconButton(onClick = { onMediaCommand(FfiMediaCommand.VolumeDown) }) {
                 Icon(Icons.AutoMirrored.Filled.VolumeDown, contentDescription = "Volume down")
             }
-            if (volumePercent != null) {
-                // Disabled, not draggable — it reflects the real output
-                // level, it isn't itself a control (see the doc comment).
-                Slider(
-                    value = volumePercent,
-                    onValueChange = {},
-                    enabled = false,
-                    valueRange = 0f..1f,
+            IconButton(onClick = { onMediaCommand(FfiMediaCommand.Previous) }, modifier = Modifier.size(48.dp)) {
+                Icon(Icons.Default.SkipPrevious, contentDescription = "Previous", modifier = Modifier.size(30.dp))
+            }
+            FilledIconButton(onClick = { onMediaCommand(FfiMediaCommand.PlayPause) }, modifier = Modifier.size(56.dp)) {
+                Icon(
+                    if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                    contentDescription = if (isPlaying) "Pause" else "Play",
+                    modifier = Modifier.size(32.dp),
+                )
+            }
+            IconButton(onClick = { onMediaCommand(FfiMediaCommand.Next) }, modifier = Modifier.size(48.dp)) {
+                Icon(Icons.Default.SkipNext, contentDescription = "Next", modifier = Modifier.size(30.dp))
+            }
+            IconButton(onClick = { onMediaCommand(FfiMediaCommand.VolumeUp) }) {
+                Icon(Icons.AutoMirrored.Filled.VolumeUp, contentDescription = "Volume up")
+            }
+        }
+
+        // `volumePercent == null` means this peer doesn't report a readable
+        // level — the buttons above still work either way, just without a bar.
+        val volumePercent = info?.volumePercent
+        if (volumePercent != null) {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(top = 2.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    "Volume",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                // Read-only — it reflects the real output level, it isn't
+                // itself a control (see the doc comment).
+                LinearProgressIndicator(
+                    progress = { volumePercent.coerceIn(0f, 1f) },
                     modifier = Modifier.weight(1f),
                 )
                 Text(
                     "${(volumePercent * 100).toInt()}%",
-                    style = MaterialTheme.typography.labelMedium,
+                    style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.widthIn(min = 36.dp),
+                    textAlign = TextAlign.End,
+                    modifier = Modifier.widthIn(min = 34.dp),
                 )
-            } else {
-                Text(
-                    "Volume",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.weight(1f),
-                    textAlign = TextAlign.Center,
-                )
-            }
-            IconButton(onClick = { onMediaCommand(FfiMediaCommand.VolumeUp) }) {
-                Icon(Icons.AutoMirrored.Filled.VolumeUp, contentDescription = "Volume up")
             }
         }
     }

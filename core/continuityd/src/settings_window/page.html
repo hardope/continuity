@@ -1,0 +1,855 @@
+<!doctype html>
+<!--
+  Continuity's settings window on Linux and Windows (see settings_window.rs):
+  the same pages as the macOS app, in the system webview. __PLATFORM__ is
+  replaced with "linux" or "windows" before loading, which picks the look —
+  Adwaita-like on Linux, Fluent-like on Windows — and the wording.
+
+  Requests go to Rust with window.ipc.postMessage(JSON) — {id, op, ...} —
+  and everything comes back through window.continuity.receive(...): a
+  status ({ok, status}) whenever anything changes, and an answer ({id, ok,
+  message}) to each request. Nothing is kept here between statuses: the
+  status is the truth, and a change shown early is put back if it's refused.
+-->
+<html lang="en" data-platform="__PLATFORM__">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Continuity</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --font: system-ui, sans-serif;
+  --bg: #f6f6f7;
+  --sidebar: #ececee;
+  --card: #ffffff;
+  --border: rgba(0, 0, 0, 0.08);
+  --text: #1d1d1f;
+  --muted: #64646a;
+  --accent: #2f6fd6;
+  --on-accent: #ffffff;
+  --danger: #c01c28;
+  --ok: #2e9e5b;
+  --warn: #d97a00;
+  --hover: rgba(0, 0, 0, 0.045);
+  --selected: rgba(0, 0, 0, 0.085);
+  --button: rgba(0, 0, 0, 0.06);
+  --button-hover: rgba(0, 0, 0, 0.1);
+  --switch-off: rgba(0, 0, 0, 0.22);
+  --radius: 12px;
+  --control-radius: 6px;
+  --button-height: 32px;
+  --shadow: 0 10px 40px rgba(0, 0, 0, 0.22);
+}
+html[data-platform="windows"] {
+  --font: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --bg: #f3f3f3;
+  --sidebar: #ebebeb;
+  --card: #fbfbfb;
+  --border: rgba(0, 0, 0, 0.07);
+  --text: #1a1a1a;
+  --muted: #5d5d5d;
+  --accent: #005fb8;
+  --radius: 8px;
+  --control-radius: 4px;
+  --button: #fdfdfd;
+  --button-hover: #f6f6f6;
+}
+html[data-platform="linux"] {
+  --font: Cantarell, Ubuntu, "Noto Sans", "DejaVu Sans", system-ui, sans-serif;
+  --bg: #fafafb;
+  --sidebar: #ebebed;
+  --accent: #3584e4;
+  --danger: #c01c28;
+  --radius: 12px;
+  --control-radius: 8px;
+  --button-height: 34px;
+}
+@media (prefers-color-scheme: dark) {
+  :root, html[data-platform] {
+    --bg: #1f1f21;
+    --sidebar: #29292c;
+    --card: #2c2c2f;
+    --border: rgba(255, 255, 255, 0.08);
+    --text: #f2f2f4;
+    --muted: #a5a5ad;
+    --accent: #78aeed;
+    --on-accent: #0b1726;
+    --danger: #ff7b6b;
+    --ok: #5ad48a;
+    --warn: #ffb04a;
+    --hover: rgba(255, 255, 255, 0.05);
+    --selected: rgba(255, 255, 255, 0.1);
+    --button: rgba(255, 255, 255, 0.08);
+    --button-hover: rgba(255, 255, 255, 0.13);
+    --switch-off: rgba(255, 255, 255, 0.25);
+    --shadow: 0 10px 40px rgba(0, 0, 0, 0.55);
+  }
+  html[data-platform="windows"] {
+    --bg: #202020;
+    --sidebar: #1b1b1b;
+    --card: #2b2b2b;
+    --accent: #60cdff;
+    --on-accent: #001a28;
+    --button: #2d2d2d;
+    --button-hover: #323232;
+  }
+  html[data-platform="linux"] {
+    --bg: #222226;
+    --sidebar: #2e2e32;
+    --card: #36363a;
+  }
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0;
+  display: flex;
+  overflow: hidden;
+  font: 14px/1.45 var(--font);
+  color: var(--text);
+  background: var(--bg);
+  -webkit-user-select: none;
+  user-select: none;
+  cursor: default;
+}
+button { font: inherit; color: inherit; }
+svg { display: block; flex: none; }
+.selectable { -webkit-user-select: text; user-select: text; cursor: text; }
+.muted { color: var(--muted); }
+
+/* Sidebar */
+#sidebar {
+  width: 248px;
+  flex: none;
+  overflow-y: auto;
+  padding: 12px 8px 16px;
+  background: var(--sidebar);
+  border-right: 1px solid var(--border);
+}
+.group-title {
+  margin: 16px 10px 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+}
+.item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 7px 10px;
+  border: 0;
+  border-radius: var(--control-radius);
+  background: none;
+  text-align: left;
+}
+.item:hover { background: var(--hover); }
+.item.selected { background: var(--selected); }
+.item .icon { color: var(--muted); }
+.item.selected .icon { color: var(--accent); }
+.item .labels { flex: 1; min-width: 0; }
+.item .name, .item .sub { display: block; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.item .sub { font-size: 12px; color: var(--muted); }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--switch-off); flex: none; }
+.dot.on { background: var(--ok); }
+.none { padding: 6px 10px; color: var(--muted); }
+
+/* Main column */
+#main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+#toolbar { display: flex; justify-content: flex-end; gap: 6px; padding: 10px 14px 0; }
+#content { flex: 1; overflow-y: auto; padding: 4px 32px 32px; }
+.page { max-width: 660px; margin: 0 auto; }
+
+/* Sections */
+.section { margin-top: 22px; }
+.section > h2 { margin: 0 0 8px 4px; font-size: 13px; font-weight: 600; }
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-height: 52px;
+  padding: 11px 16px;
+}
+.row + .row { border-top: 1px solid var(--border); }
+.row .text { flex: 1; min-width: 0; }
+.row .title { display: block; }
+.row .detail { display: block; font-size: 12.5px; color: var(--muted); margin-top: 1px; }
+.row .value { color: var(--muted); text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 60%; }
+.row .glyph { color: var(--accent); }
+.footer { margin: 7px 4px 0; font-size: 12.5px; color: var(--muted); }
+.footer p { margin: 0 0 4px; }
+
+.header { display: flex; align-items: center; gap: 16px; padding: 16px; }
+.badge {
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  flex: none;
+  color: var(--accent);
+  background: var(--hover);
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
+}
+.badge.ok { color: var(--ok); background: var(--hover); background: color-mix(in srgb, var(--ok) 15%, transparent); }
+.badge.off { color: var(--muted); background: var(--hover); }
+.header h1 { margin: 0; font-size: 21px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.header .sub { color: var(--muted); }
+.actions { display: flex; flex-wrap: wrap; gap: 8px; padding: 0 16px 16px; }
+
+/* Controls */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  height: var(--button-height);
+  padding: 0 14px;
+  border: 1px solid transparent;
+  border-radius: var(--control-radius);
+  background: var(--button);
+  white-space: nowrap;
+}
+html[data-platform="windows"] .btn { border-color: var(--border); }
+.btn:hover { background: var(--button-hover); }
+.btn.primary { background: var(--accent); color: var(--on-accent); border-color: transparent; }
+.btn.primary:hover { filter: brightness(1.08); }
+.btn.danger { color: var(--danger); }
+.btn.link { background: none; border: 0; padding: 0 2px; height: auto; color: var(--accent); }
+.btn.link:hover { text-decoration: underline; }
+.btn.icon-only { width: var(--button-height); padding: 0; }
+.btn:disabled { opacity: 0.45; pointer-events: none; }
+.btn:focus-visible, .item:focus-visible, .switch input:focus-visible + .track { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.switch { position: relative; flex: none; width: 46px; height: 26px; }
+html[data-platform="windows"] .switch { width: 40px; height: 20px; }
+.switch input { position: absolute; inset: 0; margin: 0; opacity: 0; cursor: pointer; z-index: 1; }
+.switch .track {
+  position: absolute;
+  inset: 0;
+  border-radius: 999px;
+  background: var(--switch-off);
+  transition: background 0.15s;
+}
+.switch .track::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+  transition: transform 0.15s;
+}
+html[data-platform="windows"] .switch .track::after { top: 4px; left: 4px; width: 12px; height: 12px; box-shadow: none; }
+.switch input:checked + .track { background: var(--accent); }
+.switch input:checked + .track::after { transform: translateX(20px); }
+html[data-platform="windows"] .switch input:checked + .track::after { background: var(--on-accent); }
+
+.notice { display: flex; align-items: center; gap: 10px; color: var(--warn); }
+.allowed { display: inline-flex; align-items: center; gap: 6px; color: var(--ok); }
+
+/* Dialogs */
+.overlay {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(0, 0, 0, 0.32);
+  z-index: 10;
+}
+.dialog {
+  width: min(420px, 100%);
+  padding: 20px;
+  border-radius: calc(var(--radius) + 2px);
+  background: var(--card);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow);
+}
+.dialog h3 { margin: 0 0 8px; font-size: 16px; }
+.dialog p { margin: 0 0 18px; color: var(--muted); }
+.dialog .buttons { display: flex; justify-content: flex-end; gap: 8px; }
+.sheet {
+  width: min(600px, 100%);
+  max-height: 100%;
+  display: flex;
+  flex-direction: column;
+  border-radius: calc(var(--radius) + 2px);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+.sheet .scroll { overflow-y: auto; padding: 4px 22px 22px; }
+.sheet .bar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 12px 18px;
+  border-top: 1px solid var(--border);
+  background: var(--card);
+  font-size: 13px;
+}
+.sheet .bar .spacer { flex: 1; }
+.app { display: flex; align-items: center; gap: 16px; padding: 16px; }
+.app h1 { margin: 0; font-size: 21px; font-weight: 600; }
+.tip { display: flex; align-items: flex-start; gap: 12px; padding: 11px 16px; }
+.tip + .tip { border-top: 1px solid var(--border); }
+.tip svg { color: var(--muted); margin-top: 1px; }
+.mono { font-family: ui-monospace, "Cascadia Mono", Consolas, "DejaVu Sans Mono", monospace; font-size: 12.5px; }
+
+#toast {
+  position: fixed;
+  left: 50%;
+  bottom: 20px;
+  transform: translateX(-50%);
+  max-width: min(520px, calc(100% - 40px));
+  padding: 10px 16px;
+  border-radius: var(--radius);
+  background: var(--text);
+  color: var(--bg);
+  box-shadow: var(--shadow);
+  z-index: 20;
+}
+#toast[hidden] { display: none; }
+#loading { margin: auto; color: var(--muted); }
+</style>
+</head>
+<body>
+<p id="loading">Loading…</p>
+<div id="toast" role="status" hidden></div>
+<script>
+"use strict";
+
+const PLATFORM = document.documentElement.dataset.platform;
+
+// Small line icons, drawn on a 24-unit grid.
+const ICONS = {
+  laptop: '<rect x="4" y="5" width="16" height="11" rx="1.5"/><path d="M2 19h20"/>',
+  desktop: '<rect x="3" y="4" width="18" height="12" rx="1.5"/><path d="M9 20h6M12 16v4"/>',
+  phone: '<rect x="7" y="2.5" width="10" height="19" rx="2.2"/><path d="M11 18.5h2"/>',
+  info: '<circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 7.6v.01"/>',
+  pause: '<path d="M9 6v12M15 6v12"/>',
+  play: '<path d="M8 5.5v13l10-6.5z"/>',
+  send: '<path d="M21 3 10 14"/><path d="M21 3l-7 18-4-7-7-4z"/>',
+  link: '<path d="M10 14a4 4 0 0 0 5.66 0l3-3a4 4 0 0 0-5.66-5.66l-1 1"/><path d="M14 10a4 4 0 0 0-5.66 0l-3 3a4 4 0 0 0 5.66 5.66l1-1"/>',
+  warning: '<path d="M12 3.5 2.5 20h19z"/><path d="M12 10v4.5M12 17.2v.01"/>',
+  check: '<circle cx="12" cy="12" r="9"/><path d="m8 12.2 2.8 2.8L16 9.5"/>',
+  folder: '<path d="M3 6.5A1.5 1.5 0 0 1 4.5 5H9l2 2h8.5A1.5 1.5 0 0 1 21 8.5v9a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 17.5z"/>',
+  clipboard: '<rect x="6" y="4" width="12" height="17" rx="2"/><path d="M9 4.5V3h6v1.5M9 10h6M9 14h4"/>',
+  copy: '<rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V5.5A1.5 1.5 0 0 0 14.5 4h-9A1.5 1.5 0 0 0 4 5.5v9A1.5 1.5 0 0 0 5.5 16H8"/>',
+  screen: '<rect x="3" y="4" width="18" height="12" rx="1.5"/><path d="M8 20h8"/><path d="m10 7.5 5 2.6-2.1.7-.8 2.1z"/>',
+  lock: '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>',
+  shield: '<path d="M12 3 4.5 6v5.5c0 4.7 3.2 8.3 7.5 9.5 4.3-1.2 7.5-4.8 7.5-9.5V6z"/>',
+  close: '<path d="M6 6l12 12M18 6 6 18"/>',
+};
+
+function icon(name, size = 20, width = 1.8) {
+  const fill = name === "play" ? "currentColor" : "none";
+  return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="${fill}" stroke="currentColor" stroke-width="${width}" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name]}</svg>`;
+}
+
+// The mark from assets/logo.svg.
+const LOGO = `<svg width="60" height="60" viewBox="0 0 100 100" aria-hidden="true">
+  <defs>
+    <linearGradient id="blue" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#38bdf8"/><stop offset="100%" stop-color="#2563eb"/></linearGradient>
+    <linearGradient id="purple" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#6d28d9"/><stop offset="100%" stop-color="#a855f7"/></linearGradient>
+  </defs>
+  <rect width="100" height="100" rx="22" fill="#0a0e1a"/>
+  <circle cx="50" cy="50" r="30" fill="none" stroke="url(#blue)" stroke-width="9" stroke-linecap="round" stroke-dasharray="83.78 104.72"/>
+  <circle cx="50" cy="50" r="30" fill="none" stroke="url(#purple)" stroke-width="9" stroke-linecap="round" stroke-dasharray="83.78 104.72" transform="rotate(180 50 50)"/>
+  <circle cx="21.81" cy="60.26" r="8.5" fill="#38bdf8"/>
+  <circle cx="78.19" cy="39.74" r="8.5" fill="#a855f7"/>
+</svg>`;
+
+const PLATFORMS = {
+  mac_os: { name: "Mac", icon: "laptop" },
+  windows: { name: "Windows PC", icon: "desktop" },
+  linux: { name: "Linux computer", icon: "desktop" },
+  android: { name: "Android phone", icon: "phone" },
+  ios: { name: "iPhone", icon: "phone" },
+};
+const platformInfo = (platform) => PLATFORMS[platform] || { name: "Device", icon: "desktop" };
+// What this computer is called in the copy.
+const HERE = PLATFORM === "windows" ? "PC" : "computer";
+
+const state = {
+  status: null,
+  selection: { kind: "this" },
+  // A request id → what to do with its answer.
+  pending: new Map(),
+  nextId: 1,
+  pairing: new Set(),
+  dialog: null,
+  infoOpen: false,
+};
+
+function esc(text) {
+  return String(text ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+}
+
+function send(op, fields = {}, onAnswer) {
+  const id = state.nextId++;
+  if (onAnswer) state.pending.set(id, onAnswer);
+  window.ipc.postMessage(JSON.stringify({ id, op, ...fields }));
+}
+
+window.continuity = {
+  receive(message) {
+    if (message.status) {
+      state.status = message.status;
+      fixSelection();
+      render();
+      return;
+    }
+    const onAnswer = state.pending.get(message.id);
+    state.pending.delete(message.id);
+    if (onAnswer) onAnswer(message);
+    if (!message.ok && message.message) toast(message.message);
+    else if (message.ok && message.message) toast(message.message);
+  },
+};
+
+// ── Formatting ─────────────────────────────────────────────────────────────
+
+function home(path) {
+  return String(path || "")
+    .replace(/^\/home\/[^/]+/, "~")
+    .replace(/^[A-Za-z]:\\Users\\[^\\]+/, "~");
+}
+function bytes(n) {
+  const units = ["bytes", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  while (n >= 1000 && i < units.length - 1) { n /= 1000; i++; }
+  return i === 0 ? `${n} bytes` : `${n.toFixed(n < 10 ? 1 : 0)} ${units[i]}`;
+}
+function files(count, size) {
+  return count === 0 ? "None" : `${count} · ${bytes(size)}`;
+}
+function ago(unix) {
+  const seconds = Math.round(unix - Date.now() / 1000);
+  const format = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
+  for (const [unit, length] of [["day", 86400], ["hour", 3600], ["minute", 60]]) {
+    if (Math.abs(seconds) >= length) return format.format(Math.round(seconds / length), unit);
+  }
+  return format.format(seconds, "second");
+}
+function date(unix) {
+  return new Date(unix * 1000).toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" });
+}
+
+// ── Pieces ─────────────────────────────────────────────────────────────────
+
+function section(title, rows, footer = "") {
+  return `<section class="section">${title ? `<h2>${esc(title)}</h2>` : ""}<div class="card">${rows}</div>${footer ? `<div class="footer">${footer}</div>` : ""}</section>`;
+}
+function switchRow(title, detail, checked, action, data = "") {
+  return `<div class="row"><span class="text"><span class="title">${esc(title)}</span><span class="detail">${esc(detail)}</span></span>
+    <label class="switch"><input type="checkbox" role="switch" aria-label="${esc(title)}" data-action="${action}" ${data} ${checked ? "checked" : ""}><span class="track"></span></label></div>`;
+}
+function infoRow(label, value, extra = "") {
+  return `<div class="row"><span class="text">${esc(label)}</span><span class="value selectable">${esc(value)}</span>${extra}</div>`;
+}
+function buttonRow(title, detail, button) {
+  return `<div class="row"><span class="text"><span class="title">${esc(title)}</span>${detail ? `<span class="detail selectable">${esc(detail)}</span>` : ""}</span>${button}</div>`;
+}
+function header(iconName, tone, title, subtitle) {
+  return `<div class="header"><div class="badge ${tone}">${icon(iconName, 26)}</div><div style="min-width:0"><h1>${esc(title)}</h1><div class="sub">${esc(subtitle)}</div></div></div>`;
+}
+function tip(iconName, text) {
+  return `<div class="tip">${icon(iconName, 18)}<span>${esc(text)}</span></div>`;
+}
+
+// ── Sidebar ────────────────────────────────────────────────────────────────
+
+function sidebarItem(kind, id, iconName, name, sub, online) {
+  const selected = state.selection.kind === kind && (kind === "this" || state.selection.id === id);
+  const dot = online === null ? "" : `<span class="dot ${online ? "on" : ""}" title="${online ? "Connected" : "Not connected"}"></span>`;
+  return `<button class="item ${selected ? "selected" : ""}" data-action="select" data-kind="${kind}" data-id="${esc(id)}">
+    <span class="icon">${icon(iconName)}</span><span class="labels"><span class="name">${esc(name)}</span><span class="sub">${esc(sub)}</span></span>${dot}</button>`;
+}
+
+function renderSidebar(status) {
+  let html = sidebarItem("this", "", platformInfo(status.device.platform).icon, status.device.name, `This ${HERE}`, null);
+  html += `<div class="group-title">Paired devices</div>`;
+  if (status.devices.length === 0) html += `<div class="none">None yet</div>`;
+  for (const device of status.devices) {
+    html += sidebarItem("device", device.id, platformInfo(device.platform).icon, device.name, device.connected ? "Connected" : "Not connected", device.connected);
+  }
+  if (status.nearby.length > 0) {
+    html += `<div class="group-title">Nearby</div>`;
+    for (const device of status.nearby) {
+      html += sidebarItem("nearby", device.id, platformInfo(device.platform).icon, device.name, "Not paired", null);
+    }
+  }
+  return html;
+}
+
+// ── Pages ──────────────────────────────────────────────────────────────────
+
+function thisDevicePage(status) {
+  const kind = platformInfo(status.device.platform).name;
+  return (
+    `<div class="card">${header(platformInfo(status.device.platform).icon, "", status.device.name, `This ${kind} · Continuity ${status.device.version}`)}</div>` +
+    section("", switchRow("Pause syncing", "Stops clipboard sync and new connections until you resume. Devices that are already connected stay connected.", status.paused, "pause")) +
+    section("Received files", buttonRow("Saved to", home(status.received_files_dir), `<button class="btn" data-action="show-received">${icon("folder", 16)}Open folder</button>`)) +
+    section(
+      "",
+      `<div class="row"><button class="btn danger" data-action="forget-all" ${status.devices.length === 0 ? "disabled" : ""}>Forget all devices…</button></div>`,
+      "Every device will need to be paired again, on both sides."
+    )
+  );
+}
+
+function devicePage(status, device) {
+  const info = platformInfo(device.platform);
+  const connection = device.connected
+    ? `<button class="btn" data-action="disconnect" data-id="${esc(device.id)}">Disconnect</button>`
+    : `<button class="btn" data-action="connect" data-id="${esc(device.id)}">Connect</button>`;
+  let html =
+    `<div class="card">${header(info.icon, device.connected ? "ok" : "off", device.name, `${info.name} · ${device.connected ? "connected" : "not connected"}`)}
+      <div class="actions"><button class="btn primary" data-action="send-files" data-id="${esc(device.id)}" ${device.connected ? "" : "disabled"}>${icon("send", 16)}Send files…</button>${connection}</div></div>`;
+  if (status.can_be_controlled) {
+    const detail = device.remote_control_allowed
+      ? `${device.name} can see this screen and use its keyboard and mouse whenever it asks.`
+      : `This ${HERE} asks you first each time ${device.name} wants to control it.`;
+    html += section("Remote control", switchRow(`Control this ${HERE} without asking`, detail, device.remote_control_allowed, "remote-control", `data-id="${esc(device.id)}"`));
+  }
+  if (status.can_be_unlocked) {
+    html += section(
+      "Remote unlock",
+      switchRow(`Unlock this ${HERE}`, "You're notified every time it's used. Locking never needs permission.", device.unlock_allowed, "unlock", `data-id="${esc(device.id)}"`)
+    );
+  }
+  html += section("", `<div class="row"><button class="btn danger" data-action="forget" data-id="${esc(device.id)}">Forget ${esc(device.name)}…</button></div>`, `Paired ${esc(date(device.paired_at_unix))}`);
+  return html;
+}
+
+function nearbyPage(device) {
+  const info = platformInfo(device.platform);
+  const hint = state.pairing.has(device.id)
+    ? "Compare the codes on both devices, and confirm on each only if they match."
+    : "Pairing shows a code on both devices. Confirm on each only if the codes match.";
+  return `<div class="card">${header(info.icon, "", device.name, `${info.name} nearby · not paired`)}
+      <div class="actions"><button class="btn primary" data-action="pair" data-id="${esc(device.id)}">${icon("link", 16)}Pair…</button></div></div>
+    <div class="footer">${esc(hint)}</div>`;
+}
+
+// ── The ⓘ panel ────────────────────────────────────────────────────────────
+
+function remoteControlHelp(status) {
+  if (!status.can_be_controlled) return "";
+  if (PLATFORM === "linux") {
+    return section(
+      "Remote control",
+      tip("screen", "When a device starts controlling this computer, your desktop asks you to share the screen and allow remote input. Choose the screen and allow it. Where your desktop supports it, Continuity remembers that, so it only asks once.") +
+        tip("lock", "Remote unlock is off for every device until you switch it on under that device. It works with GNOME's and KDE Plasma's lock screens."),
+      "<p>If nobody answers the desktop's prompt within 90 seconds, the attempt ends and the phone says why.</p>"
+    );
+  }
+  if (PLATFORM === "windows") {
+    return section(
+      "Remote control",
+      tip("screen", "Nothing to set up: once you allow a device, it sees this screen and uses the keyboard and mouse.") +
+        tip("shield", "Windows doesn't let an app type or click into windows running as administrator, or into a UAC prompt — while one is in front, the controlling device can only watch.") +
+        tip("link", "If your devices can't find this PC, allow Continuity on private networks: Windows Security → Firewall & network protection → Allow an app through firewall.")
+    );
+  }
+  return "";
+}
+
+function howTo(status) {
+  const files = PLATFORM === "windows"
+    ? "Send files from a device's page here, from File Explorer (right-click → Send to), or from your phone's share sheet."
+    : "Send files from a device's page here, from your file manager's right-click menu, or from your phone's share sheet.";
+  return section(
+    "How to use",
+    tip("link", "Pair a device by choosing it under Nearby, then check that both screens show the same code.") +
+      tip("clipboard", "Copy on one device and paste on another — the clipboard follows you.") +
+      tip("send", `${files} They arrive in ${home(status.received_files_dir)}.`) +
+      tip("phone", `From your phone, control what's playing here, lock this ${HERE}, or take control of its screen.`) +
+      tip("pause", "Pause syncing from the toolbar here or the tray menu whenever you like.")
+  );
+}
+
+function infoPanel(status) {
+  const about = status.about;
+  const activity = status.activity;
+  let html = `<div class="card"><div class="app">${LOGO}<div><h1>Continuity</h1><div class="muted">Version ${esc(status.device.version)}</div>
+    <div class="muted" style="font-size:12.5px">Clipboard, files and remote control between your devices — over your own network, with no account.</div></div></div></div>`;
+  html += remoteControlHelp(status);
+  html += howTo(status);
+  if (activity) {
+    html += section(
+      "Activity",
+      infoRow("Connections", activity.connections) +
+        infoRow("Clipboard", `${activity.clipboard_sent} sent · ${activity.clipboard_received} received`) +
+        infoRow("Files sent", files(activity.files_sent, activity.bytes_sent)) +
+        infoRow("Files received", files(activity.files_received, activity.bytes_received)) +
+        infoRow("Remote control sessions", activity.remote_control_sessions) +
+        infoRow("Locked or unlocked from a phone", activity.screen_locks),
+      about ? esc(`Since Continuity started, ${ago(about.started_at_unix)}.`) : ""
+    );
+  }
+  let device = infoRow("Name", status.device.name);
+  if (about) device += infoRow("System", about.os) + infoRow("Continuity", `${status.device.version} · protocol ${about.protocol_version}`);
+  device += `<div class="row"><span class="text">Device ID</span><span class="value selectable mono">${esc(status.device.id)}</span>
+    <button class="btn icon-only" data-action="copy" data-text="${esc(status.device.id)}" title="Copy the device ID" aria-label="Copy the device ID">${icon("copy", 16)}</button></div>`;
+  html += section(`This ${HERE}`, device);
+  let paths = buttonRow("Received files", home(status.received_files_dir), `<button class="btn" data-action="show-received">Open folder</button>`);
+  if (about && about.log_file) paths += buttonRow("Log — attach it to a bug report", home(about.log_file), `<button class="btn" data-action="show-log">Show</button>`);
+  html += section("Files", paths);
+  return `<div class="overlay" data-action="close-info-backdrop"><div class="sheet" role="dialog" aria-label="About Continuity">
+    <div class="scroll" id="info-scroll">${html}</div>
+    <div class="bar"><button class="btn link" data-action="link" data-page="">Continuity on GitHub</button>
+      <button class="btn link" data-action="link" data-page="issues">Report a problem</button>
+      <button class="btn link" data-action="link" data-page="license">MIT License</button>
+      <span class="spacer"></span><button class="btn primary" data-action="close-info">Done</button></div></div></div>`;
+}
+
+// ── Confirmations ──────────────────────────────────────────────────────────
+
+function confirmDialog(title, message, action, run) {
+  state.dialog = { title, message, action, run };
+  render();
+}
+
+function dialogHtml() {
+  const d = state.dialog;
+  return `<div class="overlay" data-action="dialog-cancel"><div class="dialog" role="alertdialog" aria-label="${esc(d.title)}">
+    <h3>${esc(d.title)}</h3><p>${esc(d.message)}</p>
+    <div class="buttons"><button class="btn" data-action="dialog-cancel">Cancel</button><button class="btn primary" data-action="dialog-ok">${esc(d.action)}</button></div></div></div>`;
+}
+
+// ── Rendering ──────────────────────────────────────────────────────────────
+
+function fixSelection() {
+  const status = state.status;
+  const { kind, id } = state.selection;
+  if (kind === "device" && !status.devices.some((d) => d.id === id)) state.selection = { kind: "this" };
+  if (kind === "nearby" && !status.nearby.some((d) => d.id === id)) {
+    // Just paired: follow it to its page.
+    state.selection = status.devices.some((d) => d.id === id) ? { kind: "device", id } : { kind: "this" };
+  }
+}
+
+function render() {
+  const status = state.status;
+  if (!status) return;
+  let shell = document.getElementById("main");
+  if (!shell) {
+    document.body.innerHTML = `<nav id="sidebar" aria-label="Devices"></nav><div id="main"><div id="toolbar"></div><div id="content"></div></div><div id="layer"></div><div id="toast" role="status" hidden></div>`;
+  }
+  const content = document.getElementById("content");
+  const infoScroll = document.getElementById("info-scroll");
+  const scrolls = [content.scrollTop, infoScroll ? infoScroll.scrollTop : 0];
+
+  document.getElementById("sidebar").innerHTML = renderSidebar(status);
+  document.getElementById("toolbar").innerHTML =
+    `<button class="btn icon-only" data-action="pause-toggle" title="${status.paused ? "Resume syncing" : "Pause syncing"}" aria-label="${status.paused ? "Resume syncing" : "Pause syncing"}">${icon(status.paused ? "play" : "pause", 16, 2.2)}</button>
+     <button class="btn icon-only" data-action="open-info" title="About Continuity" aria-label="About Continuity">${icon("info", 18)}</button>`;
+
+  const { kind, id } = state.selection;
+  let page;
+  if (kind === "device") page = devicePage(status, status.devices.find((d) => d.id === id));
+  else if (kind === "nearby") page = nearbyPage(status.nearby.find((d) => d.id === id));
+  else page = thisDevicePage(status);
+  content.innerHTML = `<div class="page">${page}</div>`;
+
+  document.getElementById("layer").innerHTML = (state.infoOpen ? infoPanel(status) : "") + (state.dialog ? dialogHtml() : "");
+  content.scrollTop = scrolls[0];
+  const newInfoScroll = document.getElementById("info-scroll");
+  if (newInfoScroll) newInfoScroll.scrollTop = scrolls[1];
+}
+
+let toastTimer;
+function toast(text) {
+  const element = document.getElementById("toast");
+  element.textContent = text;
+  element.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => (element.hidden = true), 5000);
+}
+
+// Shows a change straight away; the next status confirms it, or puts it
+// back if Continuity refused it.
+function changeDevice(id, change) {
+  const device = state.status.devices.find((d) => d.id === id);
+  if (device) change(device);
+  render();
+}
+
+function copy(text) {
+  const area = document.createElement("textarea");
+  area.value = text;
+  document.body.appendChild(area);
+  area.select();
+  const copied = document.execCommand("copy");
+  area.remove();
+  toast(copied ? "Copied" : "Couldn't copy — select the ID instead");
+}
+
+// ── Events ─────────────────────────────────────────────────────────────────
+
+document.addEventListener("click", (event) => {
+  const target = event.target.closest("[data-action]");
+  if (!target || target.tagName === "INPUT") return;
+  const { action, id } = target.dataset;
+  const status = state.status;
+  const device = status && status.devices.find((d) => d.id === id);
+  switch (action) {
+    case "select":
+      state.selection = target.dataset.kind === "this" ? { kind: "this" } : { kind: target.dataset.kind, id };
+      render();
+      document.getElementById("content").scrollTop = 0;
+      break;
+    case "pause-toggle":
+      status.paused = !status.paused;
+      render();
+      send("set_paused", { paused: status.paused });
+      break;
+    case "open-info":
+      state.infoOpen = true;
+      render();
+      break;
+    case "close-info":
+      state.infoOpen = false;
+      render();
+      break;
+    case "close-info-backdrop":
+      if (event.target === target) {
+        state.infoOpen = false;
+        render();
+      }
+      break;
+    case "show-received":
+      send("show_received_files");
+      break;
+    case "show-log":
+      send("show_log");
+      break;
+    case "link":
+      send("open_link", { page: target.dataset.page });
+      break;
+    case "copy":
+      copy(target.dataset.text);
+      break;
+    case "send-files":
+      send("send_files", { device: id });
+      break;
+    case "connect":
+      send("connect", { device: id });
+      break;
+    case "disconnect":
+      send("disconnect", { device: id });
+      break;
+    case "pair":
+      state.pairing.add(id);
+      render();
+      send("connect", { device: id });
+      break;
+    case "forget":
+      confirmDialog(`Forget ${device.name}?`, "It disconnects now and will need to be paired again from scratch.", "Forget", () => {
+        state.selection = { kind: "this" };
+        send("forget", { device: id });
+      });
+      break;
+    case "forget-all":
+      confirmDialog(`Forget all ${status.devices.length} paired devices?`, "They disconnect now, and each one will need to be paired again from scratch.", "Forget all", () => {
+        state.selection = { kind: "this" };
+        send("reset");
+      });
+      break;
+    case "dialog-ok": {
+      const run = state.dialog.run;
+      state.dialog = null;
+      run();
+      render();
+      break;
+    }
+    case "dialog-cancel":
+      if (event.target === target) {
+        state.dialog = null;
+        render();
+      }
+      break;
+  }
+});
+
+document.addEventListener("change", (event) => {
+  const input = event.target.closest("input[data-action]");
+  if (!input) return;
+  const { action, id } = input.dataset;
+  const status = state.status;
+  const device = status.devices.find((d) => d.id === id);
+  const on = input.checked;
+  switch (action) {
+    case "pause":
+      status.paused = on;
+      render();
+      send("set_paused", { paused: on });
+      break;
+    case "remote-control":
+      if (!on) {
+        changeDevice(id, (d) => (d.remote_control_allowed = false));
+        send("set_remote_control_allowed", { device: id, allowed: false });
+        break;
+      }
+      input.checked = false;
+      confirmDialog(
+        `Let ${device.name} control this ${HERE} without asking?`,
+        `Whenever it asks, ${device.name} will see this screen and use its keyboard and mouse — no prompt here first. Anyone with ${device.name} unlocked could do the same.`,
+        "Allow",
+        () => {
+          changeDevice(id, (d) => (d.remote_control_allowed = true));
+          send("set_remote_control_allowed", { device: id, allowed: true });
+        }
+      );
+      break;
+    case "unlock":
+      if (!on) {
+        changeDevice(id, (d) => (d.unlock_allowed = false));
+        send("set_unlock_allowed", { device: id, allowed: false });
+        break;
+      }
+      input.checked = false;
+      confirmDialog(
+        `Let ${device.name} unlock this ${HERE}?`,
+        `${device.name} will be able to unlock this ${HERE} without its password. Anyone using ${device.name} while it's unlocked could too.`,
+        "Allow",
+        () => {
+          changeDevice(id, (d) => (d.unlock_allowed = true));
+          send("set_unlock_allowed", { device: id, allowed: true });
+        }
+      );
+      break;
+  }
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && (state.dialog || state.infoOpen)) {
+    if (state.dialog) state.dialog = null;
+    else state.infoOpen = false;
+    render();
+  }
+  // A reload would only blank the window for a moment; nothing to gain.
+  if (event.key === "F5" || ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "r")) event.preventDefault();
+});
+document.addEventListener("contextmenu", (event) => {
+  if (!event.target.closest(".selectable")) event.preventDefault();
+});
+
+send("watch");
+</script>
+</body>
+</html>

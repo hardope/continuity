@@ -92,8 +92,8 @@ const MOVE_THROTTLE: Duration = Duration::from_millis(8);
 const RENDER_WATCHDOG: Duration = Duration::from_secs(5);
 
 impl RemoteViewer {
-    pub fn open(
-        target: &EventLoopWindowTarget<continuity_daemon::SyncEvent>,
+    pub fn open<T: 'static>(
+        target: &EventLoopWindowTarget<T>,
         peer_id: String,
         peer_name: &str,
         peer_platform: Platform,

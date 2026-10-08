@@ -26,6 +26,25 @@
     "nearby": [{ "id": "tab", "name": "Galaxy Tab S9", "platform": "android" }],
     "received_files_dir": "/Users/me/Downloads/Continuity",
     "can_be_controlled": true,
-    "can_be_unlocked": false
+    "can_be_unlocked": false,
+    "about": {
+      "protocol_version": 2,
+      "os": "macOS 12.7.6",
+      "started_at_unix": 1759900000,
+      "log_file": "/Users/me/Library/Application Support/app.continuity.continuity/continuityd.log",
+      "config_dir": "/Users/me/Library/Application Support/app.continuity.continuity"
+    },
+    "activity": {
+      "connections": 3,
+      "clipboard_sent": 12,
+      "clipboard_received": 5,
+      "files_sent": 2,
+      "bytes_sent": 3500000,
+      "files_received": 1,
+      "bytes_received": 820000,
+      "remote_control_sessions": 1,
+      "screen_locks": 0
+    },
+    "permissions": { "screen_recording": false, "accessibility": true }
   }
 }

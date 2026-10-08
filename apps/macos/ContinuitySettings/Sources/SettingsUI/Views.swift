@@ -2,31 +2,38 @@ import SwiftUI
 
 /// The whole window: paired and nearby devices in the sidebar, the selected
 /// one's settings beside it — or, while Continuity isn't running, a way to
-/// start it.
+/// start it. The toolbar's ⓘ opens `InfoView`.
 public struct RootView: View {
     @EnvironmentObject private var model: SettingsModel
+    @Environment(\.legacyLayout) private var legacyLayout
 
     public init() {}
 
     public var body: some View {
         Group {
             if let status = model.status, model.connection == .connected {
-                NavigationSplitView {
-                    Sidebar(status: status)
-                        .navigationSplitViewColumnWidth(min: 210, ideal: 240, max: 320)
-                } detail: {
-                    Detail(status: status)
-                }
-                .toolbar {
-                    ToolbarItem(placement: .primaryAction) {
-                        Button {
-                            model.setPaused(!status.paused)
-                        } label: {
-                            Label(status.paused ? "Resume Syncing" : "Pause Syncing", systemImage: status.paused ? "play.fill" : "pause.fill")
+                split(status)
+                    .toolbar {
+                        ToolbarItemGroup(placement: .primaryAction) {
+                            Button {
+                                model.setPaused(!status.paused)
+                            } label: {
+                                Label(status.paused ? "Resume Syncing" : "Pause Syncing", systemImage: status.paused ? "play.fill" : "pause.fill")
+                            }
+                            .help(status.paused ? "Resume syncing with your devices" : "Pause syncing with your devices")
+                            Button {
+                                model.showingInfo = true
+                            } label: {
+                                Label("About Continuity", systemImage: "info.circle")
+                            }
+                            .help("About Continuity, what it's done, and the permissions remote control needs")
                         }
-                        .help(status.paused ? "Resume syncing with your devices" : "Pause syncing with your devices")
                     }
-                }
+                    .sheet(isPresented: $model.showingInfo) {
+                        InfoView(status: status)
+                            .environmentObject(model)
+                            .environment(\.legacyLayout, legacyLayout)
+                    }
             } else {
                 NotRunningView()
             }
@@ -39,6 +46,24 @@ public struct RootView: View {
             Button("OK", role: .cancel) {}
         } message: { problem in
             Text(problem.message)
+        }
+    }
+
+    @ViewBuilder
+    private func split(_ status: Status) -> some View {
+        if #available(macOS 13.0, *), !legacyLayout {
+            NavigationSplitView {
+                Sidebar(status: status)
+                    .navigationSplitViewColumnWidth(min: 210, ideal: 240, max: 320)
+            } detail: {
+                Detail(status: status)
+            }
+        } else {
+            NavigationView {
+                Sidebar(status: status)
+                    .frame(minWidth: 210, idealWidth: 240, maxWidth: 320)
+                Detail(status: status)
+            }
         }
     }
 }
@@ -162,14 +187,32 @@ struct Header: View {
     }
 }
 
+/// Shown wherever remote control of this Mac is set up while macOS still
+/// withholds a permission it needs; the info panel explains the rest.
+struct PermissionNotice: View {
+    @EnvironmentObject private var model: SettingsModel
+    let missing: [Permission]
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+            Text("Remote control needs \(ListFormatter.localizedString(byJoining: missing.map(\.title))) permission on this Mac.")
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 8)
+            Button("Show How…") { model.showingInfo = true }
+        }
+    }
+}
+
 struct ThisDeviceView: View {
     @EnvironmentObject private var model: SettingsModel
     let status: Status
     @State private var confirmingForgetAll = false
 
     var body: some View {
-        Form {
-            Section {
+        Page {
+            PageSection {
                 Header(
                     symbol: status.device.platform.symbol,
                     tint: .accentColor,
@@ -177,28 +220,28 @@ struct ThisDeviceView: View {
                     subtitle: "This \(status.device.platform.displayName) · Continuity \(status.device.version)"
                 )
             }
-            Section {
-                Toggle(isOn: Binding(get: { status.paused }, set: { model.setPaused($0) })) {
-                    Text("Pause syncing")
-                    Text("Stops clipboard sync and new connections until you resume. Devices that are already connected stay connected.")
+            if !status.missingPermissions.isEmpty {
+                PageSection {
+                    PermissionNotice(missing: status.missingPermissions)
                 }
             }
-            Section("Received Files") {
-                LabeledContent("Saved to") {
-                    Text(abbreviatingHome(status.receivedFilesDir))
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
-                Button("Show in Finder") { model.showReceivedFiles() }
+            PageSection {
+                ToggleRow(
+                    title: "Pause syncing",
+                    detail: "Stops clipboard sync and new connections until you resume. Devices that are already connected stay connected.",
+                    isOn: Binding(get: { status.paused }, set: { model.setPaused($0) })
+                )
             }
-            Section {
+            PageSection(title: "Received Files") {
+                PathRow(label: "Saved to", path: status.receivedFilesDir) { model.showReceivedFiles() }
+            }
+            PageSection {
                 Button("Forget All Devices…", role: .destructive) { confirmingForgetAll = true }
                     .disabled(status.devices.isEmpty)
             } footer: {
                 Text("Every device will need to be paired again, on both sides.")
             }
         }
-        .formStyle(.grouped)
         .navigationTitle(status.device.name)
         .confirmationDialog(
             "Forget all \(status.devices.count) paired devices?",
@@ -232,8 +275,8 @@ struct DeviceView: View {
     }
 
     var body: some View {
-        Form {
-            Section {
+        Page {
+            PageSection {
                 Header(
                     symbol: platform.symbol,
                     tint: device.connected ? .green : .secondary,
@@ -258,48 +301,52 @@ struct DeviceView: View {
                 }
             }
             if status.canBeControlled {
-                Section("Remote Control") {
-                    Toggle(isOn: Binding(
-                        get: { device.remoteControlAllowed },
-                        set: { allowed in
-                            if allowed {
-                                confirmingRemoteControl = true
-                            } else {
-                                model.setRemoteControlAllowed(device, false)
-                            }
-                        }
-                    )) {
-                        Text("Control this \(here) without asking")
-                        Text(device.remoteControlAllowed
+                PageSection(title: "Remote Control") {
+                    ToggleRow(
+                        title: "Control this \(here) without asking",
+                        detail: device.remoteControlAllowed
                             ? "\(device.name) can see this screen and use its keyboard and mouse whenever it asks."
-                            : "This \(here) asks you first each time \(device.name) wants to control it.")
+                            : "This \(here) asks you first each time \(device.name) wants to control it.",
+                        isOn: Binding(
+                            get: { device.remoteControlAllowed },
+                            set: { allowed in
+                                if allowed {
+                                    confirmingRemoteControl = true
+                                } else {
+                                    model.setRemoteControlAllowed(device, false)
+                                }
+                            }
+                        )
+                    )
+                    if !status.missingPermissions.isEmpty {
+                        PermissionNotice(missing: status.missingPermissions)
                     }
                 }
             }
             if status.canBeUnlocked {
-                Section("Remote Unlock") {
-                    Toggle(isOn: Binding(
-                        get: { device.unlockAllowed },
-                        set: { allowed in
-                            if allowed {
-                                confirmingUnlock = true
-                            } else {
-                                model.setUnlockAllowed(device, false)
+                PageSection(title: "Remote Unlock") {
+                    ToggleRow(
+                        title: "Unlock this \(here)",
+                        detail: "You're notified every time it's used. Locking never needs permission.",
+                        isOn: Binding(
+                            get: { device.unlockAllowed },
+                            set: { allowed in
+                                if allowed {
+                                    confirmingUnlock = true
+                                } else {
+                                    model.setUnlockAllowed(device, false)
+                                }
                             }
-                        }
-                    )) {
-                        Text("Unlock this \(here)")
-                        Text("You're notified every time it's used. Locking never needs permission.")
-                    }
+                        )
+                    )
                 }
             }
-            Section {
+            PageSection {
                 Button("Forget \(device.name)…", role: .destructive) { confirmingForget = true }
             } footer: {
                 Text("Paired \(Date(timeIntervalSince1970: TimeInterval(device.pairedAtUnix)).formatted(date: .long, time: .omitted))")
             }
         }
-        .formStyle(.grouped)
         .navigationTitle(device.name)
         .confirmationDialog("Let \(device.name) control this \(here) without asking?", isPresented: $confirmingRemoteControl, titleVisibility: .visible) {
             Button("Allow") { model.setRemoteControlAllowed(device, true) }
@@ -325,8 +372,8 @@ struct NearbyView: View {
     @State private var requested = false
 
     var body: some View {
-        Form {
-            Section {
+        Page {
+            PageSection {
                 Header(
                     symbol: device.platform.symbol,
                     tint: .accentColor,
@@ -346,7 +393,6 @@ struct NearbyView: View {
                     : "Pairing shows a code on both devices. Confirm on each only if the codes match.")
             }
         }
-        .formStyle(.grouped)
         .navigationTitle(device.name)
     }
 }
@@ -374,10 +420,4 @@ struct NotRunningView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(40)
     }
-}
-
-/// `/Users/me/Downloads/Continuity` → `~/Downloads/Continuity`.
-func abbreviatingHome(_ path: String) -> String {
-    let home = FileManager.default.homeDirectoryForCurrentUser.path
-    return path.hasPrefix(home) ? "~" + path.dropFirst(home.count) : path
 }

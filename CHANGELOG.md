@@ -6,10 +6,10 @@ All notable user-facing changes to Continuity are documented here.
 
 ### Added
 
-- **A page for every device on Android.** Tap a device to open it: the full
-  media player (usable even when nothing is playing — play resumes whatever
-  was last playing), send files, remote control, lock/unlock, disconnect and
-  forget, all in one place. The device list shows a now-playing line and a
+- **A page for every device on Android.** Tap a device to open it: a
+  compact media player (usable even when nothing is playing — play resumes
+  whatever was last playing), send files, remote control, lock/unlock,
+  disconnect and forget, all in one place, most of it on one screen. The device list shows a now-playing line and a
   quick play/pause (or Reconnect) button per device, and a banner when
   syncing is paused.
 - **Remote lock and unlock (Linux).** Lock or unlock a Linux desktop from
@@ -33,11 +33,21 @@ All notable user-facing changes to Continuity are documented here.
 - **Lock a Mac or a Windows PC from your phone**, from the computer's page,
   just like a Linux one. Unlocking stays Linux-only: macOS and Windows don't
   let apps unlock the screen.
-- **A settings window on macOS.** Tray menu → Settings… opens a proper
-  window with your paired and nearby devices: pair with one, send it files,
-  disconnect or forget it, and choose whether it may control this Mac
-  without asking you each time. It uses Liquid Glass on macOS 26, and needs
-  macOS 13 or newer.
+- **A settings window.** Tray menu → Settings… opens a proper window with
+  your paired and nearby devices: pair with one, send it files, disconnect
+  or forget it, and choose whether it may control this computer without
+  asking you each time (and, on Linux, unlock it). On macOS it's a native
+  app that uses Liquid Glass on macOS 26 and works back to macOS 12; on
+  Linux and Windows it opens in the system's own web view, styled to fit
+  each.
+- **About, activity and permissions in the settings window.** Its ⓘ button
+  shows the version and system, what Continuity has done since it started
+  (connections, clipboard, files, remote control, locks), where received
+  files and the log are, and a few tips. It also explains what remote
+  control needs on that computer: on a Mac, the Screen Recording and
+  Accessibility permissions — whether each is on, a Grant… button for
+  each, and where to find them in System Settings — and the Mac's settings
+  pages warn while one is missing.
 
 ### Fixed
 

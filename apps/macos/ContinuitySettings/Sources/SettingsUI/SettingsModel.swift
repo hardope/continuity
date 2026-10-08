@@ -28,6 +28,9 @@ public final class SettingsModel: ObservableObject {
     @Published public private(set) var connection: Connection = .connecting
     @Published public var selection: SidebarItem? = .thisDevice
     @Published public var problem: Problem?
+    /// The ⓘ panel: about Continuity, what it's done, the permissions remote
+    /// control needs.
+    @Published public var showingInfo = false
 
     private let client: ControlClient?
     private var watcher: LineConnection?
@@ -109,6 +112,23 @@ public final class SettingsModel: ObservableObject {
         // something to show before that.
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         NSWorkspace.shared.open(URL(fileURLWithPath: dir, isDirectory: true))
+    }
+
+    /// Selects the log in Finder — what to attach to a bug report.
+    public func showLogFile() {
+        guard let log = status?.about?.logFile else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: log)])
+    }
+
+    /// Asks continuityd — the process that needs it — for a permission: the
+    /// system prompt the first time, System Settings at the right page after.
+    public func requestPermission(_ permission: Permission) {
+        perform(["op": "request_permission", "permission": permission.rawValue])
+    }
+
+    public func copyToPasteboard(_ text: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
     }
 
     /// Starts Continuity itself, when this window finds it isn't running.

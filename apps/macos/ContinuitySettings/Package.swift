@@ -9,7 +9,9 @@ import PackageDescription
 
 let package = Package(
     name: "ContinuitySettings",
-    platforms: [.macOS(.v13)],
+    // macOS 12 lays the pages out by hand (see Sources/SettingsUI/Layout.swift);
+    // 13 and later get the grouped form, and 26 Liquid Glass.
+    platforms: [.macOS(.v12)],
     targets: [
         // Everything but the entry point, so the preview tool can reuse it.
         .target(name: "SettingsUI"),

@@ -40,7 +40,7 @@ pub const SHARE_TO_FLAG: &str = "--share-to";
 /// `--share-to` target meaning every currently-connected device.
 const ALL_DEVICES: &str = "all";
 
-type ConnectedPeers = Arc<Mutex<HashMap<String, String>>>;
+pub(crate) type ConnectedPeers = Arc<Mutex<HashMap<String, String>>>;
 
 /// Written by the running instance, read by `--share-to`.
 #[derive(Serialize, Deserialize)]
@@ -57,9 +57,9 @@ struct ShareRequest {
 }
 
 #[derive(Serialize, Deserialize)]
-struct ShareResponse {
-    ok: bool,
-    message: String,
+pub(crate) struct ShareResponse {
+    pub(crate) ok: bool,
+    pub(crate) message: String,
 }
 
 /// One right-click entry: what it's labeled, and what `--share-to` gets.
@@ -89,8 +89,9 @@ fn menu_targets(connected: &HashMap<String, String>) -> Vec<MenuTarget> {
 }
 
 /// Queues every file for every device `target` names. Folders are skipped —
-/// the engine only sends regular files.
-fn dispatch(target: &str, paths: &[PathBuf], commands: &UnboundedSender<EngineCommand>, connected: &ConnectedPeers) -> ShareResponse {
+/// the engine only sends regular files. Also what the Linux and Windows
+/// settings window's Send Files… does (see settings_window.rs).
+pub(crate) fn dispatch(target: &str, paths: &[PathBuf], commands: &UnboundedSender<EngineCommand>, connected: &ConnectedPeers) -> ShareResponse {
     let peers: Vec<String> = {
         let connected = connected.lock().unwrap();
         if target == ALL_DEVICES {
@@ -647,7 +648,7 @@ mod tests {
             platform: continuity_proto::Platform::Linux,
             version: "test".into(),
         };
-        ControlState::new(device, dir.path().join("trust.json"), dir.path().join("Received"))
+        ControlState::new(device, dir.path().join("trust.json"), dir.path().join("Received"), None)
     }
 
     /// Sends one request line to the running server and returns its first

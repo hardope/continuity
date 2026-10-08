@@ -8,14 +8,14 @@
 //!
 //! State comes from two places. What the tray learns from engine events —
 //! who's connected and on what platform, who's nearby, whether syncing is
-//! paused — is mirrored here by `observe`. Who's paired, and each paired
-//! device's permissions, come from the trust store file the engine keeps,
-//! re-read for every snapshot (it's saved atomically, so a read never sees
-//! half a write) and polled for changes.
+//! paused, what's been sent and received — is mirrored here by `observe`.
+//! Who's paired, and each paired device's permissions, come from the trust
+//! store file the engine keeps, re-read for every snapshot (it's saved
+//! atomically, so a read never sees half a write) and polled for changes.
 
 use continuity_crypto::TrustStore;
 use continuity_daemon::{EngineCommand, SyncEvent};
-use continuity_proto::Platform;
+use continuity_proto::{Platform, ScreenLockOutcome, PROTOCOL_VERSION};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -23,8 +23,10 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc::UnboundedSender;
 
-/// How often the trust store file is checked for changes the tray never
-/// hears about as an event (a remembered remote-control answer, say).
+/// How often the trust store file (and, on macOS, the privacy permissions)
+/// are checked for changes the tray never hears about as an event — a
+/// remembered remote-control answer, say, or Accessibility being granted in
+/// System Settings.
 const TRUST_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// A `watch` connection re-sends the current status at least this often
@@ -55,6 +57,16 @@ pub enum ControlOp {
     SendFiles { device: String, paths: Vec<PathBuf> },
     /// Forgets every paired device.
     Reset,
+    /// macOS only: asks for a privacy permission — the system prompt the
+    /// first time, System Settings at the right page after that.
+    RequestPermission { permission: Permission },
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum Permission {
+    ScreenRecording,
+    Accessibility,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -71,6 +83,53 @@ pub struct Status {
     pub can_be_controlled: bool,
     /// Whether this computer can be unlocked remotely (Linux only).
     pub can_be_unlocked: bool,
+    pub about: About,
+    pub activity: Activity,
+    /// The macOS privacy permissions Continuity needs, as this process has
+    /// them. `None` on Linux and Windows, which have nothing to grant ahead
+    /// of time.
+    pub permissions: Option<Permissions>,
+}
+
+/// The rest of what the window's info panel shows.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct About {
+    pub protocol_version: u32,
+    /// "macOS 12.7.6", "Ubuntu 26.04 LTS", "Windows 11 24H2".
+    pub os: String,
+    /// When this run of Continuity started.
+    pub started_at_unix: u64,
+    pub log_file: Option<String>,
+    /// Where the identity, paired devices and log live.
+    pub config_dir: Option<String>,
+}
+
+/// What's happened since Continuity started.
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
+pub struct Activity {
+    /// Connections made to paired devices, reconnections included.
+    pub connections: u64,
+    /// Copies on this computer that went to at least one device.
+    pub clipboard_sent: u64,
+    pub clipboard_received: u64,
+    pub files_sent: u64,
+    pub bytes_sent: u64,
+    pub files_received: u64,
+    pub bytes_received: u64,
+    /// Either way: a device controlling this computer, or this one another.
+    pub remote_control_sessions: u64,
+    /// Times a device locked or unlocked this computer.
+    pub screen_locks: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq)]
+pub struct Permissions {
+    /// What a controlling device sees. Without it, macOS shows it only the
+    /// wallpaper.
+    pub screen_recording: bool,
+    /// Keyboard and mouse input from a controlling device, and a phone's
+    /// play/pause/next.
+    pub accessibility: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -110,6 +169,10 @@ struct Live {
     /// Every platform seen since start, so an offline paired device keeps
     /// its icon.
     platforms: HashMap<String, Platform>,
+    activity: Activity,
+    /// Sizes of the transfers under way, by transfer id — the events that
+    /// finish one don't repeat it.
+    transfer_sizes: HashMap<String, u64>,
     /// Bumped on every change a watcher should hear about.
     generation: u64,
 }
@@ -118,13 +181,21 @@ pub struct ControlState {
     device: ThisDevice,
     trust_path: PathBuf,
     received_files_dir: PathBuf,
+    about: About,
     live: Mutex<Live>,
     changed: Condvar,
 }
 
 impl ControlState {
-    pub fn new(device: ThisDevice, trust_path: PathBuf, received_files_dir: PathBuf) -> Arc<Self> {
-        Arc::new(Self { device, trust_path, received_files_dir, live: Mutex::new(Live::default()), changed: Condvar::new() })
+    pub fn new(device: ThisDevice, trust_path: PathBuf, received_files_dir: PathBuf, log_file: Option<PathBuf>) -> Arc<Self> {
+        let about = About {
+            protocol_version: PROTOCOL_VERSION,
+            os: os_description(),
+            started_at_unix: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or_default(),
+            log_file: log_file.map(|path| path.display().to_string()),
+            config_dir: trust_path.parent().filter(|dir| !dir.as_os_str().is_empty()).map(|dir| dir.display().to_string()),
+        };
+        Arc::new(Self { device, trust_path, received_files_dir, about, live: Mutex::new(Live::default()), changed: Condvar::new() })
     }
 
     /// Mirrors the parts of an engine event a settings window shows.
@@ -135,7 +206,30 @@ impl ControlState {
                 live.connected.insert(peer.id.clone(), peer.name.clone());
                 live.platforms.insert(peer.id.clone(), peer.platform);
                 live.nearby.remove(&peer.id);
+                live.activity.connections += 1;
             }
+            SyncEvent::ClipboardBroadcast { peer_count } if *peer_count > 0 => live.activity.clipboard_sent += 1,
+            SyncEvent::ClipboardReceived { .. } => live.activity.clipboard_received += 1,
+            SyncEvent::FileSending { transfer_id, size_bytes, .. } | SyncEvent::FileReceiving { transfer_id, size_bytes, .. } => {
+                live.transfer_sizes.insert(transfer_id.clone(), *size_bytes);
+                return;
+            }
+            SyncEvent::FileSent { transfer_id, .. } => {
+                let size = live.transfer_sizes.remove(transfer_id).unwrap_or_default();
+                live.activity.files_sent += 1;
+                live.activity.bytes_sent += size;
+            }
+            SyncEvent::FileReceived { transfer_id, .. } => {
+                let size = live.transfer_sizes.remove(transfer_id).unwrap_or_default();
+                live.activity.files_received += 1;
+                live.activity.bytes_received += size;
+            }
+            SyncEvent::FileTransferFailed { transfer_id, .. } => {
+                live.transfer_sizes.remove(transfer_id);
+                return;
+            }
+            SyncEvent::RemoteControlSessionStarted { .. } => live.activity.remote_control_sessions += 1,
+            SyncEvent::ScreenLockRequested { outcome: ScreenLockOutcome::Done, .. } => live.activity.screen_locks += 1,
             SyncEvent::Disconnected { peer_id, .. } | SyncEvent::WasRevoked { peer_id, .. } => {
                 live.connected.remove(peer_id);
             }
@@ -162,16 +256,17 @@ impl ControlState {
         self.changed.notify_all();
     }
 
-    /// Watches the trust store file for changes the tray never sees as an
-    /// event, for as long as the process runs.
+    /// Watches the trust store file — and the privacy permissions — for
+    /// changes the tray never sees as an event, for as long as the process
+    /// runs.
     pub fn spawn_trust_watcher(self: &Arc<Self>) {
         let state = Arc::clone(self);
         std::thread::spawn(move || {
             let modified = |path: &PathBuf| std::fs::metadata(path).and_then(|m| m.modified()).ok();
-            let mut last: Option<SystemTime> = modified(&state.trust_path);
+            let mut last = (modified(&state.trust_path), permissions());
             loop {
                 std::thread::sleep(TRUST_POLL_INTERVAL);
-                let now = modified(&state.trust_path);
+                let now = (modified(&state.trust_path), permissions());
                 if now != last {
                     last = now;
                     state.bump();
@@ -218,6 +313,9 @@ impl ControlState {
             received_files_dir: self.received_files_dir.display().to_string(),
             can_be_controlled: cfg!(all(feature = "remote-control", any(target_os = "macos", target_os = "windows", target_os = "linux"))),
             can_be_unlocked: cfg!(target_os = "linux"),
+            about: self.about.clone(),
+            activity: live.activity.clone(),
+            permissions: permissions(),
         }
     }
 
@@ -265,12 +363,93 @@ impl ControlState {
                 EngineCommand::RevokeDevice { peer_crypto_id: device }
             }
             ControlOp::Reset => EngineCommand::Reset,
+            ControlOp::RequestPermission { permission } => {
+                #[cfg(target_os = "macos")]
+                {
+                    crate::permissions_mac::request(permission);
+                    self.bump();
+                    return Ok(());
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let _ = permission;
+                    return Err("There's nothing to grant on this computer.".to_string());
+                }
+            }
             ControlOp::Status | ControlOp::Watch | ControlOp::SendFiles { .. } => {
                 return Err("not a change".to_string());
             }
         };
         commands.send(command).map_err(|_| "Continuity is shutting down.".to_string())
     }
+}
+
+fn permissions() -> Option<Permissions> {
+    #[cfg(target_os = "macos")]
+    return Some(crate::permissions_mac::current());
+    #[cfg(not(target_os = "macos"))]
+    None
+}
+
+/// The operating system and its version, the way people know it.
+#[cfg(target_os = "macos")]
+fn os_description() -> String {
+    let mut version = [0u8; 32];
+    let mut len = version.len();
+    let found =
+        unsafe { libc::sysctlbyname(c"kern.osproductversion".as_ptr(), version.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0) } == 0;
+    let version = found.then(|| String::from_utf8_lossy(&version[..len]).trim_end_matches('\0').to_string());
+    match version {
+        Some(version) if !version.is_empty() => format!("macOS {version}"),
+        _ => "macOS".to_string(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn os_description() -> String {
+    std::fs::read_to_string("/etc/os-release")
+        .ok()
+        .and_then(|release| release.lines().find_map(|line| Some(line.strip_prefix("PRETTY_NAME=")?.trim_matches('"').to_string())))
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "Linux".to_string())
+}
+
+/// Windows 11 still calls itself "Windows 10" in `ProductName`; its build
+/// number is what tells them apart.
+#[cfg(target_os = "windows")]
+fn os_description() -> String {
+    use windows::core::{w, PCWSTR};
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
+    let read = |value: PCWSTR| -> Option<String> {
+        let mut text = [0u16; 64];
+        let mut bytes = std::mem::size_of_val(&text) as u32;
+        unsafe {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                w!(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion"),
+                value,
+                RRF_RT_REG_SZ,
+                None,
+                Some(text.as_mut_ptr().cast()),
+                Some(&mut bytes),
+            )
+        }
+        .ok()
+        .ok()?;
+        let len = text.iter().position(|&c| c == 0).unwrap_or(text.len());
+        Some(String::from_utf16_lossy(&text[..len]))
+    };
+    let build: u32 = read(w!("CurrentBuild")).and_then(|build| build.parse().ok()).unwrap_or_default();
+    let name = if build >= 22000 { "Windows 11" } else { "Windows 10" };
+    match read(w!("DisplayVersion")) {
+        Some(version) if !version.is_empty() => format!("{name} {version}"),
+        _ => name.to_string(),
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+fn os_description() -> String {
+    std::env::consts::OS.to_string()
 }
 
 /// This desktop's own platform, as peers see it.
@@ -292,7 +471,7 @@ mod tests {
 
     fn state(dir: &tempfile::TempDir) -> Arc<ControlState> {
         let device = ThisDevice { name: "Desk".into(), id: "me".into(), platform: Platform::Linux, version: "test".into() };
-        ControlState::new(device, dir.path().join("trust.json"), dir.path().join("Received"))
+        ControlState::new(device, dir.path().join("trust.json"), dir.path().join("Received"), Some(dir.path().join("continuityd.log")))
     }
 
     fn pair(dir: &tempfile::TempDir, id: &str, name: &str) -> TrustStore {
@@ -339,8 +518,84 @@ mod tests {
             received_files_dir: "/Users/me/Downloads/Continuity".into(),
             can_be_controlled: true,
             can_be_unlocked: false,
+            about: About {
+                protocol_version: 2,
+                os: "macOS 12.7.6".into(),
+                started_at_unix: 1_759_900_000,
+                log_file: Some("/Users/me/Library/Application Support/app.continuity.continuity/continuityd.log".into()),
+                config_dir: Some("/Users/me/Library/Application Support/app.continuity.continuity".into()),
+            },
+            activity: Activity {
+                connections: 3,
+                clipboard_sent: 12,
+                clipboard_received: 5,
+                files_sent: 2,
+                bytes_sent: 3_500_000,
+                files_received: 1,
+                bytes_received: 820_000,
+                remote_control_sessions: 1,
+                screen_locks: 0,
+            },
+            permissions: Some(Permissions { screen_recording: false, accessibility: true }),
         };
         assert_eq!(serde_json::json!({ "ok": true, "status": status }), fixture);
+    }
+
+    #[test]
+    fn activity_counts_what_happened_since_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(&dir);
+        let phone = info("phone", "pixel", Platform::Android);
+        state.observe(&SyncEvent::Connected { peer: phone.clone() });
+        state.observe(&SyncEvent::ClipboardBroadcast { peer_count: 1 });
+        state.observe(&SyncEvent::ClipboardBroadcast { peer_count: 0 });
+        state.observe(&SyncEvent::ClipboardReceived { from_name: "pixel".into() });
+        state.observe(&SyncEvent::FileSending { transfer_id: "t1".into(), to_name: "pixel".into(), file_name: "a".into(), size_bytes: 1000 });
+        state.observe(&SyncEvent::FileSent { transfer_id: "t1".into(), file_name: "a".into(), to_name: "pixel".into() });
+        state.observe(&SyncEvent::FileReceiving { transfer_id: "t2".into(), from_name: "pixel".into(), file_name: "b".into(), size_bytes: 50 });
+        state.observe(&SyncEvent::FileTransferFailed { transfer_id: "t2".into(), reason: "cancelled".into() });
+        state.observe(&SyncEvent::FileReceiving { transfer_id: "t3".into(), from_name: "pixel".into(), file_name: "c".into(), size_bytes: 70 });
+        state.observe(&SyncEvent::FileReceived { transfer_id: "t3".into(), file_name: "c".into(), path: "/tmp/c".into() });
+        state.observe(&SyncEvent::ScreenLockRequested {
+            peer_id: "phone".into(),
+            peer_name: "pixel".into(),
+            action: continuity_proto::ScreenLockAction::Lock,
+            outcome: ScreenLockOutcome::Done,
+        });
+        state.observe(&SyncEvent::ScreenLockRequested {
+            peer_id: "phone".into(),
+            peer_name: "pixel".into(),
+            action: continuity_proto::ScreenLockAction::Unlock,
+            outcome: ScreenLockOutcome::NotAllowed,
+        });
+
+        let activity = state.status().activity;
+        assert_eq!(
+            activity,
+            Activity {
+                connections: 1,
+                clipboard_sent: 1,
+                clipboard_received: 1,
+                files_sent: 1,
+                bytes_sent: 1000,
+                files_received: 1,
+                bytes_received: 70,
+                remote_control_sessions: 0,
+                screen_locks: 1,
+            },
+            "a copy nobody received, a failed transfer and a refused unlock don't count"
+        );
+    }
+
+    #[test]
+    fn about_names_this_os_and_where_things_are() {
+        let dir = tempfile::tempdir().unwrap();
+        let about = state(&dir).status().about;
+        assert_eq!(about.protocol_version, PROTOCOL_VERSION);
+        assert!(!about.os.is_empty());
+        assert_eq!(about.config_dir.as_deref(), Some(dir.path().display().to_string().as_str()));
+        assert!(about.log_file.unwrap().ends_with("continuityd.log"));
+        assert!(about.started_at_unix > 1_700_000_000);
     }
 
     #[test]
@@ -348,6 +603,10 @@ mod tests {
         let op: ControlOp = serde_json::from_str(r#"{"op":"set_remote_control_allowed","device":"abc","allowed":false}"#).unwrap();
         assert_eq!(op, ControlOp::SetRemoteControlAllowed { device: "abc".into(), allowed: false });
         assert_eq!(serde_json::from_str::<ControlOp>(r#"{"op":"watch"}"#).unwrap(), ControlOp::Watch);
+        assert_eq!(
+            serde_json::from_str::<ControlOp>(r#"{"op":"request_permission","permission":"screen_recording"}"#).unwrap(),
+            ControlOp::RequestPermission { permission: Permission::ScreenRecording }
+        );
         assert!(serde_json::from_str::<ControlOp>(r#"{"op":"format_disk"}"#).is_err());
     }
 

@@ -20,6 +20,8 @@ mod media_mac;
 mod media_windows;
 #[cfg(target_os = "linux")]
 mod media_linux;
+#[cfg(target_os = "macos")]
+mod permissions_mac;
 #[cfg(all(target_os = "macos", feature = "remote-control"))]
 mod remote_control_mac;
 #[cfg(all(target_os = "windows", feature = "remote-control"))]
@@ -38,6 +40,8 @@ mod screen_lock_linux;
 mod screen_lock_mac;
 #[cfg(target_os = "windows")]
 mod screen_lock_windows;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+mod settings_window;
 mod control;
 mod share;
 
@@ -53,6 +57,15 @@ use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tray_icon::menu::CheckMenuItem;
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, TrayIconBuilder, TrayIconEvent};
+
+/// What wakes the tray's event loop, besides the OS itself.
+enum AppEvent {
+    Engine(SyncEvent),
+    /// From the settings window's page (Linux and Windows — macOS has a
+    /// settings app of its own).
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    Settings(settings_window::Message),
+}
 
 /// Who a click on a dynamically-built "Send File" submenu entry should
 /// send to — rebuilt every time the connected-device set changes, so the
@@ -98,8 +111,10 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    let event_loop = EventLoopBuilder::<SyncEvent>::with_user_event().build();
+    let event_loop = EventLoopBuilder::<AppEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    let settings_route = settings_window::Route { proxy: event_loop.create_proxy(), wrap: AppEvent::Settings };
 
     let device_name = continuity_daemon::default_device_name();
 
@@ -113,11 +128,10 @@ fn main() -> anyhow::Result<()> {
     let pause_item = MenuItem::new("Pause Syncing", true, None);
     let reset_item = MenuItem::new("Reset...", true, None);
     let about_item = MenuItem::new(format!("About Continuity ({})", env!("CARGO_PKG_VERSION")), true, None);
-    // The settings window — so far a native SwiftUI app on macOS only
-    // (apps/macos/ContinuitySettings); Linux and Windows keep the menu.
-    #[cfg(target_os = "macos")]
+    // The settings window: on macOS a SwiftUI app of its own
+    // (apps/macos/ContinuitySettings), on Linux and Windows a webview window
+    // of this process (settings_window.rs).
     let settings_item = MenuItem::new("Settings…", true, None);
-    #[cfg(target_os = "macos")]
     let settings_item_id = settings_item.id().clone();
     let quit_item = MenuItem::new("Quit", true, None);
     let refresh_item_id = refresh_item.id().clone();
@@ -206,7 +220,6 @@ fn main() -> anyhow::Result<()> {
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&pause_item)?;
     menu.append(&reset_item)?;
-    #[cfg(target_os = "macos")]
     menu.append(&settings_item)?;
     menu.append(&about_item)?;
     menu.append(&PredefinedMenuItem::separator())?;
@@ -230,6 +243,7 @@ fn main() -> anyhow::Result<()> {
         },
         TrustStore::default_path(&profile()).unwrap_or_default(),
         received_files_dir(&profile()),
+        log_file_path(&profile()),
     );
     control.spawn_trust_watcher();
     // Entries left behind by a previous run that didn't quit cleanly would
@@ -247,6 +261,9 @@ fn main() -> anyhow::Result<()> {
     // tao event loop's own thread, same as everything else in `main()`.
     #[cfg(feature = "remote-control")]
     let viewer: std::rc::Rc<std::cell::RefCell<Option<remote_viewer::RemoteViewer>>> = std::rc::Rc::new(std::cell::RefCell::new(None));
+    // At most one; "Settings…" brings an open one to the front.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    let mut settings: Option<settings_window::SettingsWindow> = None;
 
     event_loop.run(move |event, target, control_flow| {
         // Keep the tray icon (and its menu) alive for the app's lifetime —
@@ -288,6 +305,13 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        if let tao::event::Event::WindowEvent { window_id, event: tao::event::WindowEvent::CloseRequested, .. } = &event {
+            if settings.as_ref().is_some_and(|window| window.window_id() == *window_id) {
+                settings = None;
+            }
+        }
+
         // Finder's "Open With > Continuity" (see share.rs and the
         // CFBundleDocumentTypes entry in installers/macos/Info.plist).
         #[cfg(target_os = "macos")]
@@ -296,50 +320,74 @@ fn main() -> anyhow::Result<()> {
             share::handle_opened_files(paths, connected_peers.clone(), commands.clone());
         }
 
-        if let tao::event::Event::UserEvent(sync_event) = event {
-            control.observe(&sync_event);
-            #[cfg(feature = "remote-control")]
-            handle_remote_control_sync_event(&sync_event, target, &viewer, &connected_peer_platforms, &commands);
-            #[cfg(target_os = "linux")]
-            let unlock_menu_update = unlock_menu_update(&sync_event);
-            handle_sync_event(
-                sync_event,
-                &send_submenu,
-                &forget_submenu,
-                &nearby_submenu,
-                &pause_item,
-                &connected_peers,
-                &send_target_map,
-                &forget_target_map,
-                &nearby_peers,
-                &nearby_target_map,
-                &is_paused,
-                &commands,
-                &tray_icon,
-            );
-            #[cfg(feature = "remote-control")]
-            rebuild_remote_control_menu(
-                &remote_control_submenu,
-                &connected_peers.lock().unwrap(),
-                &connected_peer_platforms.lock().unwrap(),
-                &remote_control_target_map,
-            );
-            // After `handle_sync_event`, so `connected_peers` already
-            // reflects this event when the menu is rebuilt from it. Only for
-            // events that change what it shows — rebuilding on every event
-            // (now-playing updates arrive every 1.5s) would keep yanking
-            // the menu out from under someone who has it open.
-            #[cfg(target_os = "linux")]
-            if let Some(update) = unlock_menu_update {
-                update.apply(&mut unlock_permissions.lock().unwrap());
-                rebuild_unlock_menu(&unlock_submenu, &connected_peers.lock().unwrap(), &unlock_permissions.lock().unwrap(), &unlock_target_map);
+        match event {
+            tao::event::Event::UserEvent(AppEvent::Engine(sync_event)) => {
+                control.observe(&sync_event);
+                #[cfg(feature = "remote-control")]
+                handle_remote_control_sync_event(&sync_event, target, &viewer, &connected_peer_platforms, &commands);
+                #[cfg(target_os = "linux")]
+                let unlock_menu_update = unlock_menu_update(&sync_event);
+                handle_sync_event(
+                    sync_event,
+                    &send_submenu,
+                    &forget_submenu,
+                    &nearby_submenu,
+                    &pause_item,
+                    &connected_peers,
+                    &send_target_map,
+                    &forget_target_map,
+                    &nearby_peers,
+                    &nearby_target_map,
+                    &is_paused,
+                    &commands,
+                    &tray_icon,
+                );
+                #[cfg(feature = "remote-control")]
+                rebuild_remote_control_menu(
+                    &remote_control_submenu,
+                    &connected_peers.lock().unwrap(),
+                    &connected_peer_platforms.lock().unwrap(),
+                    &remote_control_target_map,
+                );
+                // After `handle_sync_event`, so `connected_peers` already
+                // reflects this event when the menu is rebuilt from it. Only for
+                // events that change what it shows — rebuilding on every event
+                // (now-playing updates arrive every 1.5s) would keep yanking
+                // the menu out from under someone who has it open.
+                #[cfg(target_os = "linux")]
+                if let Some(update) = unlock_menu_update {
+                    update.apply(&mut unlock_permissions.lock().unwrap());
+                    rebuild_unlock_menu(&unlock_submenu, &connected_peers.lock().unwrap(), &unlock_permissions.lock().unwrap(), &unlock_target_map);
+                }
             }
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            tao::event::Event::UserEvent(AppEvent::Settings(message)) => {
+                if let Some(window) = settings.as_mut() {
+                    let context = settings_window::Context { control: &control, commands: &commands, connected: &connected_peers };
+                    window.handle(message, &context, &settings_route);
+                }
+            }
+            _ => {}
         }
 
         if let Ok(event) = MenuEvent::receiver().try_recv() {
-            #[cfg(target_os = "macos")]
             if event.id == settings_item_id {
+                #[cfg(target_os = "macos")]
                 open_settings(&profile());
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
+                match &settings {
+                    Some(window) => window.focus(),
+                    None => {
+                        let icon = tao::window::Icon::from_rgba(render_icon_rgba(64), 64, 64).ok();
+                        match settings_window::SettingsWindow::open(target, settings_route.clone(), icon) {
+                            Ok(window) => settings = Some(window),
+                            Err(e) => {
+                                tracing::warn!("couldn't open the settings window: {e}");
+                                notify(&settings_window_failed(&e));
+                            }
+                        }
+                    }
+                }
             }
             if event.id == pause_item_id {
                 let currently_paused = *is_paused.lock().unwrap();
@@ -974,7 +1022,7 @@ fn rebuild_remote_control_menu(
 #[cfg(feature = "remote-control")]
 fn handle_remote_control_sync_event(
     event: &SyncEvent,
-    target: &tao::event_loop::EventLoopWindowTarget<SyncEvent>,
+    target: &tao::event_loop::EventLoopWindowTarget<AppEvent>,
     viewer: &std::rc::Rc<std::cell::RefCell<Option<remote_viewer::RemoteViewer>>>,
     connected_peer_platforms: &Arc<Mutex<HashMap<String, Platform>>>,
     commands: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
@@ -1114,10 +1162,6 @@ fn confirm(
     }
 }
 
-/// Shows a native notification when possible. Unbundled dev binaries often
-/// can't (macOS requires a proper .app bundle with an Info.plist for
-/// reliable notification delivery), so this always logs too — the tray
-/// menu/dialogs are the guaranteed-visible UI; notifications are a bonus.
 /// Opens the settings window: the SwiftUI app bundled inside Continuity.app
 /// (`Contents/Helpers/Continuity Settings.app`, built from
 /// apps/macos/ContinuitySettings), which talks to this process over the
@@ -1139,11 +1183,27 @@ fn open_settings(profile: &str) {
     std::thread::spawn(move || match open.status() {
         Ok(status) if status.success() => {}
         // LaunchServices refuses an app whose minimum macOS is newer.
-        Ok(_) => notify("Couldn't open Continuity's settings window — it needs macOS 13 or newer."),
+        Ok(_) => notify("Couldn't open Continuity's settings window — it needs macOS 12 or newer."),
         Err(e) => tracing::warn!("couldn't run open for the settings window: {e}"),
     });
 }
 
+/// What to tell someone whose settings window didn't open.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn settings_window_failed(error: &anyhow::Error) -> String {
+    if cfg!(target_os = "windows") {
+        format!(
+            "Couldn't open the settings window ({error}). It needs the Microsoft Edge WebView2 Runtime, which comes with Windows 11 — on Windows 10, install it from https://go.microsoft.com/fwlink/p/?LinkId=2124703"
+        )
+    } else {
+        format!("Couldn't open the settings window ({error}). It needs WebKitGTK (libwebkit2gtk-4.1).")
+    }
+}
+
+/// Shows a native notification when possible. Unbundled dev binaries often
+/// can't (macOS requires a proper .app bundle with an Info.plist for
+/// reliable notification delivery), so this always logs too — the tray
+/// menu/dialogs are the guaranteed-visible UI; notifications are a bonus.
 fn notify(body: &str) {
     tracing::info!("{body}");
     if let Err(e) = notify_rust::Notification::new()
@@ -1230,7 +1290,7 @@ fn reveal_in_folder(path: &str) -> std::io::Result<()> {
 fn start_engine_thread(
     profile: String,
     device_name: String,
-    proxy: tao::event_loop::EventLoopProxy<SyncEvent>,
+    proxy: tao::event_loop::EventLoopProxy<AppEvent>,
 ) -> anyhow::Result<(tokio::sync::mpsc::UnboundedSender<EngineCommand>, String)> {
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
 
@@ -1308,7 +1368,7 @@ fn start_engine_thread(
                 Ok((mut engine, device_id)) => {
                     let _ = ready_tx.send(Ok((engine.command_sender(), device_id)));
                     while let Some(event) = engine.events.recv().await {
-                        if proxy.send_event(event).is_err() {
+                        if proxy.send_event(AppEvent::Engine(event)).is_err() {
                             break;
                         }
                     }

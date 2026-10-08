@@ -24,6 +24,24 @@ final class ControlClientTests: XCTestCase {
         XCTAssertEqual(status.receivedFilesDir, "/Users/me/Downloads/Continuity")
         XCTAssertTrue(status.canBeControlled)
         XCTAssertFalse(status.canBeUnlocked)
+        XCTAssertEqual(status.about?.os, "macOS 12.7.6")
+        XCTAssertEqual(status.about?.protocolVersion, 2)
+        XCTAssertEqual(status.activity?.bytesSent, 3_500_000)
+        XCTAssertEqual(status.activity?.remoteControlSessions, 1)
+        XCTAssertEqual(status.permissions, Permissions(screenRecording: false, accessibility: true))
+        XCTAssertEqual(status.missingPermissions, [.screenRecording])
+    }
+
+    func testAContinuitydWithoutTheInfoFieldsStillDecodes() throws {
+        var json = try XCTUnwrap(JSONSerialization.jsonObject(with: fixture()) as? [String: Any])
+        var status = try XCTUnwrap(json["status"] as? [String: Any])
+        for key in ["about", "activity", "permissions"] {
+            status.removeValue(forKey: key)
+        }
+        json["status"] = status
+        let decoded = try XCTUnwrap(Envelope.decode(JSONSerialization.data(withJSONObject: json)).status)
+        XCTAssertNil(decoded.about)
+        XCTAssertEqual(decoded.missingPermissions, [], "nothing to warn about without knowing")
     }
 
     func testAnUnknownPlatformDoesNotBreakDecoding() throws {

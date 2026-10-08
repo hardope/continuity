@@ -19,10 +19,11 @@
     <string>AppIcon</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
-    <!-- NavigationSplitView and the grouped form style need macOS 13;
-         Continuity itself still runs on 11 and 12, without this window. -->
+    <!-- macOS 12 gets a hand-laid version of the pages (see
+         Sources/SettingsUI/Layout.swift). Continuity itself still runs on
+         macOS 11, without this window. -->
     <key>LSMinimumSystemVersion</key>
-    <string>13.0</string>
+    <string>12.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
 </dict>

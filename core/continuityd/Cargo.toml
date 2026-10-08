@@ -155,7 +155,18 @@ windows = { version = "0.58", features = [
     "Win32_UI_Shell",
     # LockWorkStation — screen_lock_windows.rs, remote lock.
     "Win32_System_Shutdown",
+    # The Windows version for the settings window's info panel (control.rs).
+    "Win32_System_Registry",
 ] }
+
+# The settings window on Linux and Windows (settings_window.rs): one HTML
+# page in the system's own webview — WebKitGTK 4.1 on Linux, already
+# installed with GNOME and KDE and pulled in by the .deb's auto-computed
+# Depends:; WebView2 on Windows, which ships with Windows 11 — inside a tao
+# window of this process. macOS has a SwiftUI app instead
+# (apps/macos/ContinuitySettings).
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+wry = "0.57"
 
 # MPRIS media control/reads over D-Bus — see src/media_linux.rs. Also
 # carries rfd's Linux dialog backend (see the non-Linux `rfd` entry above

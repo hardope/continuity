@@ -16,7 +16,10 @@ sudo apt-get update
 #   pkg-config, and run bindgen, which needs libclang, over their headers).
 # - libgtk-3-dev / libdbus-1-dev / pkg-config: the tray and dialogs (GTK),
 #   the keyring's Secret Service backend (D-Bus).
+# - libwebkit2gtk-4.1-dev: the settings window (settings_window.rs, through
+#   wry), which is a WebKitGTK webview. Brings libsoup-3.0-dev with it.
 sudo apt-get install -y \
   libgtk-3-dev libayatana-appindicator3-dev \
   libdbus-1-dev libxdo-dev pkg-config dpkg-dev \
-  libpipewire-0.3-dev libspa-0.2-dev libclang-dev
+  libpipewire-0.3-dev libspa-0.2-dev libclang-dev \
+  libwebkit2gtk-4.1-dev
