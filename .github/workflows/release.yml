@@ -6,14 +6,21 @@
 # Each platform's code only compiles (let alone runs) on that platform —
 # media, remote control, screen lock and sharing all go through OS APIs —
 # and the dev machine can't stand in for Windows, Linux or Android. So each
-# OS gets its own test job and its own build job, all in parallel. Separate
-# jobs rather than one matrix job: almost every step is platform-specific
-# (packaging especially), and a matrix spent most of its lines on
-# `if: matrix.name == ...`. (There's no iOS job — see below.)
+# platform is a lane of its own: its tests, then its build, all lanes in
+# parallel, meeting at the release:
 #
-# A release needs every build *and* every unit-test job to pass. The engine's
-# integration tests (two real engines over loopback mDNS) run on every
-# release too, but don't hold it back yet — see that job.
+#   Test (Linux)   -> Build (Linux)   \
+#   Test (macOS)   -> Build (macOS)    \
+#   Test (Windows) -> Build (Windows)  /  -> Release
+#   Test (Engine)  -> Build (Android) /
+#
+# The phone app is the shared engine behind an FFI layer, so the engine's
+# integration tests gate the Android build. Every job's dependencies differ,
+# which is also what keeps GitHub's graph drawing each one as its own block
+# (it stacks jobs with identical dependencies into one). Separate jobs rather
+# than matrices: almost every step is platform-specific (packaging
+# especially), and a matrix spent most of its lines on `if: matrix.name ==`.
+# (There's no iOS job — see below.)
 #
 # Release assets are one properly-packaged file per platform, not a raw
 # binary — continuityctl (the dev/test CLI) is deliberately not shipped:
@@ -97,13 +104,12 @@ jobs:
       - name: Unit tests
         run: cargo test --workspace --lib --bins
 
-  integration-linux:
-    name: Engine integration tests (Linux)
+  test-engine:
+    name: Test (Engine)
     # Pairs of real engines finding each other over loopback mDNS:
     # connection races, revocation, remote-control sessions and their end
-    # reasons, remote lock (core/continuity-daemon/tests/). They depend on
-    # the runner's networking more than unit tests do, so the release
-    # doesn't wait on this job until it has a record of passing here.
+    # reasons, remote lock (core/continuity-daemon/tests/). Gates the
+    # Android build, which is this engine behind an FFI layer.
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
@@ -127,8 +133,43 @@ jobs:
 
   # ─── Builds ─────────────────────────────────────────────────────────────
 
-  macos:
+  build-linux:
+    name: Build (Linux)
+    needs: test-linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: bash .github/scripts/install-linux-deps.sh
+
+      - name: Build
+        # continuityctl isn't released, but cheap — this keeps it building.
+        run: cargo build --release -p continuityd -p continuityctl
+
+      - name: Build .deb package
+        # The raw binary dynamically links libxdo, libayatana-appindicator3,
+        # etc. — fine here where they're installed, but a user running the
+        # raw binary hits "error while loading shared libraries" unless they
+        # happen to have the same packages. A .deb's Depends: field fixes
+        # this by making apt/dpkg pull them in automatically. cargo-deb's
+        # default ("$auto", see core/continuityd/Cargo.toml) computes that
+        # list itself by running ldd against the built binary — no
+        # hand-maintained package list to drift.
+        run: |
+          cargo install cargo-deb --locked
+          cargo deb -p continuityd --no-build
+          cp target/debian/*.deb continuity-linux.deb
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: continuity-linux.deb
+          path: continuity-linux.deb
+
+  build-macos:
     name: Build (macOS)
+    needs: test-macos
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -224,8 +265,9 @@ jobs:
           name: continuity-macos.dmg
           path: continuity-macos.dmg
 
-  windows:
+  build-windows:
     name: Build (Windows)
+    needs: test-windows
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -257,41 +299,9 @@ jobs:
           name: continuity-windows-setup.exe
           path: continuity-windows-setup.exe
 
-  linux:
-    name: Build (Linux)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Install system dependencies
-        run: bash .github/scripts/install-linux-deps.sh
-
-      - name: Build
-        # continuityctl isn't released, but cheap — this keeps it building.
-        run: cargo build --release -p continuityd -p continuityctl
-
-      - name: Build .deb package
-        # The raw binary dynamically links libxdo, libayatana-appindicator3,
-        # etc. — fine here where they're installed, but a user running the
-        # raw binary hits "error while loading shared libraries" unless they
-        # happen to have the same packages. A .deb's Depends: field fixes
-        # this by making apt/dpkg pull them in automatically. cargo-deb's
-        # default ("$auto", see core/continuityd/Cargo.toml) computes that
-        # list itself by running ldd against the built binary — no
-        # hand-maintained package list to drift.
-        run: |
-          cargo install cargo-deb --locked
-          cargo deb -p continuityd --no-build
-          cp target/debian/*.deb continuity-linux.deb
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: continuity-linux.deb
-          path: continuity-linux.deb
-
-  android:
+  build-android:
     name: Build (Android)
+    needs: test-engine
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -351,8 +361,11 @@ jobs:
   # ─── Release ────────────────────────────────────────────────────────────
 
   release:
+    name: Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [test-linux, test-macos, test-windows, macos, windows, linux, android]
+    # Each build already waits for its own lane's tests, so this waits for
+    # everything.
+    needs: [build-linux, build-macos, build-windows, build-android]
     runs-on: ubuntu-latest
     # The default GITHUB_TOKEN is read-only unless a job explicitly asks
     # for more — softprops/action-gh-release needs contents: write to

@@ -65,7 +65,7 @@ cargo build --release -p continuityd -p continuityctl
 
 **iOS**: see [`docs/ios-build.md`](docs/ios-build.md) — needs full Xcode, and doesn't build cleanly yet regardless (see Status above).
 
-CI (`.github/workflows/release.yml`) tests and builds every desktop platform and Android on its own native GitHub-hosted runner for each tagged release: unit tests on macOS, Windows and Linux (plus the macOS settings window's Swift tests), and the engine's two-device integration tests on Linux. A release is only published once the builds and unit tests pass.
+CI (`.github/workflows/release.yml`) tests and builds every platform on its own native GitHub-hosted runner for each tagged release, one lane per platform — its tests, then its build: unit tests on Linux, macOS (plus the settings window's Swift tests) and Windows, and the engine's two-device integration tests ahead of the Android build. A release is only published once every lane passes.
 
 **Tests** locally: `cargo test --workspace --lib --bins` (unit tests), `cargo test -p continuity-daemon --tests` (integration tests: two real engines over loopback mDNS), and `swift test` in `apps/macos/ContinuitySettings`.
 
