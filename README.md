@@ -69,12 +69,12 @@ Continuity fills the gap Apple's own Continuity leaves at the edge of its ecosys
 
 Get the file for each device from the [latest release](https://github.com/hardope/continuity/releases/latest):
 
-| | File | Install | Needs |
-|---|---|---|---|
-| **macOS** | `continuity-macos.dmg` | Open it and drag Continuity to Applications. | macOS 11 or later, Apple silicon or Intel. The settings window needs macOS 12. |
-| **Windows** | `continuity-windows-setup.exe` | Run it: Start menu entry, starts at sign-in, uninstalls cleanly. | Windows 10 or 11, 64-bit. On Windows 10 the settings window needs the [WebView2 Runtime](https://go.microsoft.com/fwlink/p/?LinkId=2124703) (Windows 11 has it). |
-| **Linux** | `continuity-linux.deb` | `sudo apt install ./continuity-linux.deb` (it installs the libraries it needs), then run `continuityd`. | Ubuntu 24.04 or Debian 13 or later, x86-64. |
-| **Android** | `continuity-android.apk` | Open it on the phone, allowing installs from unknown sources. | Android 8 or later. |
+| | Install | Needs |
+|---|---|---|
+| **macOS** | Open `continuity-macos.dmg` and drag Continuity to Applications. | macOS 11 or later, Apple silicon or Intel. The settings window needs macOS 12. |
+| **Windows** | Run `continuity-windows-setup.exe`: it adds a Start menu entry, starts Continuity at sign-in, and uninstalls cleanly. | Windows 10 or 11, 64-bit. On Windows 10 the settings window needs the [WebView2 Runtime](https://go.microsoft.com/fwlink/p/?LinkId=2124703) (Windows 11 has it). |
+| **Linux** | `sudo apt install ./continuity-linux.deb`, which also installs the libraries it needs, then run `continuityd`. | Ubuntu 24.04 or Debian 13 or later, x86-64. |
+| **Android** | Open `continuity-android.apk` on the phone, allowing installs from unknown sources. | Android 8 or later. |
 
 Nothing is signed with a paid certificate yet, so expect one warning the first time. On **macOS** the app is ad-hoc signed but not notarized: right-click Continuity → **Open** (on macOS 15 and later: System Settings → Privacy & Security → **Open Anyway**). On **Windows**, SmartScreen: **More info** → **Run anyway**.
 
@@ -96,26 +96,24 @@ Continuity lives in the menu bar or system tray. Windows 11 often hides a new tr
 
 ## Status
 
-0.1.6 is the current release. Every platform is built and tested in CI on its own runner; this is what has also been confirmed on real devices so far:
+0.1.6 is the current release, built and tested in CI on every platform's own runner. Tried on real devices so far:
 
-| | Confirmed on real devices | Built and tested, not yet confirmed |
-|---|---|---|
-| Pairing and connections | macOS, Windows, Linux, Android | |
-| Clipboard | macOS, Windows, Android | Linux |
-| Files | macOS, Windows | Linux, Android |
-| Media control from a phone | controlling a Mac | controlling Windows and Linux |
-| Remote control from a phone | Windows; a Mac's screen | clicks and typing on a Mac; Linux |
-| Remote lock and unlock | | lock on macOS and Windows; lock and unlock on Linux |
-| Settings window | macOS (Apple silicon), Windows, Linux (Ubuntu) | macOS 12; the Linux file picker fixed in 0.1.6 |
-| Android device page | fits one screen on a Galaxy A05 | |
-| Sharing (share sheet, file managers) | | Android, Windows, Linux, macOS |
-| iOS app | | doesn't build yet — see [`docs/ios-build.md`](docs/ios-build.md) |
+| | Tested on |
+|---|---|
+| Pairing and connections | macOS, Windows, Linux, Android |
+| Clipboard | macOS, Windows, Android |
+| Files | macOS, Windows |
+| Media control from a phone | a Mac |
+| Remote control from a phone | Windows, and a Mac's screen |
+| Settings window | macOS, Windows, Linux (Ubuntu) |
+| Android device page | a Galaxy A05 |
 
 - The Mac app is universal: it runs on Apple silicon (an M1) and on Intel (a Mac on macOS 12).
 - Android only sends its clipboard while the app is open: Android 10 and later don't let apps read the clipboard in the background.
 - Controlling one computer from another is built but hidden from the tray menu for now: the viewer froze the controlling app in testing.
+- The iOS app doesn't build yet — see [`docs/ios-build.md`](docs/ios-build.md).
 
-The full write-up — protocol, security model, every bug worth remembering and what's still unverified — is in [`docs/protocol.md`](docs/protocol.md).
+The full write-up — protocol, security model and every bug worth remembering — is in [`docs/protocol.md`](docs/protocol.md).
 
 ## How it works
 
