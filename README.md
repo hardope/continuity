@@ -11,7 +11,7 @@
 
 <p align="center">
   <a href="https://github.com/hardope/continuity/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/hardope/continuity"></a>
-  <a href="https://github.com/hardope/continuity/actions/workflows/release.yml"><img alt="Release build" src="https://github.com/hardope/continuity/actions/workflows/release.yml/badge.svg"></a>
+  <a href="https://github.com/hardope/continuity/actions/workflows/release.yml?query=event%3Apush"><img alt="Release build" src="https://github.com/hardope/continuity/actions/workflows/release.yml/badge.svg?event=push"></a>
   <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-blue"></a>
 </p>
 
