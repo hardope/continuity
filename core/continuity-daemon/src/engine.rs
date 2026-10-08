@@ -81,6 +81,11 @@ const MAX_AUTO_ACCEPT_BYTES: u64 = 500 * 1024 * 1024;
 /// calling the end unexpected — see `handle_screen_stream_connection`.
 const SCREEN_STREAM_END_GRACE: Duration = Duration::from_millis(750);
 
+/// How long accepting a remote-control request waits for this side's own
+/// mDNS to resolve the requester's address, when it hasn't yet — see
+/// `accept_remote_control_session`.
+const DIAL_BACK_ADDRESS_WAIT: Duration = Duration::from_secs(5);
+
 pub struct EngineConfig {
     pub identity: Identity,
     pub device_name: String,
@@ -117,7 +122,19 @@ impl EngineHandle {
         self.commands_tx.clone()
     }
 
+    /// Stops the engine. Dropping the handle does the same — see `Drop`.
     pub fn shutdown(self) {
+        drop(self);
+    }
+}
+
+/// Dropping the handle shuts the engine down, so a handle that goes away
+/// without `shutdown()` — a test that panics, say — doesn't leave the
+/// clipboard and now-playing watchers running forever. They run on tokio's
+/// blocking pool, which a runtime waits for when it's dropped, so before
+/// this a failed engine test hung instead of failing.
+impl Drop for EngineHandle {
+    fn drop(&mut self) {
         // Must happen before the aborts below: `task.abort()` can't
         // preempt the clipboard/now-playing watchers, since they run on
         // tokio's blocking thread pool and are already executing their
@@ -489,24 +506,33 @@ fn accept_remote_control_session(state: &Arc<SharedState>, peer_crypto_id: Strin
         return;
     }
 
-    // Accepting starts capture *before* telling the peer it succeeded —
-    // if it fails (no Screen Recording permission, say), the peer hears
-    // about a session that never really started instead of one that
-    // silently never sends any frames.
-    let Some(frames) = state.remote_control.start_capture() else {
-        let _ = tx.send(Message::RemoteControlResponse { session_id: session_id.clone(), accepted: false });
-        state.emit(SyncEvent::RemoteControlSessionEnded {
-            peer_id: peer_crypto_id.clone(),
-            peer_name: state.trust_store.lock().unwrap().get(&peer_crypto_id).map(|d| d.name.clone()).unwrap_or_else(|| peer_crypto_id.clone()),
-            session_id,
-            reason: Some("couldn't start screen capture".to_string()),
-        });
+    // The screen stream is dialed back to the address this side's own
+    // mDNS resolved for the requester (see the decline below for why it
+    // can't come from the mesh connection). A request can arrive the
+    // instant a connection opens, a moment before that resolution has
+    // happened — so when the address isn't known yet, wait a few seconds
+    // for it rather than declining a request that would have worked. The
+    // address is checked before capture starts, so a session that can't
+    // be dialed back never pops up the desktop's own screen-sharing prompt.
+    if let Some(addr) = state.known_addresses.lock().unwrap().get(&peer_crypto_id).copied() {
+        start_controlled_session(state, peer_crypto_id, session_id, tx, addr);
         return;
-    };
-
-    let Some(addr) = state.known_addresses.lock().unwrap().get(&peer_crypto_id).copied() else {
+    }
+    let state = state.clone();
+    tokio::spawn(async move {
+        let deadline = tokio::time::Instant::now() + DIAL_BACK_ADDRESS_WAIT;
+        while tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let addr = state.known_addresses.lock().unwrap().get(&peer_crypto_id).copied();
+            if let Some(addr) = addr {
+                // Still connected? The request is moot otherwise.
+                if state.peer_senders.lock().unwrap().contains_key(&peer_crypto_id) {
+                    start_controlled_session(&state, peer_crypto_id, session_id, tx, addr);
+                }
+                return;
+            }
+        }
         let _ = tx.send(Message::RemoteControlResponse { session_id: session_id.clone(), accepted: false });
-        state.remote_control.stop_capture();
         // Same silent-failure shape as the `already_controlled` decline
         // above, and just as real: `known_addresses` only ever gets
         // populated by mDNS discovery, not by the mesh connection this
@@ -525,6 +551,47 @@ fn accept_remote_control_session(state: &Arc<SharedState>, peer_crypto_id: Strin
             session_id,
             reason: Some("couldn't find a network address to reach this device back on".to_string()),
         });
+    });
+}
+
+/// The rest of accepting, once the address to dial the screen stream back
+/// to is known: starts capture, records the session, tells the peer, and
+/// spawns the screen-stream push. Re-checks the one-controlled-session
+/// rule, since `accept_remote_control_session` may have waited for the
+/// address in the meantime.
+fn start_controlled_session(
+    state: &Arc<SharedState>,
+    peer_crypto_id: String,
+    session_id: String,
+    tx: mpsc::UnboundedSender<Message>,
+    addr: SocketAddr,
+) {
+    let peer_name = || state.trust_store.lock().unwrap().get(&peer_crypto_id).map(|d| d.name.clone()).unwrap_or_else(|| peer_crypto_id.clone());
+    let already_controlled =
+        state.remote_control_sessions.lock().unwrap().values().any(|s| s.role == RemoteControlRole::Controlled);
+    if already_controlled {
+        let _ = tx.send(Message::RemoteControlResponse { session_id: session_id.clone(), accepted: false });
+        state.emit(SyncEvent::RemoteControlSessionEnded {
+            peer_id: peer_crypto_id.clone(),
+            peer_name: peer_name(),
+            session_id,
+            reason: Some("already controlling another device".to_string()),
+        });
+        return;
+    }
+
+    // Accepting starts capture *before* telling the peer it succeeded —
+    // if it fails (no Screen Recording permission, say), the peer hears
+    // about a session that never really started instead of one that
+    // silently never sends any frames.
+    let Some(frames) = state.remote_control.start_capture() else {
+        let _ = tx.send(Message::RemoteControlResponse { session_id: session_id.clone(), accepted: false });
+        state.emit(SyncEvent::RemoteControlSessionEnded {
+            peer_id: peer_crypto_id.clone(),
+            peer_name: peer_name(),
+            session_id,
+            reason: Some("couldn't start screen capture".to_string()),
+        });
         return;
     };
 
@@ -535,7 +602,7 @@ fn accept_remote_control_session(state: &Arc<SharedState>, peer_crypto_id: Strin
     let _ = tx.send(Message::RemoteControlResponse { session_id: session_id.clone(), accepted: true });
     state.emit(SyncEvent::RemoteControlSessionStarted {
         peer_id: peer_crypto_id.clone(),
-        peer_name: state.trust_store.lock().unwrap().get(&peer_crypto_id).map(|d| d.name.clone()).unwrap_or_else(|| peer_crypto_id.clone()),
+        peer_name: peer_name(),
         session_id: session_id.clone(),
         role: RemoteControlRole::Controlled,
     });

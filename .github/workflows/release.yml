@@ -126,10 +126,11 @@ jobs:
         run: cargo test -p continuity-daemon --tests --no-run
 
       - name: Run
-        # A test that fails by panicking can hang instead of exiting (the
-        # engine's blocking watchers only stop on `shutdown()`), so this is
-        # capped, and --nocapture shows the failure even then.
-        run: timeout 900 cargo test -p continuity-daemon --tests -- --nocapture
+        # A failing test used to hang here instead of exiting (the engine's
+        # blocking watchers only stopped on an explicit `shutdown()`);
+        # dropping an engine now shuts it down, and this cap stays as a
+        # backstop. --nocapture shows a failure's message as it happens.
+        run: timeout 600 cargo test -p continuity-daemon --tests -- --nocapture
 
   # ─── Builds ─────────────────────────────────────────────────────────────
 

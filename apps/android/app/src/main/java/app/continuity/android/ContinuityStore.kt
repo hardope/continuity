@@ -44,7 +44,7 @@ data class DeviceStatus(
     val supportsRemoteControl: Boolean get() = isDesktop
 
     /** Every desktop can be locked (core/continuityd/src/screen_lock_*.rs;
-     * macOS and Windows since 0.1.6-beta.7 — an older one answers
+     * macOS and Windows since 0.1.6-beta.8 — an older one answers
      * "unsupported", which the result notice explains). Only a peer
      * announcing protocol v2+ understands the message at all — a v1 peer
      * drops the whole connection on a message it doesn't know (see
@@ -317,7 +317,7 @@ object ContinuityStore {
             is FfiScreenLockOutcome.Done -> if (action == FfiScreenLockAction.LOCK) "Locked '$peerName'" else "Unlocked '$peerName'"
             is FfiScreenLockOutcome.NotAllowed ->
                 "'$peerName' hasn't allowed this phone to unlock it. On that computer, open the Continuity menu and turn on Allow Remote Unlock for this phone."
-            // Every desktop can lock as of 0.1.6-beta.7, so a lock coming
+            // Every desktop can lock as of 0.1.6-beta.8, so a lock coming
             // back unsupported means that computer's Continuity is older.
             is FfiScreenLockOutcome.Unsupported ->
                 if (action == FfiScreenLockAction.LOCK) "'$peerName' can't be locked remotely yet. Update Continuity on it."

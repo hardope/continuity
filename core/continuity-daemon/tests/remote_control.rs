@@ -305,21 +305,25 @@ async fn a_capture_that_never_starts_tells_the_controlling_side_why() {
         .expect("start engine A");
     let mut b = make_engine("DeclineB", b_identity, &a_id, "DeclineA", Arc::new(b_host.clone())).await.expect("start engine B");
 
+    // Both sides, not just A: B is the one that has to act on the request.
+    let (mut a_connected, mut b_connected) = (false, false);
     let connect_deadline = tokio::time::sleep(Duration::from_secs(15));
     tokio::pin!(connect_deadline);
-    loop {
+    while !(a_connected && b_connected) {
         tokio::select! {
-            _ = &mut connect_deadline => panic!("A and B never connected"),
-            Some(ev) = a.events.recv() => if matches!(ev, SyncEvent::Connected { .. }) { break },
-            Some(_) = b.events.recv() => {}
+            _ = &mut connect_deadline => panic!("A and B never connected (A: {a_connected}, B: {b_connected})"),
+            Some(ev) = a.events.recv() => if matches!(ev, SyncEvent::Connected { .. }) { a_connected = true },
+            Some(ev) = b.events.recv() => if matches!(ev, SyncEvent::Connected { .. }) { b_connected = true },
         }
     }
 
     a.command_sender().send(EngineCommand::RequestRemoteControl { peer_crypto_id: b_id.clone() }).expect("send request");
 
     let mut a_started = false;
+    let mut a_declined = false;
     let mut a_ended_reason: Option<Option<String>> = None;
     let mut a_saw_frame = false;
+    let mut b_saw_request = false;
     let mut b_ended_reason: Option<Option<String>> = None;
     let deadline = tokio::time::sleep(Duration::from_secs(20));
     tokio::pin!(deadline);
@@ -331,12 +335,14 @@ async fn a_capture_that_never_starts_tells_the_controlling_side_why() {
                     assert_eq!(role, RemoteControlRole::Controlling);
                     a_started = true;
                 }
+                SyncEvent::RemoteControlDeclined { .. } => a_declined = true,
                 SyncEvent::RemoteControlSessionEnded { reason, .. } => a_ended_reason = Some(reason),
                 SyncEvent::ScreenFrameReceived { .. } => a_saw_frame = true,
                 _ => {}
             },
             Some(ev) = b.events.recv() => match ev {
                 SyncEvent::RemoteControlRequested { .. } => {
+                    b_saw_request = true;
                     b.command_sender()
                         .send(EngineCommand::RespondToRemoteControlRequest { peer_crypto_id: a_id.clone(), accept: true })
                         .expect("send accept");
@@ -346,7 +352,10 @@ async fn a_capture_that_never_starts_tells_the_controlling_side_why() {
             }
         }
     }
-    assert!(a_started, "A's side of the session should start once B accepts");
+    assert!(
+        a_started,
+        "A's side of the session should start once B accepts (B saw the request: {b_saw_request}, A was declined: {a_declined}, B's end reason: {b_ended_reason:?})"
+    );
     assert_eq!(a_ended_reason, Some(Some(DECLINED.to_string())), "A should learn why the session ended");
     assert_eq!(b_ended_reason, Some(Some(DECLINED.to_string())), "B's own shell should say why too");
     assert!(!a_saw_frame, "no frame was ever captured");
