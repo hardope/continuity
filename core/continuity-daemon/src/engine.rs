@@ -2325,10 +2325,25 @@ async fn handle_file_complete(
     transfer_id: &str,
     expected_hash: String,
 ) {
-    let Some(rf) = receiving.remove(transfer_id) else {
+    let Some(mut rf) = receiving.remove(transfer_id) else {
         return;
     };
     state.end_file_transfer(&rf.peer_crypto_id);
+    // tokio's `File` finishes a write on its blocking pool after
+    // `write_all` returns; only `flush` waits for that. **Real bug fixed
+    // here**: without it, `FileReceived` could go out while the last chunk
+    // was still being written, so whatever acted on it straight away — the
+    // notification's Open, Android moving the file into a chosen folder,
+    // a test reading it back — could get the file short.
+    if let Err(e) = rf.file.flush().await {
+        state.emit(SyncEvent::FileTransferFailed {
+            transfer_id: transfer_id.to_string(),
+            reason: format!("couldn't write the file: {e}"),
+        });
+        drop(rf.file);
+        let _ = tokio::fs::remove_file(&rf.path).await;
+        return;
+    }
     let actual_hash = rf.hasher.finalize_hex();
     if actual_hash != expected_hash || rf.written != rf.expected_size {
         state.emit(SyncEvent::FileTransferFailed {
