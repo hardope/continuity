@@ -47,14 +47,30 @@ pub struct WindowsRemoteControlHost {
     /// Ctrl or Shift left down would go on modifying the local person's
     /// own typing until they happened to press and release it themselves.
     held_keys: Mutex<Vec<u16>>,
+    /// Mouse buttons it holds down here, for the same reason. **Real bug
+    /// fixed here**: only keys were tracked, so a session that ended
+    /// mid-drag (the connection dropping, say) left the button logically
+    /// down, and the local person's own mouse went on dragging or
+    /// selecting until they clicked.
+    held_buttons: Mutex<Vec<ProtoMouseButton>>,
 }
 
 impl WindowsRemoteControlHost {
     pub fn new() -> Self {
-        Self { capturing: Arc::new(AtomicBool::new(false)), held_keys: Mutex::new(Vec::new()) }
+        Self {
+            capturing: Arc::new(AtomicBool::new(false)),
+            held_keys: Mutex::new(Vec::new()),
+            held_buttons: Mutex::new(Vec::new()),
+        }
     }
 
-    fn release_held_keys(&self) {
+    /// Lets go of everything the controlling device left held down —
+    /// buttons first, so a Shift-drag ends as one.
+    fn release_held_input(&self) {
+        let buttons = std::mem::take(&mut *self.held_buttons.lock().unwrap());
+        for button in buttons.into_iter().rev() {
+            inject_event(InputEventKind::MouseButton { button, down: false });
+        }
         let held = std::mem::take(&mut *self.held_keys.lock().unwrap());
         for vk in held.into_iter().rev() {
             send_key_event(vk, true);
@@ -84,6 +100,13 @@ impl RemoteControlHost for WindowsRemoteControlHost {
                 }
             }
             InputEventKind::KeyUp { code } => self.held_keys.lock().unwrap().retain(|&vk| vk != code as u16),
+            InputEventKind::MouseButton { button, down: true } => {
+                let mut held = self.held_buttons.lock().unwrap();
+                if !held.contains(&button) {
+                    held.push(button);
+                }
+            }
+            InputEventKind::MouseButton { button, down: false } => self.held_buttons.lock().unwrap().retain(|&held| held != button),
             _ => {}
         }
         inject_event(event);
@@ -92,7 +115,7 @@ impl RemoteControlHost for WindowsRemoteControlHost {
     fn start_capture(&self) -> Option<mpsc::Receiver<Vec<u8>>> {
         // Nothing should be held at the start of a session; if a previous
         // one somehow left something, let go of it first.
-        self.release_held_keys();
+        self.release_held_input();
         // Unlike macOS's Screen Recording permission, plain GDI
         // `BitBlt`-based capture needs no special OS permission grant at
         // all on Windows — this probe is purely "does capture actually
@@ -125,7 +148,7 @@ impl RemoteControlHost for WindowsRemoteControlHost {
 
     fn stop_capture(&self) {
         self.capturing.store(false, Ordering::Relaxed);
-        self.release_held_keys();
+        self.release_held_input();
     }
 }
 
