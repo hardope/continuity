@@ -21,8 +21,14 @@ installers in `installers/`).
   -2 was already fixed by "Control one computer at a time from the window").
 - android-1 to -4 are fixed too (not compiled: no Android SDK on the
   owner's Mac — CI's Android build is the first compile).
-- Next up: "What is left" items 1 (macOS SwiftUI + contracts review), 2
-  and 3.
+- "What is left" items 1 (review: no new defects; iOS's EngineController
+  switch is long stale, pre-existing) and 2 (README, CHANGELOG
+  [Unreleased], protocol doc) are done.
+- Item 3: verified on the owner's Mac (every target builds, all unit tests,
+  lite build, all engine integration tests except the macOS-only one,
+  swift test). Not compiled anywhere yet: Windows, Linux and Android code —
+  needs a CI run, which needs the owner's OK. Then the branch move (also
+  the owner's OK).
 - Windows- and Linux-only code changed since the last CI run (e.g.
   remote_control_windows.rs) can't be compiled on the owner's Mac; ask the
   owner before dispatching a CI run.
