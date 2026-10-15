@@ -37,7 +37,8 @@
 //! spare.
 
 use super::{
-    handle_connection, unique_destination_path, SharedState, FILE_ACCEPT_TIMEOUT, PROGRESS_EVENT_BYTES,
+    handle_connection, spawn_screen_stream_connection, unique_destination_path, SharedState, FILE_ACCEPT_TIMEOUT,
+    PROGRESS_EVENT_BYTES,
 };
 use crate::events::{FileTransferDirection, SyncEvent};
 use continuity_crypto::IncrementalHash;
@@ -655,9 +656,18 @@ pub(super) fn may_dial_data_connection(state: &SharedState, peer_id: &str) -> bo
 
 /// An inbound connection from a peer that may be dialing a data connection
 /// (see `may_dial_data_connection`): reads its first message and sends it
-/// where it belongs — a `FileStreamHandshake` to the transfer it names,
+/// where it belongs — a `FileStreamHandshake` to the transfer it names, a
+/// `ScreenStreamHandshake` this side is waiting for to the screen stream,
 /// anything else (a mesh `DeviceAnnounce`) on to `handle_connection` with
 /// that message already read.
+///
+/// **Real bug fixed here**: the screen stream used to be recognized by
+/// identity alone before this ran, so a data connection from the same peer
+/// arriving first (a file it was sending this device as a remote-control
+/// session started, or a resume retry) took the screen stream's place and
+/// failed, and the real screen stream then came here, was taken for a mesh
+/// reconnect, and was dropped as "already connected" — a session that
+/// started but never showed a frame.
 pub(super) async fn route_inbound(mut conn: Connection, state: Arc<SharedState>, peer_id: String, addr: SocketAddr) {
     let first = match tokio::time::timeout(FIRST_MESSAGE_TIMEOUT, read_message(&mut conn)).await {
         Ok(Ok(message)) => message,
@@ -670,6 +680,10 @@ pub(super) async fn route_inbound(mut conn: Connection, state: Arc<SharedState>,
             return;
         }
     };
+    if matches!(first, Message::ScreenStreamHandshake { .. }) && state.pending_screen_stream_peers.lock().unwrap().remove(&peer_id) {
+        spawn_screen_stream_connection(&state, conn, peer_id, addr, Some(first));
+        return;
+    }
     let Message::FileStreamHandshake { transfer_id, offset } = first else {
         state.test_hooks.mesh_connections_read_first.fetch_add(1, Ordering::Relaxed);
         let id_for_registry = peer_id.clone();

@@ -534,8 +534,31 @@ fn end_remote_control_session(state: &Arc<SharedState>, peer_crypto_id: &str, re
 /// (see `pending_screen_stream_peers`) — a second identity round-trip
 /// would confirm nothing a redundant read wouldn't already need to pay
 /// for.
-async fn handle_screen_stream_connection(mut conn: Connection, state: Arc<SharedState>, peer_crypto_id: String) -> anyhow::Result<()> {
-    let Message::ScreenStreamHandshake { session_id } = read_message(&mut conn).await? else {
+/// Runs `handle_screen_stream_connection` in its own task, registered so
+/// ending the session can abort it. `first` is its handshake, if
+/// `transfer::route_inbound` already read it.
+fn spawn_screen_stream_connection(state: &Arc<SharedState>, conn: Connection, peer_crypto_id: String, addr: SocketAddr, first: Option<Message>) {
+    let conn_state = state.clone();
+    let id_for_registry = peer_crypto_id.clone();
+    let join = tokio::spawn(async move {
+        if let Err(e) = handle_screen_stream_connection(conn, conn_state, peer_crypto_id, first).await {
+            tracing::debug!("screen-stream connection from {addr} ended: {e}");
+        }
+    });
+    state.remote_control_stream_handles.lock().unwrap().insert(id_for_registry, join.abort_handle());
+}
+
+async fn handle_screen_stream_connection(
+    mut conn: Connection,
+    state: Arc<SharedState>,
+    peer_crypto_id: String,
+    first: Option<Message>,
+) -> anyhow::Result<()> {
+    let first = match first {
+        Some(message) => message,
+        None => read_message(&mut conn).await?,
+    };
+    let Message::ScreenStreamHandshake { session_id } = first else {
         anyhow::bail!("expected ScreenStreamHandshake as the first message on a screen-stream connection");
     };
 
@@ -945,19 +968,14 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                         // comment), so there's nothing to read-and-decide
                         // here, no added latency on the far more common
                         // plain-reconnect case.
-                        if state.pending_screen_stream_peers.lock().unwrap().remove(&peer_crypto_id) {
-                            let conn_state = state.clone();
-                            let id_for_registry = peer_crypto_id.clone();
-                            let join = tokio::spawn(async move {
-                                if let Err(e) = handle_screen_stream_connection(conn, conn_state, peer_crypto_id).await {
-                                    tracing::debug!("screen-stream connection from {addr} ended: {e}");
-                                }
-                            });
-                            state
-                                .remote_control_stream_handles
-                                .lock()
-                                .unwrap()
-                                .insert(id_for_registry, join.abort_handle());
+                        //
+                        // Unless that peer may also be dialing a file data
+                        // connection (below): the two could arrive in
+                        // either order, so then the screen stream is told
+                        // apart by its first message like everything else.
+                        let may_dial_data = transfer::may_dial_data_connection(&state, &peer_crypto_id);
+                        if !may_dial_data && state.pending_screen_stream_peers.lock().unwrap().remove(&peer_crypto_id) {
+                            spawn_screen_stream_connection(&state, conn, peer_crypto_id, addr, None);
                             continue;
                         }
                         // A v3 file data connection can't be told apart by
@@ -971,7 +989,7 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                         // first message (`transfer::route_inbound`); every
                         // other inbound connection still goes straight to
                         // `handle_connection`, unread.
-                        if transfer::may_dial_data_connection(&state, &peer_crypto_id) {
+                        if may_dial_data {
                             let conn_state = state.clone();
                             tokio::spawn(async move {
                                 transfer::route_inbound(conn, conn_state, peer_crypto_id, addr).await;

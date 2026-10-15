@@ -413,3 +413,94 @@ async fn a_host_that_reports_unavailable_auto_declines_without_bothering_the_use
     a.shutdown();
     b.shutdown();
 }
+
+/// A controlled device that's also sending this one a file can dial that
+/// file's data connection before its screen stream (a resume retry, or a
+/// transfer starting as the session does). Both still go where they
+/// belong: the screen stream isn't taken by whichever connection from that
+/// device happens to arrive first. Driven by hand as the controlled side,
+/// so the order is exactly that.
+#[tokio::test]
+async fn a_screen_stream_arriving_after_a_data_connection_still_delivers_frames() {
+    use continuity_proto::{DeviceInfo, Message, Platform};
+
+    let b_identity = Identity::generate();
+    let b_id = b_identity.device_id();
+    let a_identity = Identity::generate();
+    let mut a = make_engine("StreamOrderA", a_identity, &b_id, "HandB", Arc::new(continuity_daemon::NoopRemoteControlHost))
+        .await
+        .expect("start engine A");
+    let port = loop {
+        match tokio::time::timeout(Duration::from_secs(5), a.events.recv()).await {
+            Ok(Some(SyncEvent::Listening { port })) => break port,
+            Ok(Some(_)) => continue,
+            other => panic!("no Listening event: {other:?}"),
+        }
+    };
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let tls = continuity_crypto::generate_self_signed(&b_identity).unwrap();
+    let mut mesh = continuity_net::connect(addr, &tls).await.unwrap();
+    let b_device = DeviceInfo { id: b_id.clone(), name: "HandB".into(), platform: Platform::Linux, protocol_version: 3 };
+    continuity_net::announce_and_identify(&mut mesh, &b_device).await.unwrap();
+
+    // Next message on the mesh connection other than background chatter.
+    async fn next(mesh: &mut continuity_net::Connection) -> Message {
+        loop {
+            match tokio::time::timeout(Duration::from_secs(10), continuity_net::read_message(mesh)).await {
+                Ok(Ok(Message::Ping | Message::NowPlayingUpdate { .. } | Message::ClipboardUpdate { .. })) => continue,
+                Ok(Ok(message)) => return message,
+                other => panic!("nothing more from A: {other:?}"),
+            }
+        }
+    }
+
+    // B starts sending A a file over a data connection.
+    let offer = Message::FileOffer {
+        transfer_id: "00000000000000f1".into(),
+        origin_device: b_id.clone(),
+        file_name: "while controlled.bin".into(),
+        size_bytes: 4 * 1024 * 1024,
+        mime: None,
+        data_channel: true,
+        resume: false,
+    };
+    continuity_net::write_message(&mut mesh, &offer).await.unwrap();
+    assert!(matches!(next(&mut mesh).await, Message::FileAccept { accepted: true, data_channel: true, .. }));
+
+    // A asks to control B, and B accepts.
+    a.send_command(EngineCommand::RequestRemoteControl { peer_crypto_id: b_id.clone() });
+    let Message::RemoteControlRequest { session_id } = next(&mut mesh).await else { panic!("expected RemoteControlRequest") };
+    continuity_net::write_message(&mut mesh, &Message::RemoteControlResponse { session_id: session_id.clone(), accepted: true })
+        .await
+        .unwrap();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(10), a.events.recv()).await {
+            Ok(Some(SyncEvent::RemoteControlSessionStarted { role: RemoteControlRole::Controlling, .. })) => break,
+            Ok(Some(_)) => continue,
+            other => panic!("A never started controlling: {other:?}"),
+        }
+    }
+
+    // The file's data connection first, then the screen stream.
+    let mut data = continuity_net::connect(addr, &tls).await.unwrap();
+    let handshake = Message::FileStreamHandshake { transfer_id: "00000000000000f1".into(), offset: 0 };
+    continuity_net::write_message(&mut data, &handshake).await.unwrap();
+    let mut screen = continuity_net::connect(addr, &tls).await.unwrap();
+    continuity_net::write_message(&mut screen, &Message::ScreenStreamHandshake { session_id }).await.unwrap();
+    for seq in 0..3u8 {
+        continuity_net::write_frame(&mut screen, &[seq; 16]).await.unwrap();
+    }
+
+    let frame = loop {
+        match tokio::time::timeout(Duration::from_secs(10), a.events.recv()).await {
+            Ok(Some(SyncEvent::ScreenFrameReceived { peer_id, frame, .. })) if peer_id == b_id => break frame,
+            Ok(Some(SyncEvent::RemoteControlSessionEnded { reason, .. })) => panic!("the session ended instead: {reason:?}"),
+            Ok(Some(_)) => continue,
+            other => panic!("A never received a screen frame: {other:?}"),
+        }
+    };
+    assert_eq!(frame, vec![0u8; 16]);
+
+    drop((mesh, data, screen));
+    a.shutdown();
+}
