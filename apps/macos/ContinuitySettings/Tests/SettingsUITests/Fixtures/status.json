@@ -28,6 +28,7 @@
     "can_be_controlled": true,
     "can_be_unlocked": false,
     "can_control_others": true,
+    "controlling_device": null,
     "transfers": [
       {
         "id": "t4",

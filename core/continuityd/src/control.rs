@@ -18,7 +18,7 @@
 //! the trust store (see `AppSettings`), written only from here.
 
 use continuity_crypto::TrustStore;
-use continuity_daemon::{EngineCommand, SyncEvent};
+use continuity_daemon::{EngineCommand, RemoteControlRole, SyncEvent};
 use continuity_proto::{Platform, ScreenLockOutcome, PROTOCOL_VERSION};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -131,6 +131,10 @@ pub struct Status {
     /// Whether this computer can take control of another one — it has the
     /// remote-control viewer (off in a "lite" build).
     pub can_control_others: bool,
+    /// The computer this one is controlling right now, if any. Only one at
+    /// a time: there's one viewer window, and the windows don't offer
+    /// Control while this is set.
+    pub controlling_device: Option<String>,
     /// Every transfer under way and the most recently finished ones, newest
     /// first.
     pub transfers: Vec<Transfer>,
@@ -333,6 +337,10 @@ struct Live {
     /// Ids of the finished transfers in `transfers`, in the order they
     /// finished.
     finished: VecDeque<String>,
+    /// The computers this one is controlling — peer id to session id. One,
+    /// except for the moment between a second session starting and the
+    /// tray ending the first (see `handle_remote_control_sync_event`).
+    controlling: HashMap<String, String>,
     received_files_dir: PathBuf,
     /// Bumped on every change a watcher should hear about straight away.
     generation: u64,
@@ -516,7 +524,18 @@ impl ControlState {
                     live.finish_transfer(transfer_id, fail);
                 }
             }
-            SyncEvent::RemoteControlSessionStarted { .. } => live.activity.remote_control_sessions += 1,
+            SyncEvent::RemoteControlSessionStarted { peer_id, session_id, role, .. } => {
+                live.activity.remote_control_sessions += 1;
+                if *role == RemoteControlRole::Controlling {
+                    live.controlling.insert(peer_id.clone(), session_id.clone());
+                }
+            }
+            SyncEvent::RemoteControlSessionEnded { peer_id, session_id, .. } => {
+                if live.controlling.get(peer_id) != Some(session_id) {
+                    return;
+                }
+                live.controlling.remove(peer_id);
+            }
             SyncEvent::ScreenLockRequested { outcome: ScreenLockOutcome::Done, .. } => live.activity.screen_locks += 1,
             SyncEvent::Disconnected { peer_id, .. } | SyncEvent::WasRevoked { peer_id, .. } => {
                 live.connected.remove(peer_id);
@@ -625,6 +644,7 @@ impl ControlState {
             can_be_controlled: cfg!(all(feature = "remote-control", any(target_os = "macos", target_os = "windows", target_os = "linux"))),
             can_be_unlocked: cfg!(target_os = "linux"),
             can_control_others: cfg!(feature = "remote-control"),
+            controlling_device: live.controlling.keys().min().cloned(),
             transfers: live.transfers.iter().rev().cloned().collect(),
             about: self.about.clone(),
             activity: live.activity.clone(),
@@ -716,13 +736,20 @@ impl ControlState {
                     return Err("This build of Continuity can't control other computers.".to_string());
                 }
                 paired(&device)?;
-                let (name, platform) = {
+                let (name, platform, controlling) = {
                     let live = self.live.lock().unwrap();
-                    (live.connected.get(&device).cloned(), live.platforms.get(&device).copied())
+                    let controlling = live.controlling.keys().min().map(|other| live.connected.get(other).cloned().unwrap_or_else(|| "another computer".to_string()));
+                    (live.connected.get(&device).cloned(), live.platforms.get(&device).copied(), controlling)
                 };
                 let Some(name) = name else {
                     return Err("That device isn't connected right now.".to_string());
                 };
+                // One at a time — there's one viewer window. (The windows
+                // don't offer Control meanwhile; this is for a request
+                // that was already on its way.)
+                if let Some(other) = controlling {
+                    return Err(format!("Already controlling {other} — close its window first."));
+                }
                 // Phones can control a computer, but can't be controlled.
                 if matches!(platform, Some(Platform::Android | Platform::Ios)) {
                     return Err(format!("{name} can't be controlled — only computers can."));
@@ -964,6 +991,7 @@ mod tests {
             can_be_controlled: true,
             can_be_unlocked: false,
             can_control_others: true,
+            controlling_device: None,
             transfers,
             about: About {
                 protocol_version: 2,
@@ -1352,6 +1380,53 @@ mod tests {
         if cfg!(feature = "remote-control") {
             assert!(matches!(rx.try_recv(), Ok(EngineCommand::RequestRemoteControl { peer_crypto_id }) if peer_crypto_id == "mac"));
         }
+    }
+
+    #[test]
+    fn only_one_computer_is_controlled_at_a_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(&dir);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        pair(&dir, "mac", "MacBook");
+        pair(&dir, "pc", "Office PC");
+        state.observe(&SyncEvent::Connected { peer: info("mac", "MacBook", Platform::MacOs) });
+        state.observe(&SyncEvent::Connected { peer: info("pc", "Office PC", Platform::Windows) });
+        let started = |peer: &str, name: &str, session: &str, role: RemoteControlRole| SyncEvent::RemoteControlSessionStarted {
+            peer_id: peer.into(),
+            peer_name: name.into(),
+            session_id: session.into(),
+            role,
+        };
+        let ended = |peer: &str, name: &str, session: &str| SyncEvent::RemoteControlSessionEnded {
+            peer_id: peer.into(),
+            peer_name: name.into(),
+            session_id: session.into(),
+            reason: None,
+        };
+
+        // Being controlled doesn't count.
+        state.observe(&started("pc", "Office PC", "s0", RemoteControlRole::Controlled));
+        assert_eq!(state.status().controlling_device, None);
+        state.observe(&ended("pc", "Office PC", "s0"));
+
+        state.observe(&started("mac", "MacBook", "s1", RemoteControlRole::Controlling));
+        assert_eq!(state.status().controlling_device.as_deref(), Some("mac"));
+        let refused = state.apply(ControlOp::RequestRemoteControl { device: "pc".into() }, &tx);
+        if cfg!(feature = "remote-control") {
+            let refused = refused.unwrap_err();
+            assert!(refused.contains("MacBook"), "{refused}");
+        } else {
+            assert!(refused.is_err());
+        }
+        assert!(rx.try_recv().is_err(), "nothing reached the engine");
+
+        // The end of some other session with it changes nothing.
+        state.observe(&ended("mac", "MacBook", "older"));
+        assert_eq!(state.status().controlling_device.as_deref(), Some("mac"));
+
+        state.observe(&ended("mac", "MacBook", "s1"));
+        assert_eq!(state.status().controlling_device, None);
+        assert_eq!(state.apply(ControlOp::RequestRemoteControl { device: "pc".into() }, &tx).is_ok(), cfg!(feature = "remote-control"));
     }
 
     #[test]

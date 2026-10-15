@@ -595,9 +595,10 @@ function devicePage(status, device) {
   const connection = device.connected
     ? `<button class="btn" data-action="disconnect" data-id="${esc(device.id)}">Disconnect</button>`
     : `<button class="btn" data-action="connect" data-id="${esc(device.id)}">Connect</button>`;
-  // Only a computer that's connected right now, and only from a build
-  // that can show another screen.
-  const canControl = status.can_control_others && device.connected && COMPUTERS.includes(device.platform);
+  // Only a computer that's connected right now, only from a build that
+  // can show another screen, and not while this one is controlling one
+  // already (there's one viewer window).
+  const canControl = status.can_control_others && !status.controlling_device && device.connected && COMPUTERS.includes(device.platform);
   const control = canControl
     ? `<button class="btn" data-action="control" data-id="${esc(device.id)}">${icon("screen", 16)}Control ${esc(device.name)}…</button>`
     : "";

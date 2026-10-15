@@ -15,6 +15,9 @@ public struct Status: Decodable, Equatable {
     /// Whether this Mac can take control of another computer — it has the
     /// remote-control viewer (off in a "lite" build).
     public var canControlOthers: Bool?
+    /// The computer this Mac is controlling right now, if any. One at a
+    /// time: no other device gets a Control button meanwhile.
+    public var controllingDevice: String?
     /// Every transfer under way and the most recently finished ones, newest
     /// first.
     public var transfers: [Transfer]?
@@ -26,7 +29,7 @@ public struct Status: Decodable, Equatable {
     public init(
         device: ThisDevice, paused: Bool, devices: [PairedDevice], nearby: [NearbyDevice],
         receivedFilesDir: String, canBeControlled: Bool, canBeUnlocked: Bool,
-        canControlOthers: Bool? = nil, transfers: [Transfer]? = nil,
+        canControlOthers: Bool? = nil, controllingDevice: String? = nil, transfers: [Transfer]? = nil,
         about: About? = nil, activity: Activity? = nil, permissions: Permissions? = nil
     ) {
         self.device = device
@@ -37,6 +40,7 @@ public struct Status: Decodable, Equatable {
         self.canBeControlled = canBeControlled
         self.canBeUnlocked = canBeUnlocked
         self.canControlOthers = canControlOthers
+        self.controllingDevice = controllingDevice
         self.transfers = transfers
         self.about = about
         self.activity = activity
@@ -51,11 +55,12 @@ public struct Status: Decodable, Equatable {
     }
 
     /// Whether a device's page offers to take control of it: this build
-    /// has the viewer, the device is connected right now, and it's a
-    /// computer — phones can control a computer but can't be controlled. A
-    /// device whose platform isn't known yet doesn't get the button either.
+    /// has the viewer, it isn't controlling another computer already, the
+    /// device is connected right now, and it's a computer — phones can
+    /// control a computer but can't be controlled. A device whose platform
+    /// isn't known yet doesn't get the button either.
     public func canControl(_ device: PairedDevice) -> Bool {
-        guard canControlOthers == true, device.connected, let platform = device.platform else { return false }
+        guard canControlOthers == true, controllingDevice == nil, device.connected, let platform = device.platform else { return false }
         return [Platform.macOS, .windows, .linux].contains(platform)
     }
 }

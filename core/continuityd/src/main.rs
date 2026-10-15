@@ -267,6 +267,10 @@ fn main() -> anyhow::Result<()> {
         let _ = event_loop.create_proxy().send_event(AppEvent::OpenWindow);
     }
     let is_paused: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+    // Remote-control sessions in either role, as session id and the tray
+    // tooltip that announced each, oldest first — the tray icon's red dot
+    // stays while any is left.
+    let mut remote_sessions: Vec<(String, String)> = Vec::new();
     // The open remote-control viewer window, if any — at most one at a
     // time (mirrors the engine's own one-Controlled-session-device-wide
     // rule; nothing stops *this* device from controlling several peers
@@ -369,6 +373,7 @@ fn main() -> anyhow::Result<()> {
                     &commands,
                     &tray_icon,
                     &control,
+                    &mut remote_sessions,
                 );
             }
             #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -501,6 +506,7 @@ fn handle_sync_event(
     commands: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
     tray_icon: &tray_icon::TrayIcon,
     control: &control::ControlState,
+    remote_sessions: &mut Vec<(String, String)>,
 ) {
     match event {
         SyncEvent::Listening { port } => tracing::info!("listening on port {port}"),
@@ -732,7 +738,7 @@ fn handle_sync_event(
         SyncEvent::RemoteControlDeclined { peer_name, .. } => {
             notify(&format!("'{peer_name}' declined the remote control request"));
         }
-        SyncEvent::RemoteControlSessionStarted { peer_name, role, .. } => {
+        SyncEvent::RemoteControlSessionStarted { peer_name, role, session_id, .. } => {
             let text = match role {
                 continuity_daemon::RemoteControlRole::Controlled => {
                     format!("'{peer_name}' is now controlling this device — click here or use the peer's app to end it")
@@ -748,17 +754,31 @@ fn handle_sync_event(
             // glance, since it's easy to forget one's still running,
             // especially the Controlled side where nothing else on this
             // device changes at all.
+            let tooltip = format!("Continuity — {text}");
             let _ = tray_icon.set_icon(Some(build_icon(true)));
-            let _ = tray_icon.set_tooltip(Some(format!("Continuity — {text}")));
+            let _ = tray_icon.set_tooltip(Some(&tooltip));
+            remote_sessions.push((session_id, tooltip));
         }
-        SyncEvent::RemoteControlSessionEnded { peer_name, reason, .. } => {
+        // The dot stays while any session is left: a second controlling
+        // session ends the first only after it has started (see
+        // `handle_remote_control_sync_event`), and this device can be
+        // controlled while it controls another.
+        SyncEvent::RemoteControlSessionEnded { peer_name, reason, session_id, .. } => {
             let text = match reason {
                 Some(reason) => format!("Remote control session with '{peer_name}' ended: {reason}"),
                 None => format!("Remote control session with '{peer_name}' ended"),
             };
             notify(&text);
-            let _ = tray_icon.set_icon(Some(build_icon(false)));
-            let _ = tray_icon.set_tooltip(Some("Continuity"));
+            remote_sessions.retain(|(id, _)| *id != session_id);
+            match remote_sessions.last() {
+                Some((_, tooltip)) => {
+                    let _ = tray_icon.set_tooltip(Some(tooltip));
+                }
+                None => {
+                    let _ = tray_icon.set_icon(Some(build_icon(false)));
+                    let _ = tray_icon.set_tooltip(Some("Continuity"));
+                }
+            }
         }
         // Never arrives here: `start_engine_thread` sends screen frames
         // straight to the viewer's decoder (see `route_screen_frame`)
@@ -904,7 +924,26 @@ fn handle_remote_control_sync_event(
             let wake_proxy = viewer_proxy.clone();
             let wake: remote_viewer::Wake = Box::new(move || wake_proxy.send_event(AppEvent::ViewerFrameReady).is_ok());
             match remote_viewer::RemoteViewer::open(target, peer, frame_router, wake, commands.clone()) {
-                Ok(new_viewer) => *viewer.borrow_mut() = Some(new_viewer),
+                Ok(new_viewer) => {
+                    // One viewer at a time, so a session that starts while
+                    // another's viewer is open — Control clicked on a second
+                    // computer before the first one answered, say — replaces
+                    // it, and the earlier session is ended. Just dropping its
+                    // viewer used to leave that computer capturing and
+                    // streaming its screen to nobody and saying it's being
+                    // controlled, with nothing here left to end it. The new
+                    // viewer is opened first so it claims any of its frames
+                    // that arrived before it (see `FrameRouter`); dropping
+                    // the old one releases whatever it held down before the
+                    // end goes out.
+                    let previous = viewer.borrow_mut().replace(new_viewer);
+                    if let Some(previous) = previous.filter(|previous| previous.peer_id() != peer_id) {
+                        let previous_peer = previous.peer_id().to_string();
+                        drop(previous);
+                        tracing::info!("a session with '{peer_name}' replaced the viewer for '{previous_peer}' — ending that one");
+                        let _ = commands.send(EngineCommand::EndRemoteControlSession { peer_crypto_id: previous_peer });
+                    }
+                }
                 Err(e) => {
                     tracing::warn!("couldn't open remote control viewer window: {e}");
                     let _ = commands.send(EngineCommand::EndRemoteControlSession { peer_crypto_id: peer_id.clone() });

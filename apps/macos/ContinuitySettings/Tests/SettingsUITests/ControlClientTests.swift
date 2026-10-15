@@ -47,6 +47,7 @@ final class ControlClientTests: XCTestCase {
     func testDecodesTheTransfers() throws {
         let status = try XCTUnwrap(Envelope.decode(fixture()).status)
         XCTAssertEqual(status.canControlOthers, true)
+        XCTAssertNil(status.controllingDevice)
         let transfers = try XCTUnwrap(status.transfers)
         XCTAssertEqual(transfers.map(\.id), ["t4", "t3", "t2", "t1"], "newest first, as sent")
         XCTAssertEqual(transfers.map(\.state), [.active, .stalled, .done, .failed])
@@ -101,6 +102,9 @@ final class ControlClientTests: XCTestCase {
         XCTAssertFalse(status.canControl(device(.iOS)))
         XCTAssertFalse(status.canControl(device(.unknown)))
         XCTAssertFalse(status.canControl(device(nil)), "not seen since Continuity started")
+        status.controllingDevice = "office"
+        XCTAssertFalse(status.canControl(device(.macOS)), "already controlling a computer")
+        status.controllingDevice = nil
         status.canControlOthers = false
         XCTAssertFalse(status.canControl(device(.macOS)), "a build without the viewer")
     }
