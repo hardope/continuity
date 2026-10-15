@@ -88,6 +88,7 @@ object ReceivedFiles {
     private const val TAG = "ReceivedFiles"
     private const val COPY_BUFFER_BYTES = 1 shl 20
     private const val EXTERNAL_STORAGE_AUTHORITY = "com.android.externalstorage.documents"
+    private const val DOWNLOADS_AUTHORITY = "com.android.providers.downloads.documents"
     private const val TREE_FLAGS = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
 
     /** As shown to the user, matching [downloadsDir]. */
@@ -194,7 +195,10 @@ object ReceivedFiles {
         val mimeType = mimeTypeFor(file.name)
         val location = labelFor(file.parentFile ?: file)
         val current = _folder.value
-        val tree = current.customTree
+        // A chosen folder that's the very one the file is in (picked while
+        // the engine wrote elsewhere, and it's since moved there) needs no
+        // move — one would only copy the file to "name (1).ext" beside it.
+        val tree = current.customTree?.takeUnless { isFolder(it, file.parentFile) }
         var couldNotMoveTo: String? = null
         if (tree != null) {
             val label = current.customTreeLabel ?: "the chosen folder"
@@ -232,30 +236,63 @@ object ReceivedFiles {
         null
     }
 
-    /** Creates a document in [tree] and streams [file] into it; on any
-     * failure the half-written document is deleted again (best effort) and
-     * the exception rethrown, leaving [file] itself untouched. */
+    /** Creates a document in [tree] and streams [file] into it — under a
+     * temporary "<name>.part" name, renamed to the real one only once all
+     * of it is in, where the provider can rename. **Real bug fixed here**:
+     * it was written under its final name from the start, so the process
+     * being killed partway through a big file (Quit, or the system) left a
+     * truncated copy in the chosen folder that looked complete, beside the
+     * whole one still in [DOWNLOADS_LABEL]. On any failure the half-written
+     * document is deleted again (best effort) and the exception rethrown,
+     * leaving [file] itself untouched. */
     private fun copyIntoTree(context: Context, file: File, tree: Uri, mimeType: String): Uri {
         val resolver = context.contentResolver
         val parent = DocumentsContract.buildDocumentUriUsingTree(tree, DocumentsContract.getTreeDocumentId(tree))
-        // The provider picks a unique name ("name (1).ext") if this one's
-        // taken, the same way the engine does in its own folder.
-        val document = DocumentsContract.createDocument(resolver, parent, mimeType, file.name)
+        // The real type even for the temporary name, for providers that
+        // keep the type a document was created with. (Some add the type's
+        // extension to the name; it's renamed anyway.)
+        val partial = DocumentsContract.createDocument(resolver, parent, mimeType, "${file.name}.part")
             ?: throw IOException("the folder didn't accept a new file")
+        val renames = supportsRename(context, partial)
+        val document = if (renames) {
+            partial
+        } else {
+            // Nowhere to rename it later: straight under its own name, as
+            // before.
+            deleteQuietly(context, partial)
+            DocumentsContract.createDocument(resolver, parent, mimeType, file.name)
+                ?: throw IOException("the folder didn't accept a new file")
+        }
         try {
             val copied = resolver.openOutputStream(document, "w")?.use { output ->
                 file.inputStream().use { input -> input.copyTo(output, COPY_BUFFER_BYTES) }
             } ?: throw IOException("couldn't write to the new file")
             val expected = file.length()
             if (copied != expected) throw IOException("only $copied of $expected bytes were copied")
-            return document
+            if (!renames) return document
+            // The provider picks a unique name ("name (1).ext") if this
+            // one's taken, the same way the engine does in its own folder.
+            // No Uri back means the document kept its id.
+            return DocumentsContract.renameDocument(resolver, document, file.name) ?: document
         } catch (e: Exception) {
-            try {
-                DocumentsContract.deleteDocument(resolver, document)
-            } catch (cleanup: Exception) {
-                android.util.Log.w(TAG, "couldn't delete the partial copy $document", cleanup)
-            }
+            deleteQuietly(context, document)
             throw e
+        }
+    }
+
+    private fun supportsRename(context: Context, document: Uri): Boolean = try {
+        context.contentResolver.query(document, arrayOf(DocumentsContract.Document.COLUMN_FLAGS), null, null, null)?.use { cursor ->
+            cursor.moveToFirst() && (cursor.getInt(0) and DocumentsContract.Document.FLAG_SUPPORTS_RENAME) != 0
+        } ?: false
+    } catch (e: Exception) {
+        false
+    }
+
+    private fun deleteQuietly(context: Context, document: Uri) {
+        try {
+            DocumentsContract.deleteDocument(context.contentResolver, document)
+        } catch (e: Exception) {
+            android.util.Log.w(TAG, "couldn't delete the partial copy $document", e)
         }
     }
 
@@ -331,11 +368,18 @@ object ReceivedFiles {
     }
 
     private fun chooseTreeNow(context: Context, tree: Uri) {
-        if (isDownloadsFolder(tree)) {
+        // Only the folder the engine really is saving to. **Real bug fixed
+        // here**: picking Download/Continuity always took this way out — but
+        // while the engine is on the app's own folder instead (no storage
+        // permission on Android 8–10), choosing it here is the one way to
+        // get files there, and the notice said they already went there
+        // while every file kept landing in the hidden folder.
+        val engineDir = synchronized(lock) { appliedDir }?.let { File(it) }
+        if (engineDir != null && isFolder(tree, engineDir)) {
             // Moving each file "into" the folder it's already in would only
-            // rename it to "name (1).ext".
+            // copy it to "name (1).ext".
             clearTree(context)
-            ContinuityStore.notice("Received files already go to $DOWNLOADS_LABEL")
+            ContinuityStore.notice("Received files already go to ${labelFor(engineDir)}")
             return
         }
         // The picker's result carries a persistable grant; taking it is
@@ -373,14 +417,35 @@ object ReceivedFiles {
     private fun hasTreeAccess(context: Context, tree: Uri): Boolean =
         context.contentResolver.persistedUriPermissions.any { it.uri == tree && it.isReadPermission && it.isWritePermission }
 
-    private fun isDownloadsFolder(tree: Uri): Boolean {
-        if (tree.authority != EXTERNAL_STORAGE_AUTHORITY) return false
+    /** Whether [tree] is [dir] itself, as far as its provider lets that be
+     * told: a folder on the phone's own storage has a tree id like
+     * "primary:Download/Continuity", and one picked under the picker's
+     * Downloads entry "raw:/storage/emulated/0/Download/Continuity".
+     * **Real bug fixed here**: only the first was recognised, so
+     * Download/Continuity picked from the Downloads entry was taken for
+     * another folder, and every received file was copied into the folder
+     * it was already in, as "name (1).ext". Any other provider's folder
+     * (an SD card's, a cloud drive's) is never one the engine writes to by
+     * path. */
+    @Suppress("DEPRECATION") // The path-based API is the point; see the class comment.
+    private fun isFolder(tree: Uri, dir: File?): Boolean {
+        if (dir == null) return false
         val documentId = try {
             DocumentsContract.getTreeDocumentId(tree)
         } catch (e: IllegalArgumentException) {
             return false
         }
-        return documentId.equals("primary:${Environment.DIRECTORY_DOWNLOADS}/Continuity", ignoreCase = true)
+        val path = when (tree.authority) {
+            EXTERNAL_STORAGE_AUTHORITY ->
+                documentId.takeIf { it.startsWith("primary:") }?.let { File(Environment.getExternalStorageDirectory(), it.removePrefix("primary:")) }
+            DOWNLOADS_AUTHORITY -> documentId.takeIf { it.startsWith("raw:") }?.let { File(it.removePrefix("raw:")) }
+            else -> null
+        } ?: return false
+        return try {
+            path.canonicalPath.equals(dir.canonicalPath, ignoreCase = true)
+        } catch (e: IOException) {
+            false
+        }
     }
 
     /** "Documents/Phone" for a folder on the phone's own storage (whose
