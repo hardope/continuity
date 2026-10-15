@@ -170,6 +170,13 @@ impl RemoteViewer {
         // at all (confirmed on GNOME 50/Mutter — see `RENDER_WATCHDOG`).
         // Explicit focus doesn't reliably fix that, but it's free.
         window.set_visible(true);
+        // On macOS a window only gets keyboard input while its app is the
+        // active one, and a menu-bar app usually isn't: using its menu
+        // doesn't activate it, so by the time the peer accepts, whatever
+        // the person clicked last is. Without activating, every key went
+        // to that other app.
+        #[cfg(target_os = "macos")]
+        activate_for_keyboard(&window);
         window.set_focus();
         let window_id = window.id();
         let context = softbuffer::Context::new(window.clone()).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -461,6 +468,33 @@ impl Drop for RemoteViewer {
     /// `EndRemoteControlSession` the caller sends next.
     fn drop(&mut self) {
         self.release_all();
+    }
+}
+
+/// Brings the tray app forward so the viewer window gets keyboard focus —
+/// see the call site in `RemoteViewer::open`. `activateIgnoringOtherApps:`
+/// is the call through macOS 13 (deprecated since); macOS 14 adds the
+/// cooperative `activate`, so there both are called. `orderFrontRegardless`
+/// puts the window above other apps' windows even if activation is
+/// refused, so it's at least there to click on. (tao's own `set_focus`,
+/// called next, then makes it the key window.)
+#[cfg(target_os = "macos")]
+fn activate_for_keyboard(window: &Window) {
+    use tao::platform::macos::WindowExtMacOS;
+    let Some(mtm) = objc2_foundation::MainThreadMarker::new() else {
+        tracing::debug!("activate_for_keyboard: not on the main thread");
+        return;
+    };
+    let app = objc2_app_kit::NSApplication::sharedApplication(mtm);
+    #[allow(deprecated)]
+    app.activateIgnoringOtherApps(true);
+    if objc2::available!(macos = 14.0) {
+        app.activate();
+    }
+    // SAFETY: tao hands back its live `NSWindow` pointer, valid for as long
+    // as `window` is, and this runs on the main thread (checked above).
+    if let Some(ns_window) = unsafe { (window.ns_window() as *const objc2_app_kit::NSWindow).as_ref() } {
+        ns_window.orderFrontRegardless();
     }
 }
 
