@@ -6,13 +6,16 @@
 // day-to-day dev.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-//! Desktop tray app (Phase 1) — macOS/Windows/Linux. A thin GUI shell over
-//! `continuity-daemon`'s engine: the engine runs on a background OS thread
-//! with its own tokio runtime (tao's event loop needs the real main
-//! thread), and the two talk over a channel in each direction — engine
-//! events wake the tray thread via an `EventLoopProxy`, and menu clicks
-//! send `EngineCommand`s straight into the engine's command channel
-//! (`UnboundedSender::send` is synchronous, so no proxy needed that way).
+//! Desktop app — macOS/Windows/Linux. A thin GUI shell over
+//! `continuity-daemon`'s engine: a tray icon with a few quick actions, and
+//! the Continuity window for everything else (settings_window.rs on Linux
+//! and Windows, a SwiftUI app of its own on macOS). The engine runs on a
+//! background OS thread with its own tokio runtime (tao's event loop needs
+//! the real main thread), and the two talk over a channel in each
+//! direction — engine events wake the tray thread via an `EventLoopProxy`,
+//! and menu clicks send `EngineCommand`s straight into the engine's command
+//! channel (`UnboundedSender::send` is synchronous, so no proxy needed that
+//! way).
 
 #[cfg(target_os = "macos")]
 mod media_mac;
@@ -55,21 +58,24 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
-#[cfg(target_os = "linux")]
-use tray_icon::menu::CheckMenuItem;
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, TrayIconBuilder, TrayIconEvent};
 
 /// What wakes the tray's event loop, besides the OS itself.
 enum AppEvent {
     Engine(SyncEvent),
-    /// From the settings window's page (Linux and Windows — macOS has a
-    /// settings app of its own).
+    /// From the Continuity window's page (Linux and Windows — macOS has an
+    /// app of its own for the window).
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     Settings(settings_window::Message),
-    /// Time to make the settings window, hidden (see `SETTINGS_PREPARE_DELAY`).
+    /// Time to make the Continuity window, hidden (see
+    /// `SETTINGS_PREPARE_DELAY`).
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     PrepareSettings,
+    /// Show the Continuity window: the very first launch, or Continuity
+    /// launched again while it's already running (see share.rs's
+    /// `hand_off_to_running_instance`).
+    OpenWindow,
     /// The remote-control viewer's decoder thread has a frame ready to
     /// show — at most one of these is ever in flight (see remote_viewer.rs).
     /// Screen frames themselves never come through here.
@@ -86,11 +92,18 @@ type FrameSink = Arc<remote_viewer::FrameRouter>;
 type FrameSink = ();
 
 /// A webview takes a few seconds to start, so on Linux and Windows the
-/// settings window is made, hidden, this long after Continuity starts — late
-/// enough not to slow its own start (or a login) down — and Settings… then
-/// only has to show it.
+/// Continuity window is made, hidden, this long after Continuity starts —
+/// late enough not to slow its own start (or a login) down — and Open
+/// Continuity then only has to show it.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 const SETTINGS_PREPARE_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Who Continuity is to the system's notifications: the bundle identifier
+/// in installers/macos/Info.plist, and the AppUserModelID Windows files
+/// toasts under (and the installer gives the Start-menu shortcut — see
+/// installers/windows/continuity.iss).
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+const APP_ID: &str = "app.continuity.desktop";
 
 /// Who a click on a dynamically-built "Send File" submenu entry should
 /// send to — rebuilt every time the connected-device set changes, so the
@@ -117,8 +130,17 @@ fn main() -> anyhow::Result<()> {
     if args.get(1).map(String::as_str) == Some(share::SHARE_TO_FLAG) {
         std::process::exit(share::run_share_client(&profile(), &args[2..]));
     }
+    // Launched again while already running — from the app menu or the
+    // Start menu, say: the running one shows its window instead, and this
+    // one goes away. Only a plain launch, with nothing on the command line.
+    // (macOS reactivates a running app by itself; see `Event::Reopen`.)
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    if args.len() == 1 && share::hand_off_to_running_instance(&profile()) {
+        std::process::exit(0);
+    }
 
     init_logging();
+    init_notifications();
 
     // Without declaring DPI awareness, Windows silently DPI-virtualizes
     // this whole process on any scaled display (the large majority of
@@ -151,118 +173,49 @@ fn main() -> anyhow::Result<()> {
 
     let device_name = continuity_daemon::default_device_name();
 
-    let title_item = MenuItem::new(format!("Continuity — {device_name}"), false, None);
-    let nearby_submenu = Submenu::new("Nearby Devices", true);
-    let refresh_item = MenuItem::new("Refresh Nearby Devices", true, None);
+    // Only quick actions — everything else (pairing, nearby devices,
+    // forgetting one, its permissions, forgetting all of them, remote
+    // control, about) is in the Continuity window, which the first entry
+    // opens: on macOS the SwiftUI app bundled with this one
+    // (apps/macos/ContinuitySettings), on Linux and Windows a webview
+    // window of this process (settings_window.rs).
+    let open_item = MenuItem::new("Open Continuity", true, None);
     let send_submenu = Submenu::new("Send File", true);
-    let forget_submenu = Submenu::new("Forget Device", true);
-    #[cfg(feature = "remote-control")]
-    let remote_control_submenu = Submenu::new("Remote Control", true);
     let pause_item = MenuItem::new("Pause Syncing", true, None);
-    let reset_item = MenuItem::new("Reset...", true, None);
-    let about_item = MenuItem::new(format!("About Continuity ({})", env!("CARGO_PKG_VERSION")), true, None);
-    // The settings window: on macOS a SwiftUI app of its own
-    // (apps/macos/ContinuitySettings), on Linux and Windows a webview window
-    // of this process (settings_window.rs).
-    let settings_item = MenuItem::new("Settings…", true, None);
-    let settings_item_id = settings_item.id().clone();
-    let quit_item = MenuItem::new("Quit", true, None);
-    let refresh_item_id = refresh_item.id().clone();
+    let quit_item = MenuItem::new("Quit Continuity", true, None);
+    let open_item_id = open_item.id().clone();
     let pause_item_id = pause_item.id().clone();
-    let reset_item_id = reset_item.id().clone();
-    let about_item_id = about_item.id().clone();
     let quit_item_id = quit_item.id().clone();
 
     let connected_peers: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
     let send_target_map: Arc<Mutex<HashMap<MenuId, SendTarget>>> = Arc::new(Mutex::new(HashMap::new()));
     rebuild_send_menu(&send_submenu, &connected_peers.lock().unwrap(), &send_target_map);
 
-    // "Forget" only offers currently-connected peers, same scope as "Send
-    // File" above — there's no UI surface yet for interacting with a
-    // paired-but-offline peer individually (only bulk `Reset` reaches
-    // those). Separate map/submenu rather than reusing `send_target_map`
-    // since a click here means something structurally different
-    // (`EngineCommand::RevokeDevice`, not `SendFile`).
-    let forget_target_map: Arc<Mutex<HashMap<MenuId, String>>> = Arc::new(Mutex::new(HashMap::new()));
-    rebuild_forget_menu(&forget_submenu, &connected_peers.lock().unwrap(), &forget_target_map);
-
-    // Remote unlock is Linux-only (see screen_lock_linux.rs), so is the
-    // menu that grants it. Lists every connected device *plus* any device
-    // already allowed, even while it's offline — a lost phone is exactly
-    // the device whose permission most needs to be easy to take back.
-    // `unlock_permissions` mirrors the engine's trust store via
-    // `SyncEvent::UnlockPermissionChanged`: peer id -> (name, allowed).
-    #[cfg(target_os = "linux")]
-    let unlock_submenu = Submenu::new("Allow Remote Unlock", true);
-    #[cfg(target_os = "linux")]
-    let unlock_permissions: Arc<Mutex<HashMap<String, (String, bool)>>> = Arc::new(Mutex::new(HashMap::new()));
-    #[cfg(target_os = "linux")]
-    let unlock_target_map: Arc<Mutex<HashMap<MenuId, String>>> = Arc::new(Mutex::new(HashMap::new()));
-    #[cfg(target_os = "linux")]
-    rebuild_unlock_menu(&unlock_submenu, &connected_peers.lock().unwrap(), &unlock_permissions.lock().unwrap(), &unlock_target_map);
-
-    // A connected peer's platform isn't tracked anywhere else on desktop
-    // (`connected_peers` above only keeps id->name) — needed both to
-    // gate which peers even get a "Remote Control" entry (a phone can
-    // only ever auto-decline via its `NoopRemoteControlHost`, so offering
-    // it would be a button guaranteed to do nothing) and, once a session's
-    // open, so the viewer knows which platform's key codes to translate
-    // into.
+    // A connected peer's platform, which `connected_peers` above doesn't
+    // keep (only id->name) — once a remote-control session's open, the
+    // viewer needs it to know which platform's key codes to translate into.
     #[cfg(feature = "remote-control")]
     let connected_peer_platforms: Arc<Mutex<HashMap<String, Platform>>> = Arc::new(Mutex::new(HashMap::new()));
-    #[cfg(feature = "remote-control")]
-    let remote_control_target_map: Arc<Mutex<HashMap<MenuId, String>>> = Arc::new(Mutex::new(HashMap::new()));
-    #[cfg(feature = "remote-control")]
-    rebuild_remote_control_menu(
-        &remote_control_submenu,
-        &connected_peers.lock().unwrap(),
-        &connected_peer_platforms.lock().unwrap(),
-        &remote_control_target_map,
-    );
-
-    // Untrusted devices seen on the network (see SyncEvent::PeerDiscovered)
-    // — the engine deliberately doesn't auto-dial these anymore (that used
-    // to mean a pairing prompt for every Continuity install anyone ever
-    // shared a LAN with), so this is the only way to initiate pairing with
-    // a new device from desktop at all now. Clicking one sends
-    // EngineCommand::ReconnectPeer, which dials it and runs the normal
-    // pairing handshake.
-    let nearby_peers: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
-    let nearby_target_map: Arc<Mutex<HashMap<MenuId, String>>> = Arc::new(Mutex::new(HashMap::new()));
-    rebuild_nearby_menu(&nearby_submenu, &nearby_peers.lock().unwrap(), &nearby_target_map);
 
     let menu = Menu::new();
-    menu.append(&title_item)?;
+    menu.append(&open_item)?;
     menu.append(&PredefinedMenuItem::separator())?;
-    menu.append(&nearby_submenu)?;
-    menu.append(&refresh_item)?;
     menu.append(&send_submenu)?;
-    menu.append(&forget_submenu)?;
-    #[cfg(target_os = "linux")]
-    menu.append(&unlock_submenu)?;
-    // `remote_control_submenu` is built and kept up to date below like
-    // any other submenu, just deliberately never appended to the visible
-    // menu here — real testing (mac controlling mac) found the
-    // *requesting* device's tray app freezing solid once the peer
-    // accepted, somewhere in the viewer-window/event-loop path. Rather
-    // than ship a button that can lock up the whole app, the entry point
-    // is hidden while that gets tracked down; everything behind it (the
-    // engine session logic, the viewer window, the stuck-window
-    // watchdog) is untouched and ready to come back the moment this
-    // `menu.append` line is restored.
-    menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&pause_item)?;
-    menu.append(&reset_item)?;
-    menu.append(&settings_item)?;
-    menu.append(&about_item)?;
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&quit_item)?;
 
     let tray_icon = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_tooltip("Continuity")
-        .with_icon(build_icon(false))
-        .build()?;
+        .with_icon(build_icon(false));
+    // Windows convention: a left click on a tray icon opens the app's
+    // window, a right click shows its menu. macOS's menu-bar convention is
+    // the menu on any click, and Linux's AppIndicator tray can't report
+    // clicks at all — both keep the menu.
+    #[cfg(target_os = "windows")]
+    let tray_icon = tray_icon.with_menu_on_left_click(false);
+    let tray_icon = tray_icon.build()?;
 
     // Shared by the engine thread, which hands it every screen frame, and
     // the viewer window below, which it feeds — see remote_viewer.rs.
@@ -275,8 +228,14 @@ fn main() -> anyhow::Result<()> {
     // How the viewer's decoder thread wakes this loop when a frame is ready.
     #[cfg(feature = "remote-control")]
     let viewer_proxy = event_loop.create_proxy();
-    let (commands, device_id) = start_engine_thread(profile(), device_name.clone(), proxy, frame_sink)?;
-    // What the settings window reads and changes, over the same local
+    // Where received files go, as chosen in the window (Contract C's
+    // settings.json) — or the default when nothing was, or what was chosen
+    // can't be used right now.
+    let settings_path = control::settings_path(&profile());
+    let app_settings = settings_path.as_deref().map(control::AppSettings::load).unwrap_or_default();
+    let received_dir = received_files_dir_for_this_run(&profile(), &app_settings);
+    let (commands, device_id) = start_engine_thread(profile(), device_name.clone(), proxy, frame_sink, received_dir.clone())?;
+    // What the Continuity window reads and changes, over the same local
     // socket as "Send with Continuity" (see control.rs).
     let control = control::ControlState::new(
         control::ThisDevice {
@@ -286,15 +245,27 @@ fn main() -> anyhow::Result<()> {
             version: env!("CARGO_PKG_VERSION").to_string(),
         },
         TrustStore::default_path(&profile()).unwrap_or_default(),
-        received_files_dir(&profile()),
+        received_dir,
         log_file_path(&profile()),
+        settings_path,
+        app_settings,
     );
     control.spawn_trust_watcher();
     // Entries left behind by a previous run that didn't quit cleanly would
     // point at devices that may not be connected now — start from none and
     // let `Connected` events add them back.
     share::remove_menu_entries();
-    let share_server = share::start_server(&profile(), commands.clone(), connected_peers.clone(), control.clone());
+    // A second launch's "show the window", from the socket's own thread.
+    let open_window_proxy = Mutex::new(event_loop.create_proxy());
+    let open_window: share::OpenWindow = Arc::new(move || {
+        let _ = open_window_proxy.lock().unwrap().send_event(AppEvent::OpenWindow);
+    });
+    let share_server = share::start_server(&profile(), commands.clone(), connected_peers.clone(), control.clone(), open_window);
+    // The very first launch opens the window, so a new install doesn't look
+    // like nothing happened (a tray icon is easy to miss).
+    if control.first_window_showing() {
+        let _ = event_loop.create_proxy().send_event(AppEvent::OpenWindow);
+    }
     let is_paused: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
     // The open remote-control viewer window, if any — at most one at a
     // time (mirrors the engine's own one-Controlled-session-device-wide
@@ -305,8 +276,8 @@ fn main() -> anyhow::Result<()> {
     // tao event loop's own thread, same as everything else in `main()`.
     #[cfg(feature = "remote-control")]
     let viewer: std::rc::Rc<std::cell::RefCell<Option<remote_viewer::RemoteViewer>>> = std::rc::Rc::new(std::cell::RefCell::new(None));
-    // Made hidden in the background, then shown by Settings… and hidden
-    // again when closed.
+    // Made hidden in the background, then shown by Open Continuity and
+    // hidden again when closed.
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     let mut settings: Option<settings_window::SettingsWindow> = None;
 
@@ -316,6 +287,9 @@ fn main() -> anyhow::Result<()> {
         let _tray_icon = &tray_icon;
         let _target = target;
         *control_flow = ControlFlow::Wait;
+        // Set by anything this tick that should bring the Continuity window
+        // up — shown once, at the end.
+        let mut open_window = false;
         // Reactive check: catches a viewer that was already open and
         // idle on the *previous* tick. Doesn't by itself guarantee a
         // next tick ever happens, though — see the `WaitUntil` set at
@@ -364,6 +338,13 @@ fn main() -> anyhow::Result<()> {
             let paths: Vec<PathBuf> = urls.iter().filter_map(|url| url.to_file_path().ok()).collect();
             share::handle_opened_files(paths, connected_peers.clone(), commands.clone());
         }
+        // Continuity.app opened again while it's running — from Finder,
+        // Launchpad or Spotlight. Nothing else would happen at all: it has
+        // no Dock icon or window of its own to bring forward.
+        #[cfg(target_os = "macos")]
+        if let tao::event::Event::Reopen { .. } = &event {
+            open_window = true;
+        }
 
         match event {
             tao::event::Event::UserEvent(AppEvent::Engine(sync_event)) => {
@@ -378,40 +359,17 @@ fn main() -> anyhow::Result<()> {
                     &frame_router,
                     &viewer_proxy,
                 );
-                #[cfg(target_os = "linux")]
-                let unlock_menu_update = unlock_menu_update(&sync_event);
                 handle_sync_event(
                     sync_event,
                     &send_submenu,
-                    &forget_submenu,
-                    &nearby_submenu,
                     &pause_item,
                     &connected_peers,
                     &send_target_map,
-                    &forget_target_map,
-                    &nearby_peers,
-                    &nearby_target_map,
                     &is_paused,
                     &commands,
                     &tray_icon,
+                    &control,
                 );
-                #[cfg(feature = "remote-control")]
-                rebuild_remote_control_menu(
-                    &remote_control_submenu,
-                    &connected_peers.lock().unwrap(),
-                    &connected_peer_platforms.lock().unwrap(),
-                    &remote_control_target_map,
-                );
-                // After `handle_sync_event`, so `connected_peers` already
-                // reflects this event when the menu is rebuilt from it. Only for
-                // events that change what it shows — rebuilding on every event
-                // (now-playing updates arrive every 1.5s) would keep yanking
-                // the menu out from under someone who has it open.
-                #[cfg(target_os = "linux")]
-                if let Some(update) = unlock_menu_update {
-                    update.apply(&mut unlock_permissions.lock().unwrap());
-                    rebuild_unlock_menu(&unlock_submenu, &connected_peers.lock().unwrap(), &unlock_permissions.lock().unwrap(), &unlock_target_map);
-                }
             }
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             tao::event::Event::UserEvent(AppEvent::Settings(message)) => {
@@ -433,47 +391,22 @@ fn main() -> anyhow::Result<()> {
                 if settings.is_none() {
                     match settings_window::SettingsWindow::open(target, settings_route.clone(), settings_window_icon(), false) {
                         Ok(window) => settings = Some(window),
-                        // Settings… tries again, and says so if that fails too.
-                        Err(e) => tracing::warn!("couldn't prepare the settings window: {e}"),
+                        // Open Continuity tries again, and says so if that
+                        // fails too.
+                        Err(e) => tracing::warn!("couldn't prepare the Continuity window: {e}"),
                     }
                 }
             }
+            tao::event::Event::UserEvent(AppEvent::OpenWindow) => open_window = true,
             _ => {}
         }
 
         if let Ok(event) = MenuEvent::receiver().try_recv() {
-            if event.id == settings_item_id {
-                #[cfg(target_os = "macos")]
-                open_settings(&profile());
-                #[cfg(any(target_os = "linux", target_os = "windows"))]
-                match &settings {
-                    Some(window) => window.show(),
-                    None => match settings_window::SettingsWindow::open(target, settings_route.clone(), settings_window_icon(), true) {
-                        Ok(window) => settings = Some(window),
-                        Err(e) => {
-                            tracing::warn!("couldn't open the settings window: {e}");
-                            notify(&settings_window_failed(&e));
-                        }
-                    },
-                }
-            }
-            if event.id == pause_item_id {
+            if event.id == open_item_id {
+                open_window = true;
+            } else if event.id == pause_item_id {
                 let currently_paused = *is_paused.lock().unwrap();
                 let _ = commands.send(EngineCommand::SetPaused(!currently_paused));
-            } else if event.id == refresh_item_id {
-                let _ = commands.send(EngineCommand::RefreshDiscovery);
-            } else if event.id == reset_item_id {
-                confirm(
-                    "Continuity — Reset",
-                    "This disconnects every paired device and forgets them all. Each one will need to be paired again from scratch.\n\nAre you sure?",
-                    commands.clone(),
-                    |commands| { let _ = commands.send(EngineCommand::Reset); },
-                );
-            } else if event.id == about_item_id {
-                notify(&format!(
-                    "Continuity {}\n\nClipboard, file, and remote-control continuity across your devices — no cloud relay, no account.\n\nhttps://github.com/hardope/continuity",
-                    env!("CARGO_PKG_VERSION")
-                ));
             } else if event.id == quit_item_id {
                 share::remove_menu_entries();
                 if let Some(server) = &share_server {
@@ -497,63 +430,28 @@ fn main() -> anyhow::Result<()> {
                 if let Some(path) = rfd::FileDialog::new().pick_file() {
                     send_file_to(&target, &path.display().to_string(), &commands, &connected_peers);
                 }
-            } else if let Some(peer_id) = nearby_target_map.lock().unwrap().get(&event.id).cloned() {
-                let _ = commands.send(EngineCommand::ReconnectPeer { peer_crypto_id: peer_id });
-            } else if let Some(peer_id) = forget_target_map.lock().unwrap().get(&event.id).cloned() {
-                let peer_name = connected_peers.lock().unwrap().get(&peer_id).cloned().unwrap_or_else(|| peer_id.clone());
-                confirm(
-                    "Continuity — Forget Device",
-                    &format!("Forget '{peer_name}'? This closes the connection now and it'll need to be paired again from scratch to reconnect.\n\nAre you sure?"),
-                    commands.clone(),
-                    move |commands| { let _ = commands.send(EngineCommand::RevokeDevice { peer_crypto_id: peer_id }); },
-                );
-            } else {
-                #[cfg(feature = "remote-control")]
-                if let Some(peer_id) = remote_control_target_map.lock().unwrap().get(&event.id).cloned() {
-                    let _ = commands.send(EngineCommand::RequestRemoteControl { peer_crypto_id: peer_id });
-                }
-                // A separate `let`, not inline in the `if let`: a temporary
-                // guard in an `if let` scrutinee lives for the whole block,
-                // and `rebuild_unlock_menu` at the end locks this same map.
-                #[cfg(target_os = "linux")]
-                let unlock_peer = unlock_target_map.lock().unwrap().get(&event.id).cloned();
-                #[cfg(target_os = "linux")]
-                if let Some(peer_id) = unlock_peer {
-                    let current = unlock_permissions.lock().unwrap().get(&peer_id).cloned();
-                    let peer_name = current
-                        .as_ref()
-                        .map(|(name, _)| name.clone())
-                        .or_else(|| connected_peers.lock().unwrap().get(&peer_id).cloned())
-                        .unwrap_or_else(|| peer_id.clone());
-                    if current.is_some_and(|(_, allowed)| allowed) {
-                        let _ = commands.send(EngineCommand::SetUnlockAllowed { peer_crypto_id: peer_id, allowed: false });
-                    } else {
-                        // Turning it *on* is the one direction that needs a
-                        // human to confirm: it lets that device skip this
-                        // computer's password from then on.
-                        confirm(
-                            "Continuity — Allow Remote Unlock",
-                            &format!(
-                                "Allow '{peer_name}' to unlock this computer without your password?\n\nAnyone using '{peer_name}' while it's unlocked could then unlock this computer. You'll get a notification every time it's used, and you can turn it off again from this menu at any time."
-                            ),
-                            commands.clone(),
-                            move |commands| {
-                                let _ = commands.send(EngineCommand::SetUnlockAllowed { peer_crypto_id: peer_id, allowed: true });
-                            },
-                        );
-                    }
-                    // The click already flipped the checkmark on its own;
-                    // put it back to what's actually allowed until the
-                    // engine confirms a change.
-                    rebuild_unlock_menu(&unlock_submenu, &connected_peers.lock().unwrap(), &unlock_permissions.lock().unwrap(), &unlock_target_map);
-                }
             }
         }
 
-        // Nothing to do with tray-icon-itself clicks (left-click opening
-        // the menu is handled by the OS/tray-icon crate) — just drain the
-        // channel so it doesn't build up.
-        let _ = TrayIconEvent::receiver().try_recv();
+        // Every tray-icon event waiting, not just one — hovering the icon
+        // queues a stream of Enter/Move/Leave events nothing here needs.
+        // Windows: a left click opens the window (see `with_menu_on_left_
+        // click` above); acted on when the button comes back up, as a
+        // click on a taskbar button is.
+        while let Ok(tray_event) = TrayIconEvent::receiver().try_recv() {
+            #[cfg(target_os = "windows")]
+            if let TrayIconEvent::Click { button: tray_icon::MouseButton::Left, button_state: tray_icon::MouseButtonState::Up, .. } = tray_event {
+                open_window = true;
+            }
+            let _ = tray_event;
+        }
+
+        if open_window {
+            #[cfg(target_os = "macos")]
+            open_settings(&profile());
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            show_window(&mut settings, target, &settings_route);
+        }
 
         // Evaluated last, after everything above (including a viewer
         // window possibly just opened this very tick by the `UserEvent`
@@ -573,20 +471,36 @@ fn main() -> anyhow::Result<()> {
     });
 }
 
+/// Shows the Continuity window on Linux and Windows — made now if it isn't
+/// ready yet (see `SETTINGS_PREPARE_DELAY`), brought to the front if it is.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn show_window(
+    window: &mut Option<settings_window::SettingsWindow>,
+    target: &tao::event_loop::EventLoopWindowTarget<AppEvent>,
+    route: &settings_window::Route<AppEvent>,
+) {
+    match window {
+        Some(window) => window.show(),
+        None => match settings_window::SettingsWindow::open(target, route.clone(), settings_window_icon(), true) {
+            Ok(opened) => *window = Some(opened),
+            Err(e) => {
+                tracing::warn!("couldn't open the Continuity window: {e}");
+                notify(&settings_window_failed(&e));
+            }
+        },
+    }
+}
+
 fn handle_sync_event(
     event: SyncEvent,
     send_submenu: &Submenu,
-    forget_submenu: &Submenu,
-    nearby_submenu: &Submenu,
     pause_item: &MenuItem,
     connected_peers: &Arc<Mutex<HashMap<String, String>>>,
     send_target_map: &Arc<Mutex<HashMap<MenuId, SendTarget>>>,
-    forget_target_map: &Arc<Mutex<HashMap<MenuId, String>>>,
-    nearby_peers: &Arc<Mutex<HashMap<String, String>>>,
-    nearby_target_map: &Arc<Mutex<HashMap<MenuId, String>>>,
     is_paused: &Arc<Mutex<bool>>,
     commands: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
     tray_icon: &tray_icon::TrayIcon,
+    control: &control::ControlState,
 ) {
     match event {
         SyncEvent::Listening { port } => tracing::info!("listening on port {port}"),
@@ -675,22 +589,15 @@ fn handle_sync_event(
             notify(&format!("Pairing with '{peer_name}' was declined"));
         }
         SyncEvent::Connected { peer } => {
-            // No longer "nearby, not yet connected" once it's connected.
-            nearby_peers.lock().unwrap().remove(&peer.id);
-            rebuild_nearby_menu(nearby_submenu, &nearby_peers.lock().unwrap(), nearby_target_map);
             connected_peers.lock().unwrap().insert(peer.id, peer.name);
             rebuild_send_menu(send_submenu, &connected_peers.lock().unwrap(), send_target_map);
-            rebuild_forget_menu(forget_submenu, &connected_peers.lock().unwrap(), forget_target_map);
             share::sync_menu_entries(&connected_peers.lock().unwrap());
         }
-        SyncEvent::PeerDiscovered { device } => {
-            nearby_peers.lock().unwrap().insert(device.id, device.name);
-            rebuild_nearby_menu(nearby_submenu, &nearby_peers.lock().unwrap(), nearby_target_map);
-        }
+        // Listed under Nearby in the Continuity window (see control.rs).
+        SyncEvent::PeerDiscovered { .. } => {}
         SyncEvent::Disconnected { peer_id, peer_name } => {
             connected_peers.lock().unwrap().remove(&peer_id);
             rebuild_send_menu(send_submenu, &connected_peers.lock().unwrap(), send_target_map);
-            rebuild_forget_menu(forget_submenu, &connected_peers.lock().unwrap(), forget_target_map);
             share::sync_menu_entries(&connected_peers.lock().unwrap());
             tracing::info!("'{peer_name}' disconnected");
         }
@@ -698,26 +605,34 @@ fn handle_sync_event(
             tracing::info!("clipboard synced from '{from_name}'");
         }
         SyncEvent::ClipboardBroadcast { .. } => {}
-        SyncEvent::FileReceiving { from_name, file_name, .. } => {
-            notify(&format!("Receiving '{file_name}' from '{from_name}'..."));
+        SyncEvent::FileReceiving { from_name, file_name, size_bytes, .. } => {
+            notify(&format!("Receiving '{file_name}' ({}) from '{from_name}'", format_size(size_bytes)));
         }
         SyncEvent::FileSending { to_name, file_name, .. } => {
             notify(&format!("Sending '{file_name}' to '{to_name}'..."));
         }
-        // No persistent progress-bar surface in the tray (just a menu and
-        // one-shot notifications) — a notification per throttled tick
-        // would just be noise on top of the start/end ones already shown
-        // below. Logged instead, same as `PeerActivity`.
+        // The Continuity window shows progress (see control.rs's
+        // transfers); a notification per throttled tick would just be
+        // noise on top of the start/end ones shown here.
         SyncEvent::FileTransferProgress { transfer_id, bytes_transferred, total_bytes, .. } => {
             tracing::debug!("file transfer {transfer_id}: {bytes_transferred}/{total_bytes} bytes");
         }
-        SyncEvent::FileReceived { file_name, path, .. } => notify_file_received(&file_name, &path),
+        // Who it came from is only in `FileReceiving`, which `control`
+        // keeps by transfer id (it's already seen this event too, so the
+        // transfer is listed as done by now).
+        SyncEvent::FileReceived { transfer_id, file_name, path } => {
+            let from = control.transfer(&transfer_id).map(|transfer| transfer.peer_name);
+            notify_file_received(&file_name, from.as_deref(), &path);
+        }
         SyncEvent::FileSent { file_name, to_name, .. } => {
             notify(&format!("Sent '{file_name}' to '{to_name}'"));
         }
         SyncEvent::FileTransferFailed { reason, .. } => {
             notify(&format!("File transfer failed: {reason}"));
         }
+        // Not announced: it usually picks up again by itself within
+        // seconds, and the Continuity window shows it waiting. If it
+        // can't, `FileTransferFailed` is.
         SyncEvent::FileTransferStalled { transfer_id, reason } => {
             tracing::info!("file transfer {transfer_id} stalled: {reason}");
         }
@@ -725,7 +640,6 @@ fn handle_sync_event(
         SyncEvent::WasReset => {
             connected_peers.lock().unwrap().clear();
             rebuild_send_menu(send_submenu, &connected_peers.lock().unwrap(), send_target_map);
-            rebuild_forget_menu(forget_submenu, &connected_peers.lock().unwrap(), forget_target_map);
             share::sync_menu_entries(&connected_peers.lock().unwrap());
             notify("All paired devices have been forgotten");
         }
@@ -737,7 +651,6 @@ fn handle_sync_event(
             // again from scratch.
             connected_peers.lock().unwrap().remove(&peer_id);
             rebuild_send_menu(send_submenu, &connected_peers.lock().unwrap(), send_target_map);
-            rebuild_forget_menu(forget_submenu, &connected_peers.lock().unwrap(), forget_target_map);
             share::sync_menu_entries(&connected_peers.lock().unwrap());
             notify(&format!("Forgot '{peer_name}'"));
         }
@@ -752,14 +665,13 @@ fn handle_sync_event(
             tracing::debug!("reconnect to '{peer_id}' failed: no known address");
         }
         SyncEvent::NowPlayingChanged { peer_name, info, .. } => {
-            // No UI surface for this on desktop yet (tray-only, no window)
-            // — logged for now. The interesting direction is mobile
-            // displaying *this* device's now-playing info, not the tray
-            // app displaying a peer's.
+            // No UI surface for this on desktop yet — logged for now. The
+            // interesting direction is mobile displaying *this* device's
+            // now-playing info, not the desktop displaying a peer's.
             tracing::debug!("'{peer_name}' now playing: {info:?}");
         }
-        // No tray UI surface for this yet (see task #44 — Android-only so
-        // far); fires once per connection per ping interval (30s), too
+        // No desktop UI surface for this yet (see task #44 — Android-only
+        // so far); fires once per connection per ping interval (30s), too
         // frequent to be worth a debug log line on its own.
         SyncEvent::PeerActivity { .. } => {}
         SyncEvent::RemoteControlRequested { peer_id, peer_name, .. } => {
@@ -867,7 +779,7 @@ fn handle_sync_event(
             let text = match outcome {
                 ScreenLockOutcome::Done => format!("'{peer_name}' {verb}ed this computer"),
                 ScreenLockOutcome::NotAllowed => format!(
-                    "'{peer_name}' tried to unlock this computer, but remote unlock isn't turned on for it. To allow it, use Allow Remote Unlock in the Continuity menu."
+                    "'{peer_name}' tried to unlock this computer, but remote unlock isn't turned on for it. To allow it, open Continuity, choose '{peer_name}' and turn on Unlock this computer."
                 ),
                 ScreenLockOutcome::Unsupported => format!("'{peer_name}' asked to {verb} this computer, which isn't supported here"),
                 ScreenLockOutcome::Failed { reason } => format!("Couldn't {verb} this computer for '{peer_name}': {reason}"),
@@ -878,86 +790,28 @@ fn handle_sync_event(
         SyncEvent::ScreenLockResult { peer_name, action, outcome, .. } => {
             tracing::info!("screen {action:?} on '{peer_name}': {outcome:?}");
         }
-        // Tracked by the Linux "Allow Remote Unlock" menu in `main()`.
+        // Shown by the Continuity window, which reads the permission from
+        // the trust store (see control.rs).
         SyncEvent::UnlockPermissionChanged { .. } => {}
     }
 }
 
-/// How one engine event changes the Linux "Allow Remote Unlock" menu, if
-/// at all — see `unlock_menu_update`.
-#[cfg(target_os = "linux")]
-enum UnlockMenuUpdate {
-    Permission { peer_id: String, peer_name: String, allowed: bool },
-    /// The device was forgotten, which drops its permission with it (see
-    /// `TrustStore::revoke`).
-    Forget { peer_id: String },
-    /// Reset — every permission is gone (see `TrustStore::clear`).
-    Clear,
-    /// Only who's connected changed.
-    Refresh,
-}
-
-#[cfg(target_os = "linux")]
-impl UnlockMenuUpdate {
-    fn apply(self, permissions: &mut HashMap<String, (String, bool)>) {
-        match self {
-            UnlockMenuUpdate::Permission { peer_id, peer_name, allowed } => {
-                permissions.insert(peer_id, (peer_name, allowed));
-            }
-            UnlockMenuUpdate::Forget { peer_id } => {
-                permissions.remove(&peer_id);
-            }
-            UnlockMenuUpdate::Clear => permissions.clear(),
-            UnlockMenuUpdate::Refresh => {}
-        }
+/// A size the way people read it — "1.3 GB", "820 KB" — in the same
+/// decimal units the Continuity window and the engine's free-space message
+/// use.
+fn format_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["bytes", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1000.0 && unit < UNITS.len() - 1 {
+        value /= 1000.0;
+        unit += 1;
     }
-}
-
-#[cfg(target_os = "linux")]
-fn unlock_menu_update(event: &SyncEvent) -> Option<UnlockMenuUpdate> {
-    match event {
-        SyncEvent::UnlockPermissionChanged { peer_id, peer_name, allowed } => {
-            Some(UnlockMenuUpdate::Permission { peer_id: peer_id.clone(), peer_name: peer_name.clone(), allowed: *allowed })
-        }
-        SyncEvent::WasRevoked { peer_id, .. } => Some(UnlockMenuUpdate::Forget { peer_id: peer_id.clone() }),
-        SyncEvent::WasReset => Some(UnlockMenuUpdate::Clear),
-        SyncEvent::Connected { .. } | SyncEvent::Disconnected { .. } => Some(UnlockMenuUpdate::Refresh),
-        _ => None,
-    }
-}
-
-/// Same rebuild-from-scratch approach as `rebuild_send_menu`, but over
-/// connected devices *and* any device that's allowed while offline (see
-/// where `unlock_submenu` is created), with a checkmark per device.
-#[cfg(target_os = "linux")]
-fn rebuild_unlock_menu(
-    submenu: &Submenu,
-    connected: &HashMap<String, String>,
-    permissions: &HashMap<String, (String, bool)>,
-    target_map: &Arc<Mutex<HashMap<MenuId, String>>>,
-) {
-    while submenu.remove_at(0).is_some() {}
-    let mut map = target_map.lock().unwrap();
-    map.clear();
-
-    let mut entries: Vec<(String, String, bool)> = connected
-        .iter()
-        .map(|(id, name)| (id.clone(), name.clone(), permissions.get(id).is_some_and(|(_, allowed)| *allowed)))
-        .collect();
-    for (id, (name, allowed)) in permissions {
-        if *allowed && !connected.contains_key(id) {
-            entries.push((id.clone(), format!("{name} (offline)"), true));
-        }
-    }
-    if entries.is_empty() {
-        let _ = submenu.append(&MenuItem::new("No device connected", false, None));
-        return;
-    }
-    entries.sort_by(|a, b| a.1.cmp(&b.1));
-    for (id, label, allowed) in entries {
-        let item = CheckMenuItem::new(label, true, allowed, None);
-        map.insert(item.id().clone(), id);
-        let _ = submenu.append(&item);
+    match unit {
+        0 if bytes == 1 => "1 byte".to_string(),
+        0 => format!("{bytes} bytes"),
+        _ if value < 10.0 => format!("{value:.1} {}", UNITS[unit]),
+        _ => format!("{value:.0} {}", UNITS[unit]),
     }
 }
 
@@ -1008,93 +862,6 @@ fn send_file_to(
     };
     for peer_id in peers {
         let _ = commands.send(EngineCommand::SendFile { peer_crypto_id: peer_id, path: path.to_string() });
-    }
-}
-
-/// Same rebuild-from-scratch approach as `rebuild_send_menu`, same
-/// currently-connected-only scope — no broadcast option, since forgetting
-/// is inherently per-device and clicking one always shows its own
-/// confirmation dialog before `EngineCommand::RevokeDevice` is sent.
-fn rebuild_forget_menu(
-    submenu: &Submenu,
-    connected: &HashMap<String, String>,
-    target_map: &Arc<Mutex<HashMap<MenuId, String>>>,
-) {
-    while submenu.remove_at(0).is_some() {}
-    let mut map = target_map.lock().unwrap();
-    map.clear();
-
-    if connected.is_empty() {
-        let _ = submenu.append(&MenuItem::new("No device connected", false, None));
-        return;
-    }
-
-    let mut peers: Vec<(&String, &String)> = connected.iter().collect();
-    peers.sort_by(|a, b| a.1.cmp(b.1));
-    for (id, name) in &peers {
-        let item = MenuItem::new(format!("Forget {name}..."), true, None);
-        map.insert(item.id().clone(), (*id).clone());
-        let _ = submenu.append(&item);
-    }
-}
-
-/// Same rebuild-from-scratch approach as `rebuild_send_menu` — simpler
-/// content (just "Connect to X", no broadcast option) since this is about
-/// initiating a first connection, not fanning an action out to several
-/// already-connected ones.
-fn rebuild_nearby_menu(
-    submenu: &Submenu,
-    nearby: &HashMap<String, String>,
-    target_map: &Arc<Mutex<HashMap<MenuId, String>>>,
-) {
-    while submenu.remove_at(0).is_some() {}
-    let mut map = target_map.lock().unwrap();
-    map.clear();
-
-    if nearby.is_empty() {
-        let _ = submenu.append(&MenuItem::new("No new devices nearby", false, None));
-        return;
-    }
-
-    let mut peers: Vec<(&String, &String)> = nearby.iter().collect();
-    peers.sort_by(|a, b| a.1.cmp(b.1));
-    for (id, name) in &peers {
-        let item = MenuItem::new(format!("Connect to {name}..."), true, None);
-        map.insert(item.id().clone(), (*id).clone());
-        let _ = submenu.append(&item);
-    }
-}
-
-/// Same rebuild-from-scratch approach as `rebuild_send_menu`, same
-/// currently-connected-only scope, but desktops only — a phone can be the
-/// controlling side, never the controlled one. A peer whose platform isn't
-/// known yet (no `Connected` event seen) is left in rather than hidden.
-/// Phones running 0.1.6-beta.3 or older announce themselves as Linux (see
-/// `detect_platform` in the engine), so they still show up until updated.
-#[cfg(feature = "remote-control")]
-fn rebuild_remote_control_menu(
-    submenu: &Submenu,
-    connected: &HashMap<String, String>,
-    platforms: &HashMap<String, Platform>,
-    target_map: &Arc<Mutex<HashMap<MenuId, String>>>,
-) {
-    while submenu.remove_at(0).is_some() {}
-    let mut map = target_map.lock().unwrap();
-    map.clear();
-
-    let mut peers: Vec<(&String, &String)> = connected
-        .iter()
-        .filter(|(id, _)| !matches!(platforms.get(*id), Some(Platform::Android | Platform::Ios)))
-        .collect();
-    if peers.is_empty() {
-        let _ = submenu.append(&MenuItem::new("No computer connected", false, None));
-        return;
-    }
-    peers.sort_by(|a, b| a.1.cmp(b.1));
-    for (id, name) in &peers {
-        let item = MenuItem::new(format!("Remote Control {name}..."), true, None);
-        map.insert(item.id().clone(), (*id).clone());
-        let _ = submenu.append(&item);
     }
 }
 
@@ -1198,67 +965,8 @@ fn check_viewer_watchdog(
     }
 }
 
-/// Asks a yes/no question and runs `on_yes` if the answer is yes.
-///
-/// On Linux this goes through a critical, non-expiring desktop
-/// notification with Yes/No actions rather than a blocking
-/// `rfd::MessageDialog` — confirmed for real on a live GNOME 50/Wayland
-/// session that the plain dialog's `.show()` call can simply never
-/// return at all (GNOME/Mutter's Wayland focus-stealing prevention can
-/// refuse to present a brand-new top-level window), which doesn't just
-/// break that one confirmation: since every menu click and engine event
-/// is handled on the same single thread, one permanently-blocked dialog
-/// call freezes the *entire* tray app, including unrelated things like
-/// Quit. macOS/Windows keep the plain, synchronous dialog, which testing
-/// this session confirmed works fine there.
-fn confirm(
-    title: &str,
-    description: &str,
-    commands: tokio::sync::mpsc::UnboundedSender<EngineCommand>,
-    on_yes: impl FnOnce(&tokio::sync::mpsc::UnboundedSender<EngineCommand>) + Send + 'static,
-) {
-    #[cfg(target_os = "linux")]
-    {
-        match notify_rust::Notification::new()
-            .summary(title)
-            .body(description)
-            .action("accept", "Yes")
-            .action("decline", "No")
-            .urgency(notify_rust::Urgency::Critical)
-            .timeout(notify_rust::Timeout::Never)
-            .show()
-        {
-            Ok(handle) => {
-                std::thread::spawn(move || {
-                    let mut accepted = false;
-                    handle.wait_for_action(|action| {
-                        accepted = action == "accept" || action == "default";
-                    });
-                    if accepted {
-                        on_yes(&commands);
-                    }
-                });
-            }
-            Err(e) => {
-                tracing::warn!("couldn't show the '{title}' confirmation notification, falling back to a dialog: {e}");
-                let result = rfd::MessageDialog::new().set_title(title).set_description(description).set_buttons(rfd::MessageButtons::YesNo).show();
-                if matches!(result, rfd::MessageDialogResult::Yes) {
-                    on_yes(&commands);
-                }
-            }
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let result = rfd::MessageDialog::new().set_title(title).set_description(description).set_buttons(rfd::MessageButtons::YesNo).show();
-        if matches!(result, rfd::MessageDialogResult::Yes) {
-            on_yes(&commands);
-        }
-    }
-}
-
-/// Opens the settings window: the SwiftUI app bundled inside Continuity.app
-/// (`Contents/Helpers/Continuity Settings.app`, built from
+/// Opens the Continuity window on macOS: the SwiftUI app bundled inside
+/// Continuity.app (`Contents/Helpers/Continuity Settings.app`, built from
 /// apps/macos/ContinuitySettings), which talks to this process over the
 /// local control socket. `CONTINUITY_SETTINGS_APP` points a development
 /// build (no bundle around it) at a locally built copy.
@@ -1267,7 +975,7 @@ fn open_settings(profile: &str) {
     let bundled = std::env::current_exe().ok().and_then(|exe| Some(exe.parent()?.parent()?.join("Helpers/Continuity Settings.app")));
     let app = std::env::var_os("CONTINUITY_SETTINGS_APP").map(PathBuf::from).or(bundled).filter(|app| app.exists());
     let Some(app) = app else {
-        notify("The settings window isn't included in this build of Continuity.");
+        notify("The Continuity window isn't included in this build of Continuity.");
         return;
     };
     let mut open = std::process::Command::new("/usr/bin/open");
@@ -1278,8 +986,8 @@ fn open_settings(profile: &str) {
     std::thread::spawn(move || match open.status() {
         Ok(status) if status.success() => {}
         // LaunchServices refuses an app whose minimum macOS is newer.
-        Ok(_) => notify("Couldn't open Continuity's settings window — it needs macOS 12 or newer."),
-        Err(e) => tracing::warn!("couldn't run open for the settings window: {e}"),
+        Ok(_) => notify("Couldn't open the Continuity window — it needs macOS 12 or newer."),
+        Err(e) => tracing::warn!("couldn't run open for the Continuity window: {e}"),
     });
 }
 
@@ -1288,29 +996,142 @@ fn settings_window_icon() -> Option<tao::window::Icon> {
     tao::window::Icon::from_rgba(render_icon_rgba(64), 64, 64).ok()
 }
 
-/// What to tell someone whose settings window didn't open.
+/// What to tell someone whose Continuity window didn't open.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 fn settings_window_failed(error: &anyhow::Error) -> String {
     if cfg!(target_os = "windows") {
         format!(
-            "Couldn't open the settings window ({error}). It needs the Microsoft Edge WebView2 Runtime, which comes with Windows 11 — on Windows 10, install it from https://go.microsoft.com/fwlink/p/?LinkId=2124703"
+            "Couldn't open the Continuity window ({error}). It needs the Microsoft Edge WebView2 Runtime, which comes with Windows 11 — on Windows 10, install it from https://go.microsoft.com/fwlink/p/?LinkId=2124703"
         )
     } else {
-        format!("Couldn't open the settings window ({error}). It needs WebKitGTK (libwebkit2gtk-4.1).")
+        format!("Couldn't open the Continuity window ({error}). It needs WebKitGTK (libwebkit2gtk-4.1).")
     }
+}
+
+/// Tells the system's notifications who's sending them, before the first
+/// one goes out.
+///
+/// macOS: notify-rust's notifications come from mac-notification-sys,
+/// which posts every one as whatever app it was told to with
+/// `set_application` — and, when nobody told it, looks one up with an
+/// AppleScript that comes back with Finder, so every notification was
+/// Finder's: Finder's name and icon, and Finder's notification settings.
+/// Inside Continuity.app, that's Continuity's own bundle identifier.
+/// (Outside one — a development build — there's no Continuity app for
+/// macOS to know, and it stays as it was.)
+///
+/// Windows: a toast is filed under an AppUserModelID, and Windows drops one
+/// silently unless that id belongs to something it knows — notify-rust
+/// falls back to PowerShell's, which is why they used to say "Windows
+/// PowerShell". Continuity's is registered for this user here (a registry
+/// key with its name and icon, which is all Windows needs for an app that
+/// isn't packaged), every notification is filed under it (see
+/// `notification`), and the installer's Start-menu shortcut carries the
+/// same id.
+fn init_notifications() {
+    #[cfg(target_os = "macos")]
+    {
+        let in_bundle = std::env::current_exe().ok().is_some_and(|exe| exe.to_string_lossy().contains(".app/Contents/MacOS/"));
+        if in_bundle {
+            if let Err(e) = notify_rust::set_application(APP_ID) {
+                tracing::warn!("couldn't post notifications as {APP_ID}: {e}");
+            }
+        }
+    }
+    #[cfg(target_os = "windows")]
+    register_app_user_model_id();
+}
+
+/// See `init_notifications`. Registered on every start rather than only at
+/// install — it's two registry values and a small icon file, and this way a
+/// copy that was never installed (or whose key was cleaned away) still gets
+/// its notifications shown.
+#[cfg(target_os = "windows")]
+fn register_app_user_model_id() {
+    use windows::core::HSTRING;
+    use windows::Win32::System::Registry::{RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ};
+    use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
+
+    // This process's windows (the Continuity window, a remote-control
+    // viewer) then group with the Start-menu shortcut on the taskbar too.
+    if let Err(e) = unsafe { SetCurrentProcessExplicitAppUserModelID(&HSTRING::from(APP_ID)) } {
+        tracing::debug!("couldn't set this process's AppUserModelID: {e}");
+    }
+    // The icon toasts show, written next to the trust store (and so removed
+    // with it at uninstall): the tray icon's mark — the executable has no
+    // icon resource to point at instead (see installers/windows/continuity.iss).
+    let icon = directories::ProjectDirs::from("app", "continuity", "continuity")
+        .map(|dirs| dirs.config_dir().join("notification-icon.png"))
+        .filter(|path| {
+            let written = path
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| std::fs::write(path, encode_png(&render_icon_rgba(128), 128, 128)));
+            if let Err(e) = &written {
+                tracing::debug!("couldn't write {}: {e}", path.display());
+            }
+            written.is_ok()
+        });
+    let key = HSTRING::from(format!(r"Software\Classes\AppUserModelId\{APP_ID}"));
+    let mut values = vec![("DisplayName", "Continuity".to_string())];
+    if let Some(icon) = icon {
+        values.push(("IconUri", icon.display().to_string()));
+    }
+    for (name, value) in values {
+        let wide: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
+        // Creates the key as well, the first time.
+        let result = unsafe {
+            RegSetKeyValueW(HKEY_CURRENT_USER, &key, &HSTRING::from(name), REG_SZ.0, Some(wide.as_ptr().cast()), (wide.len() * 2) as u32)
+        };
+        if let Err(e) = result.ok() {
+            tracing::warn!("couldn't register Continuity for notifications ({name}): {e}");
+        }
+    }
+}
+
+/// A new notification, filed under Continuity's own AppUserModelID on
+/// Windows (see `init_notifications`).
+fn notification() -> notify_rust::Notification {
+    #[allow(unused_mut)]
+    let mut notification = notify_rust::Notification::new();
+    #[cfg(target_os = "windows")]
+    notification.app_id(APP_ID);
+    notification
 }
 
 /// Shows a native notification when possible. Unbundled dev binaries often
 /// can't (macOS requires a proper .app bundle with an Info.plist for
 /// reliable notification delivery), so this always logs too — the tray
 /// menu/dialogs are the guaranteed-visible UI; notifications are a bonus.
+///
+/// On macOS this *schedules* the notification for right now instead of
+/// `show()`ing it. notify-rust's `show()` there doesn't post anything
+/// itself — it hands back a handle, and the notification goes out when
+/// that's waited on (`wait_for_action`, which blocks until it's answered)
+/// or dropped, and the drop then waits up to two seconds for macOS to
+/// confirm delivery, turning the main run loop over by hand to get it when
+/// that's the calling thread — this is often called from the event loop.
+/// A scheduled notification is handed to macOS and returns. Even that runs
+/// on a thread of its own: the very first notification can stop to look up
+/// which app to post as (see `init_notifications`), and nothing here may
+/// hold up the event loop.
 fn notify(body: &str) {
     tracing::info!("{body}");
-    if let Err(e) = notify_rust::Notification::new()
-        .summary("Continuity")
-        .body(body)
-        .show()
+    #[cfg(target_os = "macos")]
     {
+        let notification = notification().summary("Continuity").body(body).finalize();
+        std::thread::spawn(move || {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or_default();
+            // Refused as "in the past" if the second ticks over before
+            // mac-notification-sys checks, so a second try a moment later.
+            let scheduled = notification.schedule_raw(now).or_else(|_| notification.schedule_raw(now + 1.0));
+            if let Err(e) = scheduled {
+                tracing::debug!("notification not shown (expected for an unbundled binary): {e}");
+            }
+        });
+    }
+    #[cfg(not(target_os = "macos"))]
+    if let Err(e) = notification().summary("Continuity").body(body).show() {
         tracing::debug!("notification not shown (expected for an unbundled binary): {e}");
     }
 }
@@ -1320,17 +1141,16 @@ fn notify(body: &str) {
 /// `wait_for_action` blocks until the user interacts (or the notification
 /// times out/closes), so it runs on its own thread rather than the tao
 /// event loop's thread — blocking that would freeze the whole tray app
-/// until the notification was dismissed.
-fn notify_file_received(file_name: &str, path: &str) {
+/// until the notification was dismissed. (On macOS that wait is also what
+/// posts it — see `notify`.)
+fn notify_file_received(file_name: &str, from: Option<&str>, path: &str) {
     tracing::info!("received '{file_name}' at {path}");
+    let body = match from {
+        Some(from) => format!("Received '{file_name}' from '{from}'"),
+        None => format!("Received '{file_name}'"),
+    };
     let path = path.to_string();
-    match notify_rust::Notification::new()
-        .summary("Continuity")
-        .body(&format!("Received '{file_name}'"))
-        .action("default", "Open")
-        .action("show-folder", "Show in Folder")
-        .show()
-    {
+    match notification().summary("Continuity").body(&body).action("default", "Open").action("show-folder", "Show in Folder").show() {
         Ok(handle) => {
             std::thread::spawn(move || {
                 handle.wait_for_action(|action| match action {
@@ -1392,6 +1212,7 @@ fn start_engine_thread(
     device_name: String,
     proxy: tao::event_loop::EventLoopProxy<AppEvent>,
     frames: FrameSink,
+    received_files_dir: PathBuf,
 ) -> anyhow::Result<(tokio::sync::mpsc::UnboundedSender<EngineCommand>, String)> {
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
 
@@ -1460,7 +1281,7 @@ fn start_engine_thread(
                     media,
                     remote_control,
                     screen_lock,
-                    received_files_dir: received_files_dir(&profile),
+                    received_files_dir,
                 };
                 continuity_daemon::start(config).await.map(|engine| (engine, device_id))
             };
@@ -1560,6 +1381,97 @@ fn received_files_dir(profile: &str) -> PathBuf {
     } else {
         base.join(format!("Continuity-{profile}"))
     }
+}
+
+/// Where received files go this run: the folder chosen in the Continuity
+/// window, if it can still be used — or, if it can't (a USB drive that
+/// isn't plugged in, a network share that's gone), the default, saying so
+/// in the log. The choice itself stays saved, so it applies again once the
+/// folder is back.
+fn received_files_dir_for_this_run(profile: &str, settings: &control::AppSettings) -> PathBuf {
+    let default = received_files_dir(profile);
+    let Some(chosen) = &settings.received_files_dir else {
+        return default;
+    };
+    match control::check_usable_dir(chosen) {
+        Ok(()) => chosen.clone(),
+        Err(e) => {
+            tracing::warn!(
+                "received files can't go in {} ({e}) — saving them in {} instead until it's back",
+                chosen.display(),
+                default.display()
+            );
+            default
+        }
+    }
+}
+
+/// A PNG of an RGBA image — the notification icon Windows shows for
+/// Continuity (see `register_app_user_model_id`). Uncompressed (deflate's
+/// "stored" blocks): a small icon written once a run doesn't need an image
+/// crate's encoder, and every PNG reader accepts it.
+#[cfg(any(target_os = "windows", test))]
+fn encode_png(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
+    fn chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+        png.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        let start = png.len();
+        png.extend_from_slice(kind);
+        png.extend_from_slice(data);
+        let crc = crc32(&png[start..]);
+        png.extend_from_slice(&crc.to_be_bytes());
+    }
+
+    let mut header = Vec::with_capacity(13);
+    header.extend_from_slice(&width.to_be_bytes());
+    header.extend_from_slice(&height.to_be_bytes());
+    // 8 bits per channel, RGBA, deflate, no filter method, no interlacing.
+    header.extend_from_slice(&[8, 6, 0, 0, 0]);
+
+    // Each row starts with its filter type: 0, none.
+    let row = width as usize * 4;
+    let mut raw = Vec::with_capacity((row + 1) * height as usize);
+    for line in rgba.chunks(row).take(height as usize) {
+        raw.push(0);
+        raw.extend_from_slice(line);
+    }
+    let mut zlib = vec![0x78, 0x01];
+    let blocks: Vec<&[u8]> = raw.chunks(u16::MAX as usize).collect();
+    for (i, block) in blocks.iter().enumerate() {
+        zlib.push(u8::from(i == blocks.len() - 1));
+        let len = block.len() as u16;
+        zlib.extend_from_slice(&len.to_le_bytes());
+        zlib.extend_from_slice(&(!len).to_le_bytes());
+        zlib.extend_from_slice(block);
+    }
+    zlib.extend_from_slice(&adler32(&raw).to_be_bytes());
+
+    let mut png = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+    chunk(&mut png, b"IHDR", &header);
+    chunk(&mut png, b"IDAT", &zlib);
+    chunk(&mut png, b"IEND", &[]);
+    png
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xedb8_8320 } else { crc >> 1 };
+        }
+    }
+    !crc
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn adler32(data: &[u8]) -> u32 {
+    let (mut a, mut b) = (1u32, 0u32);
+    for &byte in data {
+        a = (a + byte as u32) % 65521;
+        b = (b + a) % 65521;
+    }
+    (b << 16) | a
 }
 
 /// Same mark as `assets/logo.svg` (and the Android VectorDrawables),
@@ -1732,5 +1644,98 @@ mod icon_preview {
         }
         std::fs::write(&path, out).unwrap();
         println!("wrote {path}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sizes_read_the_way_people_say_them() {
+        assert_eq!(format_size(0), "0 bytes");
+        assert_eq!(format_size(1), "1 byte");
+        assert_eq!(format_size(999), "999 bytes");
+        assert_eq!(format_size(820_000), "820 KB");
+        assert_eq!(format_size(1_300_000_000), "1.3 GB");
+        assert_eq!(format_size(5_000_000), "5.0 MB");
+    }
+
+    #[test]
+    fn a_chosen_received_files_folder_is_used_only_while_it_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let default = received_files_dir("default");
+        assert_eq!(received_files_dir_for_this_run("default", &control::AppSettings::default()), default, "nothing chosen");
+
+        let chosen = dir.path().join("Incoming");
+        let settings = control::AppSettings { received_files_dir: Some(chosen.clone()), ..Default::default() };
+        assert_eq!(received_files_dir_for_this_run("default", &settings), chosen);
+        assert!(chosen.is_dir(), "made if it was missing");
+
+        // Somewhere no folder can be made: under a file.
+        let file = dir.path().join("a-file");
+        std::fs::write(&file, b"x").unwrap();
+        let gone = control::AppSettings { received_files_dir: Some(file.join("Incoming")), ..Default::default() };
+        assert_eq!(received_files_dir_for_this_run("default", &gone), default, "falls back to the default");
+    }
+
+    #[test]
+    fn checksums_match_their_reference_values() {
+        assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
+        assert_eq!(crc32(b"IEND"), 0xae42_6082, "the CRC every PNG ends with");
+        assert_eq!(adler32(b"Wikipedia"), 0x11e6_0398);
+    }
+
+    /// Walks the PNG's chunks, checks each CRC, and undoes the stored
+    /// deflate blocks by hand — there's no PNG decoder in this build to
+    /// hand it to.
+    #[test]
+    fn the_notification_icon_is_a_well_formed_png() {
+        for size in [2u32, 128] {
+            let rgba: Vec<u8> = (0..size * size * 4).map(|i| (i % 251) as u8).collect();
+            let png = encode_png(&rgba, size, size);
+            assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+            let mut chunks = Vec::new();
+            let mut at = 8;
+            while at < png.len() {
+                let len = u32::from_be_bytes(png[at..at + 4].try_into().unwrap()) as usize;
+                let kind = &png[at + 4..at + 8];
+                let data = &png[at + 8..at + 8 + len];
+                let crc = u32::from_be_bytes(png[at + 8 + len..at + 12 + len].try_into().unwrap());
+                assert_eq!(crc32(&png[at + 4..at + 8 + len]), crc, "{}", String::from_utf8_lossy(kind));
+                chunks.push((kind.to_vec(), data.to_vec()));
+                at += 12 + len;
+            }
+            let kinds: Vec<&[u8]> = chunks.iter().map(|(kind, _)| kind.as_slice()).collect();
+            assert_eq!(kinds, [b"IHDR".as_slice(), b"IDAT", b"IEND"]);
+            let header = &chunks[0].1;
+            assert_eq!(&header[..8], [size.to_be_bytes(), size.to_be_bytes()].concat());
+            assert_eq!(&header[8..], [8, 6, 0, 0, 0]);
+
+            let zlib = &chunks[1].1;
+            assert_eq!(&zlib[..2], [0x78, 0x01]);
+            let mut raw = Vec::new();
+            let mut at = 2;
+            loop {
+                let last = zlib[at] & 1 == 1;
+                assert_eq!(zlib[at] >> 1, 0, "stored blocks");
+                let len = u16::from_le_bytes([zlib[at + 1], zlib[at + 2]]);
+                assert_eq!(!len, u16::from_le_bytes([zlib[at + 3], zlib[at + 4]]));
+                raw.extend_from_slice(&zlib[at + 5..at + 5 + len as usize]);
+                at += 5 + len as usize;
+                if last {
+                    break;
+                }
+            }
+            assert_eq!(u32::from_be_bytes(zlib[at..at + 4].try_into().unwrap()), adler32(&raw));
+            assert_eq!(at + 4, zlib.len());
+            let rows: Vec<&[u8]> = raw.chunks(size as usize * 4 + 1).collect();
+            assert_eq!(rows.len(), size as usize);
+            for (y, row) in rows.iter().enumerate() {
+                assert_eq!(row[0], 0, "no filter");
+                let start = y * size as usize * 4;
+                assert_eq!(&row[1..], &rgba[start..start + size as usize * 4]);
+            }
+        }
     }
 }

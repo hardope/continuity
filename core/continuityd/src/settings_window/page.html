@@ -1,15 +1,18 @@
 <!doctype html>
 <!--
-  Continuity's settings window on Linux and Windows (see settings_window.rs):
-  the same pages as the macOS app, in the system webview. __PLATFORM__ is
-  replaced with "linux" or "windows" before loading, which picks the look —
-  Adwaita-like on Linux, Fluent-like on Windows — and the wording.
+  The Continuity window on Linux and Windows — the app's main window (see
+  settings_window.rs): the same pages as the macOS app, in the system
+  webview. __PLATFORM__ is replaced with "linux" or "windows" before
+  loading, which picks the look — Adwaita-like on Linux, Fluent-like on
+  Windows — and the wording.
 
   Requests go to Rust with window.ipc.postMessage(JSON) — {id, op, ...} —
   and everything comes back through window.continuity.receive(...): a
   status ({ok, status}) whenever anything changes, and an answer ({id, ok,
   message}) to each request. Nothing is kept here between statuses: the
   status is the truth, and a change shown early is put back if it's refused.
+  (The one exception is how fast each transfer is going, worked out here
+  from one status to the next.)
 -->
 <html lang="en" data-platform="__PLATFORM__">
 <head>
@@ -129,11 +132,17 @@ svg { display: block; flex: none; }
   border-right: 1px solid var(--border);
 }
 .group-title {
-  margin: 16px 10px 4px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 24px;
+  margin: 16px 4px 4px 10px;
   font-size: 12px;
   font-weight: 600;
   color: var(--muted);
 }
+.group-title .btn { width: 24px; height: 24px; padding: 0; border: 0; background: none; color: var(--muted); }
+.group-title .btn:hover { background: var(--hover); color: var(--text); }
 .item {
   display: flex;
   align-items: center;
@@ -183,6 +192,13 @@ svg { display: block; flex: none; }
 .row .detail { display: block; font-size: 12.5px; color: var(--muted); margin-top: 1px; }
 .row .value { color: var(--muted); text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 60%; }
 .row .glyph { color: var(--accent); }
+.row .buttons { display: flex; flex: none; gap: 8px; }
+.row .detail.warn { color: var(--warn); }
+.row .detail.danger { color: var(--danger); }
+.row .title.file { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bar { display: block; height: 4px; margin-top: 8px; border-radius: 2px; background: var(--switch-off); overflow: hidden; }
+.bar > span { display: block; height: 100%; border-radius: inherit; background: var(--accent); transition: width 0.25s; }
+.bar.stalled > span { background: var(--warn); }
 .footer { margin: 7px 4px 0; font-size: 12.5px; color: var(--muted); }
 .footer p { margin: 0 0 4px; }
 
@@ -352,6 +368,10 @@ const ICONS = {
   lock: '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>',
   shield: '<path d="M12 3 4.5 6v5.5c0 4.7 3.2 8.3 7.5 9.5 4.3-1.2 7.5-4.8 7.5-9.5V6z"/>',
   close: '<path d="M6 6l12 12M18 6 6 18"/>',
+  refresh: '<path d="M20 11a8 8 0 1 0-2.34 5.66"/><path d="M20 4.5V11h-6.5"/>',
+  upload: '<path d="M12 15.5V4M7.5 8.5 12 4l4.5 4.5"/><path d="M4 15v3.5A1.5 1.5 0 0 0 5.5 20h13a1.5 1.5 0 0 0 1.5-1.5V15"/>',
+  download: '<path d="M12 4v11.5M7.5 11l4.5 4.5 4.5-4.5"/><path d="M4 15v3.5A1.5 1.5 0 0 0 5.5 20h13a1.5 1.5 0 0 0 1.5-1.5V15"/>',
+  transfers: '<path d="M7 4v15M3.5 15.5 7 19l3.5-3.5"/><path d="M17 20V5M13.5 8.5 17 5l3.5 3.5"/>',
 };
 
 function icon(name, size = 20, width = 1.8) {
@@ -372,6 +392,8 @@ const LOGO = `<svg width="60" height="60" viewBox="0 0 100 100" aria-hidden="tru
   <circle cx="78.19" cy="39.74" r="8.5" fill="#a855f7"/>
 </svg>`;
 
+// The platforms that can be controlled (Contract B's "Control" button).
+const COMPUTERS = ["mac_os", "windows", "linux"];
 const PLATFORMS = {
   mac_os: { name: "Mac", icon: "laptop" },
   windows: { name: "Windows PC", icon: "desktop" },
@@ -392,6 +414,9 @@ const state = {
   pairing: new Set(),
   dialog: null,
   infoOpen: false,
+  // Transfer id → { bytes, time, rate }: the last sample of each transfer
+  // under way, and how fast it's going (bytes a second, smoothed).
+  rates: new Map(),
 };
 
 function esc(text) {
@@ -408,6 +433,7 @@ window.continuity = {
   receive(message) {
     if (message.status) {
       state.status = message.status;
+      measureRates(message.status);
       fixSelection();
       render();
       return;
@@ -454,6 +480,28 @@ function date(unix) {
   return new Date(unix * 1000).toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" });
 }
 
+// How fast each transfer under way is going, from how far it got since the
+// previous status (which come at most about four times a second while one
+// is moving). Samples closer together than that are too noisy to use.
+function measureRates(status) {
+  const now = Date.now() / 1000;
+  const rates = new Map();
+  for (const t of status.transfers || []) {
+    if (t.state !== "active") continue;
+    const last = state.rates.get(t.id);
+    if (!last || t.bytes_done < last.bytes) {
+      rates.set(t.id, { bytes: t.bytes_done, time: now, rate: null });
+    } else if (now - last.time < 0.2) {
+      rates.set(t.id, last);
+    } else {
+      const latest = (t.bytes_done - last.bytes) / (now - last.time);
+      const rate = last.rate === null ? latest : last.rate * 0.6 + latest * 0.4;
+      rates.set(t.id, { bytes: t.bytes_done, time: now, rate });
+    }
+  }
+  state.rates = rates;
+}
+
 // ── Pieces ─────────────────────────────────────────────────────────────────
 
 function section(title, rows, footer = "") {
@@ -478,25 +526,41 @@ function tip(iconName, text) {
 
 // ── Sidebar ────────────────────────────────────────────────────────────────
 
+// Pages that aren't about one device.
+const PAGES = ["this", "transfers"];
+
 function sidebarItem(kind, id, iconName, name, sub, online) {
-  const selected = state.selection.kind === kind && (kind === "this" || state.selection.id === id);
+  const selected = state.selection.kind === kind && (PAGES.includes(kind) || state.selection.id === id);
   const dot = online === null ? "" : `<span class="dot ${online ? "on" : ""}" title="${online ? "Connected" : "Not connected"}"></span>`;
   return `<button class="item ${selected ? "selected" : ""}" data-action="select" data-kind="${kind}" data-id="${esc(id)}">
     <span class="icon">${icon(iconName)}</span><span class="labels"><span class="name">${esc(name)}</span><span class="sub">${esc(sub)}</span></span>${dot}</button>`;
 }
 
+// What the Transfers entry says under its name.
+function transfersSummary(transfers) {
+  const moving = transfers.filter((t) => t.state === "active" || t.state === "stalled");
+  if (moving.length === 1) {
+    const t = moving[0];
+    if (t.state === "stalled") return "Waiting to reconnect…";
+    return `${t.direction === "sending" ? "Sending" : "Receiving"} · ${percent(t)}%`;
+  }
+  if (moving.length > 1) return `${moving.length} in progress`;
+  return transfers.length > 0 ? `${transfers.length} recent` : "None yet";
+}
+
 function renderSidebar(status) {
   let html = sidebarItem("this", "", platformInfo(status.device.platform).icon, status.device.name, `This ${HERE}`, null);
+  html += sidebarItem("transfers", "", "transfers", "Transfers", transfersSummary(status.transfers || []), null);
   html += `<div class="group-title">Paired devices</div>`;
   if (status.devices.length === 0) html += `<div class="none">None yet</div>`;
   for (const device of status.devices) {
     html += sidebarItem("device", device.id, platformInfo(device.platform).icon, device.name, device.connected ? "Connected" : "Not connected", device.connected);
   }
-  if (status.nearby.length > 0) {
-    html += `<div class="group-title">Nearby</div>`;
-    for (const device of status.nearby) {
-      html += sidebarItem("nearby", device.id, platformInfo(device.platform).icon, device.name, "Not paired", null);
-    }
+  // Always shown, with a way to look again: it's where pairing starts.
+  html += `<div class="group-title">Nearby<button class="btn" data-action="refresh-nearby" title="Look for nearby devices again" aria-label="Look for nearby devices again">${icon("refresh", 15)}</button></div>`;
+  if (status.nearby.length === 0) html += `<div class="none">None found</div>`;
+  for (const device of status.nearby) {
+    html += sidebarItem("nearby", device.id, platformInfo(device.platform).icon, device.name, "Not paired", null);
   }
   return html;
 }
@@ -508,7 +572,14 @@ function thisDevicePage(status) {
   return (
     `<div class="card">${header(platformInfo(status.device.platform).icon, "", status.device.name, `This ${kind} · Continuity ${status.device.version}`)}</div>` +
     section("", switchRow("Pause syncing", "Stops clipboard sync and new connections until you resume. Devices that are already connected stay connected.", status.paused, "pause")) +
-    section("Received files", buttonRow("Saved to", home(status.received_files_dir), `<button class="btn" data-action="show-received">${icon("folder", 16)}Open folder</button>`)) +
+    section(
+      "Received files",
+      buttonRow(
+        "Saved to",
+        home(status.received_files_dir),
+        `<span class="buttons"><button class="btn" data-action="change-received">Change…</button><button class="btn" data-action="show-received">${icon("folder", 16)}Open</button></span>`
+      )
+    ) +
     section(
       "",
       `<div class="row"><button class="btn danger" data-action="forget-all" ${status.devices.length === 0 ? "disabled" : ""}>Forget all devices…</button></div>`,
@@ -522,9 +593,18 @@ function devicePage(status, device) {
   const connection = device.connected
     ? `<button class="btn" data-action="disconnect" data-id="${esc(device.id)}">Disconnect</button>`
     : `<button class="btn" data-action="connect" data-id="${esc(device.id)}">Connect</button>`;
+  // Only a computer that's connected right now, and only from a build
+  // that can show another screen.
+  const canControl = status.can_control_others && device.connected && COMPUTERS.includes(device.platform);
+  const control = canControl
+    ? `<button class="btn" data-action="control" data-id="${esc(device.id)}">${icon("screen", 16)}Control ${esc(device.name)}…</button>`
+    : "";
   let html =
     `<div class="card">${header(info.icon, device.connected ? "ok" : "off", device.name, `${info.name} · ${device.connected ? "connected" : "not connected"}`)}
-      <div class="actions"><button class="btn primary" data-action="send-files" data-id="${esc(device.id)}" ${device.connected ? "" : "disabled"}>${icon("send", 16)}Send files…</button>${connection}</div></div>`;
+      <div class="actions"><button class="btn primary" data-action="send-files" data-id="${esc(device.id)}" ${device.connected ? "" : "disabled"}>${icon("send", 16)}Send files…</button>${control}${connection}</div></div>`;
+  if (canControl) {
+    html += `<div class="footer">${esc(`${device.name} will ask whoever's there first, unless it already trusts this ${HERE}.`)}</div>`;
+  }
   if (status.can_be_controlled) {
     const detail = device.remote_control_allowed
       ? `${device.name} can see this screen and use its keyboard and mouse whenever it asks.`
@@ -549,6 +629,55 @@ function nearbyPage(device) {
   return `<div class="card">${header(info.icon, "", device.name, `${info.name} nearby · not paired`)}
       <div class="actions"><button class="btn primary" data-action="pair" data-id="${esc(device.id)}">${icon("link", 16)}Pair…</button></div></div>
     <div class="footer">${esc(hint)}</div>`;
+}
+
+function percent(t) {
+  return t.size_bytes > 0 ? Math.min(100, Math.floor((t.bytes_done / t.size_bytes) * 100)) : 0;
+}
+
+function transferRow(t) {
+  const sending = t.direction === "sending";
+  const who = `${sending ? "To" : "From"} ${t.peer_name}`;
+  let detail;
+  let tone = "";
+  let bar = "";
+  let buttons = "";
+  if (t.state === "active") {
+    const rate = state.rates.get(t.id);
+    const speed = rate && rate.rate !== null ? ` · ${bytes(Math.round(rate.rate))}/s` : "";
+    detail = `${who} · ${bytes(t.bytes_done)} of ${bytes(t.size_bytes)}${speed}`;
+    bar = `<span class="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent(t)}"><span style="width:${percent(t)}%"></span></span>`;
+  } else if (t.state === "stalled") {
+    detail = `${who} · Waiting to reconnect…`;
+    tone = "warn";
+    bar = `<span class="bar stalled"><span style="width:${percent(t)}%"></span></span>`;
+  } else if (t.state === "done") {
+    const when = t.finished_at_unix ? ` ${ago(t.finished_at_unix)}` : "";
+    detail = `${who} · ${bytes(t.size_bytes)} · ${sending ? "Sent" : "Received"}${when}`;
+    if (!sending && t.path) {
+      buttons = `<span class="buttons"><button class="btn" data-action="open-transfer" data-id="${esc(t.id)}">Open</button>
+        <button class="btn" data-action="reveal-transfer" data-id="${esc(t.id)}">Show in folder</button></span>`;
+    }
+  } else {
+    detail = `${who} · Failed${t.reason ? `: ${t.reason}` : ""}`;
+    tone = "danger";
+  }
+  const title = t.state === "stalled" && t.reason ? ` title="${esc(t.reason)}"` : "";
+  return `<div class="row"><span class="glyph">${icon(sending ? "upload" : "download")}</span>
+    <span class="text"><span class="title file selectable">${esc(t.file_name)}</span><span class="detail ${tone}"${title}>${esc(detail)}</span>${bar}</span>${buttons}</div>`;
+}
+
+function transfersPage(status) {
+  const transfers = status.transfers || [];
+  const moving = transfers.filter((t) => t.state === "active" || t.state === "stalled");
+  const finished = transfers.filter((t) => t.state === "done" || t.state === "failed");
+  let html = `<div class="card">${header("transfers", "", "Transfers", "Files on their way to and from your devices")}</div>`;
+  if (moving.length > 0) html += section("In progress", moving.map(transferRow).join(""));
+  if (finished.length > 0) html += section("Recent", finished.map(transferRow).join(""), "Since Continuity started — the 20 most recent are kept.");
+  if (transfers.length === 0) {
+    html += section("", `<div class="row"><span class="text muted">Nothing sent or received since Continuity started. Send files from a device's page.</span></div>`);
+  }
+  return html;
 }
 
 // ── The ⓘ panel ────────────────────────────────────────────────────────────
@@ -669,6 +798,7 @@ function render() {
   let page;
   if (kind === "device") page = devicePage(status, status.devices.find((d) => d.id === id));
   else if (kind === "nearby") page = nearbyPage(status.nearby.find((d) => d.id === id));
+  else if (kind === "transfers") page = transfersPage(status);
   else page = thisDevicePage(status);
   content.innerHTML = `<div class="page">${page}</div>`;
 
@@ -715,7 +845,7 @@ document.addEventListener("click", (event) => {
   const device = status && status.devices.find((d) => d.id === id);
   switch (action) {
     case "select":
-      state.selection = target.dataset.kind === "this" ? { kind: "this" } : { kind: target.dataset.kind, id };
+      state.selection = PAGES.includes(target.dataset.kind) ? { kind: target.dataset.kind } : { kind: target.dataset.kind, id };
       render();
       document.getElementById("content").scrollTop = 0;
       break;
@@ -739,7 +869,25 @@ document.addEventListener("click", (event) => {
       }
       break;
     case "show-received":
-      send("show_received_files");
+      send("open_received_files_dir");
+      break;
+    case "change-received":
+      send("choose_received_files_dir");
+      break;
+    case "open-transfer":
+      send("open_transfer", { id, reveal: false });
+      break;
+    case "reveal-transfer":
+      send("open_transfer", { id, reveal: true });
+      break;
+    case "refresh-nearby":
+      send("refresh_nearby");
+      toast("Looking for nearby devices…");
+      break;
+    case "control":
+      send("request_remote_control", { device: id }, (answer) => {
+        if (answer.ok) toast(`Asking ${device.name}…`);
+      });
       break;
     case "show-log":
       send("show_log");

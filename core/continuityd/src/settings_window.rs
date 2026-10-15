@@ -1,7 +1,9 @@
-//! The settings window on Linux and Windows: the same pages as the macOS app
-//! (apps/macos/ContinuitySettings), written once as an HTML page
-//! (`settings_window/page.html`) and shown by the system's own webview —
-//! WebKitGTK on Linux, WebView2 on Windows — in a window of this process.
+//! The Continuity window on Linux and Windows — the app's main window, with
+//! the same pages as the macOS app (apps/macos/ContinuitySettings), written
+//! once as an HTML page (`settings_window/page.html`) and shown by the
+//! system's own webview — WebKitGTK on Linux, WebView2 on Windows — in a
+//! window of this process. (Still named "settings" in the code, after what
+//! it started as.)
 //!
 //! The page talks to `control.rs` through the webview rather than the local
 //! socket the macOS app uses. It posts requests — JSON with an `id` and an
@@ -12,7 +14,7 @@
 //!
 //! A webview takes a few seconds to start, so the window is made hidden a
 //! few seconds after Continuity starts, and closing it only hides it again:
-//! Settings… then just shows it.
+//! Open Continuity then just shows it.
 
 use crate::control::{ControlOp, ControlState};
 use crate::share::ConnectedPeers;
@@ -42,6 +44,9 @@ pub enum Message {
     /// file_chooser_linux.rs for why that's later, not in the request).
     #[cfg(target_os = "linux")]
     FilesChosen { device: String, paths: Vec<PathBuf> },
+    /// The same for the received-files folder's Change….
+    #[cfg(target_os = "linux")]
+    FolderChosen { path: PathBuf },
 }
 
 /// What the event loop needs to route the page's messages back to it.
@@ -128,7 +133,7 @@ impl SettingsWindow {
     pub fn hide(&self) {
         self.window.set_visible(false);
         if let Err(e) = self.webview.evaluate_script("window.continuity && window.continuity.hidden && window.continuity.hidden()") {
-            tracing::debug!("couldn't tell the settings page it was closed: {e}");
+            tracing::debug!("couldn't tell the Continuity page it was closed: {e}");
         }
     }
 
@@ -141,11 +146,19 @@ impl SettingsWindow {
                 let sent = crate::share::dispatch(&device, &paths, context.commands, context.connected);
                 self.deliver(&json!({ "ok": sent.ok, "message": sent.message }).to_string());
             }
+            #[cfg(target_os = "linux")]
+            Message::FolderChosen { path } => {
+                let (ok, message) = match set_received_files_dir(path, context) {
+                    Ok(message) => (true, message),
+                    Err(message) => (false, message),
+                };
+                self.deliver(&json!({ "ok": ok, "message": message }).to_string());
+            }
             Message::Request(body) => {
                 let request: Value = match serde_json::from_str(&body) {
                     Ok(request) => request,
                     Err(e) => {
-                        tracing::warn!("the settings page sent something that isn't JSON: {e}");
+                        tracing::warn!("the Continuity page sent something that isn't JSON: {e}");
                         return;
                     }
                 };
@@ -195,12 +208,31 @@ impl SettingsWindow {
                     }
                 }
             }
-            Some("show_received_files") => {
-                let dir = context.control.status().received_files_dir;
-                // Created on the first file received; make sure there's
-                // something to show before that.
-                let _ = std::fs::create_dir_all(&dir);
-                crate::open_path(&dir).map(|_| None).map_err(|e| format!("Couldn't open {dir}: {e}"))
+            // The same for the folder received files go to.
+            Some("choose_received_files_dir") => {
+                let current = PathBuf::from(context.control.status().received_files_dir);
+                #[cfg(target_os = "linux")]
+                {
+                    use gtk::prelude::*;
+                    use tao::platform::unix::WindowExtUnix;
+                    let route = route.clone();
+                    let parent: &gtk::Window = self.window.gtk_window().upcast_ref();
+                    crate::file_chooser_linux::choose_folder(Some(parent), "Save Received Files In", Some(&current), move |path| {
+                        let _ = route.proxy.send_event((route.wrap)(Message::FolderChosen { path }));
+                    });
+                    Ok(None)
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let mut dialog = rfd::FileDialog::new().set_title("Save Received Files In").set_parent(&self.window);
+                    if current.is_dir() {
+                        dialog = dialog.set_directory(&current);
+                    }
+                    let Some(path) = dialog.pick_folder() else {
+                        return Ok(None);
+                    };
+                    set_received_files_dir(path, context).map(Some)
+                }
             }
             Some("show_log") => {
                 let log = context.control.status().about.log_file.ok_or("There's no log file.")?;
@@ -216,8 +248,14 @@ impl SettingsWindow {
             }
             _ => match serde_json::from_value::<ControlOp>(request) {
                 // Only for the socket: the page sends neither paths nor a
-                // second watch through here.
-                Ok(ControlOp::Status | ControlOp::Watch | ControlOp::SendFiles { .. }) => Err("Not available here.".to_string()),
+                // second watch through here, and it's already the window.
+                Ok(
+                    ControlOp::Status
+                    | ControlOp::Watch
+                    | ControlOp::SendFiles { .. }
+                    | ControlOp::SetReceivedFilesDir { .. }
+                    | ControlOp::OpenWindow,
+                ) => Err("Not available here.".to_string()),
                 Ok(op) => context.control.apply(op, context.commands).map(|_| None),
                 Err(e) => Err(format!("Unknown request: {e}")),
             },
@@ -246,7 +284,7 @@ impl SettingsWindow {
         // raw in a JSON string but not in an older engine's string literal.
         let line = line.replace('\u{2028}', "\\u2028").replace('\u{2029}', "\\u2029");
         if let Err(e) = self.webview.evaluate_script(&format!("window.continuity && window.continuity.receive({line})")) {
-            tracing::warn!("couldn't update the settings window: {e}");
+            tracing::warn!("couldn't update the Continuity window: {e}");
         }
     }
 }
@@ -255,6 +293,16 @@ impl Drop for SettingsWindow {
     fn drop(&mut self) {
         self.watch_generation.fetch_add(1, Ordering::SeqCst);
     }
+}
+
+/// Where Change… sends the folder it picked: checked, saved and passed to
+/// the engine by `control.rs`, and the page told how that went either way.
+fn set_received_files_dir(path: PathBuf, context: &Context) -> Result<String, String> {
+    let shown = path.display().to_string();
+    context
+        .control
+        .apply(ControlOp::SetReceivedFilesDir { path }, context.commands)
+        .map(|()| format!("Received files will be saved in {shown}"))
 }
 
 fn platform_name() -> &'static str {

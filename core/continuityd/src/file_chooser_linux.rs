@@ -1,5 +1,6 @@
-//! The file picker on Linux, for Send File… in the tray menu and Send
-//! Files… in the settings window.
+//! The file and folder pickers on Linux, for Send File… in the tray menu,
+//! and Send Files… and the received-files folder's Change… in the
+//! Continuity window.
 //!
 //! rfd's GTK backend can't be used for this. It runs every dialog on a GTK
 //! thread of its own and blocks the calling thread until the dialog closes.
@@ -12,7 +13,7 @@
 //! thread.
 
 use gtk::prelude::*;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Shows the chooser and returns at once. `on_chosen` runs later, on the
 /// main thread, and only if something was chosen.
@@ -24,7 +25,30 @@ pub fn choose_files(parent: Option<&gtk::Window>, title: &str, multiple: bool, o
         &[("_Cancel", gtk::ResponseType::Cancel), ("_Send", gtk::ResponseType::Accept)],
     );
     dialog.set_select_multiple(multiple);
-    dialog.set_modal(parent.is_some());
+    present(dialog, parent.is_some(), on_chosen);
+}
+
+/// The same, for one folder, starting in `current` when it exists.
+pub fn choose_folder(parent: Option<&gtk::Window>, title: &str, current: Option<&Path>, on_chosen: impl Fn(PathBuf) + 'static) {
+    let dialog = gtk::FileChooserDialog::with_buttons(
+        Some(title),
+        parent,
+        gtk::FileChooserAction::SelectFolder,
+        &[("_Cancel", gtk::ResponseType::Cancel), ("_Select", gtk::ResponseType::Accept)],
+    );
+    dialog.set_create_folders(true);
+    if let Some(current) = current.filter(|dir| dir.is_dir()) {
+        let _ = dialog.set_current_folder(current);
+    }
+    present(dialog, parent.is_some(), move |mut paths| {
+        if let Some(folder) = paths.pop() {
+            on_chosen(folder);
+        }
+    });
+}
+
+fn present(dialog: gtk::FileChooserDialog, modal: bool, on_chosen: impl Fn(Vec<PathBuf>) + 'static) {
+    dialog.set_modal(modal);
     dialog.connect_response(move |dialog, response| {
         let paths = if response == gtk::ResponseType::Accept { dialog.filenames() } else { Vec::new() };
         // A dialog is a toplevel, which GTK keeps until it's destroyed.

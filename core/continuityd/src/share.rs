@@ -23,7 +23,10 @@
 //! <files...>`, which hands the files to the already-running instance over a
 //! loopback TCP socket guarded by a random token in a user-private file (see
 //! `start_server`) and exits — it never starts a second tray app. The same
-//! socket also serves the settings window's requests (see `control.rs`).
+//! socket also serves the Continuity window's requests (see `control.rs`),
+//! and, on Linux and Windows, a plain second launch of Continuity: it asks
+//! the running one to show its window and exits (see
+//! `hand_off_to_running_instance`).
 
 use crate::control::{ControlOp, ControlState};
 use continuity_daemon::EngineCommand;
@@ -37,6 +40,8 @@ use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 
 pub const SHARE_TO_FLAG: &str = "--share-to";
+/// What the server answers a request without the right token.
+const WRONG_TOKEN: &str = "rejected: wrong token";
 /// `--share-to` target meaning every currently-connected device.
 const ALL_DEVICES: &str = "all";
 
@@ -90,7 +95,7 @@ fn menu_targets(connected: &HashMap<String, String>) -> Vec<MenuTarget> {
 
 /// Queues every file for every device `target` names. Folders are skipped —
 /// the engine only sends regular files. Also what the Linux and Windows
-/// settings window's Send Files… does (see settings_window.rs).
+/// Continuity window's Send Files… does (see settings_window.rs).
 pub(crate) fn dispatch(target: &str, paths: &[PathBuf], commands: &UnboundedSender<EngineCommand>, connected: &ConnectedPeers) -> ShareResponse {
     let peers: Vec<String> = {
         let connected = connected.lock().unwrap();
@@ -136,17 +141,22 @@ impl ShareServer {
     }
 }
 
+/// What the server calls when a second launch asks for the window — it
+/// wakes the event loop, which is the only thing that can show it.
+pub type OpenWindow = Arc<dyn Fn() + Send + Sync>;
+
 /// Listens on a random loopback port and publishes `{port, token}` in a
 /// file only this user can read. Every request has to carry that token, so
 /// another local account can't push files out through this device (or
 /// change its settings) — the same boundary the trust store and identity
 /// files already rely on. Each connection gets its own thread, since a
-/// settings window's `watch` keeps one open.
+/// window's `watch` keeps one open.
 pub fn start_server(
     profile: &str,
     commands: UnboundedSender<EngineCommand>,
     connected: ConnectedPeers,
     control: Arc<ControlState>,
+    open_window: OpenWindow,
 ) -> Option<ShareServer> {
     let endpoint = endpoint_path(profile)?;
     let listener = match TcpListener::bind(("127.0.0.1", 0)) {
@@ -167,9 +177,10 @@ pub fn start_server(
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
-            let (token, commands, connected, control) = (token.clone(), commands.clone(), connected.clone(), control.clone());
+            let (token, commands, connected, control, open_window) =
+                (token.clone(), commands.clone(), connected.clone(), control.clone(), open_window.clone());
             std::thread::spawn(move || {
-                if let Err(e) = serve_one(stream, &token, &commands, &connected, &control) {
+                if let Err(e) = serve_one(stream, &token, &commands, &connected, &control, &open_window) {
                     tracing::debug!("local request failed: {e}");
                 }
             });
@@ -179,13 +190,14 @@ pub fn start_server(
 }
 
 /// One request: `--share-to`'s (no `op` — a target and files), or a
-/// settings window's (tagged by `op`, see `ControlOp`).
+/// window's or a second launch's (tagged by `op`, see `ControlOp`).
 fn serve_one(
     stream: TcpStream,
     token: &str,
     commands: &UnboundedSender<EngineCommand>,
     connected: &ConnectedPeers,
     control: &ControlState,
+    open_window: &OpenWindow,
 ) -> std::io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     let _ = stream.set_nodelay(true);
@@ -196,7 +208,7 @@ fn serve_one(
         Err(e) => return send_line(&stream, &ShareResponse { ok: false, message: format!("malformed request: {e}") }),
     };
     if request.get("token").and_then(|t| t.as_str()) != Some(token) {
-        return send_line(&stream, &ShareResponse { ok: false, message: "rejected: wrong token".to_string() });
+        return send_line(&stream, &ShareResponse { ok: false, message: WRONG_TOKEN.to_string() });
     }
     if request.get("op").is_none() {
         let response = match serde_json::from_value::<ShareRequest>(request) {
@@ -215,6 +227,10 @@ fn serve_one(
             Ok(())
         }
         Ok(ControlOp::SendFiles { device, paths }) => send_line(&stream, &dispatch(&device, &paths, commands, connected)),
+        Ok(ControlOp::OpenWindow) => {
+            open_window();
+            send_line(&stream, &ShareResponse { ok: true, message: String::new() })
+        }
         Ok(op) => {
             let response = match control.apply(op, commands) {
                 Ok(()) => ShareResponse { ok: true, message: String::new() },
@@ -282,16 +298,56 @@ pub fn run_share_client(profile: &str, args: &[String]) -> i32 {
 }
 
 fn request_share(profile: &str, target: &str, paths: Vec<PathBuf>) -> std::io::Result<ShareResponse> {
+    request_running_instance(profile, Duration::from_secs(10), |token| {
+        Ok(serde_json::to_value(ShareRequest { token, target: target.to_string(), paths })?)
+    })
+}
+
+/// One request to the running instance, if there is one: the endpoint file
+/// names its port and token. `Err` when nothing answers — no endpoint file,
+/// or one left behind by an instance that's gone.
+fn request_running_instance(
+    profile: &str,
+    read_timeout: Duration,
+    request: impl FnOnce(String) -> std::io::Result<serde_json::Value>,
+) -> std::io::Result<ShareResponse> {
     let path = endpoint_path(profile).ok_or_else(|| std::io::Error::other("no config directory"))?;
     let endpoint: Endpoint = serde_json::from_slice(&std::fs::read(path)?)?;
     let stream = TcpStream::connect_timeout(&([127, 0, 0, 1], endpoint.port).into(), Duration::from_secs(2))?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-    let mut request = serde_json::to_vec(&ShareRequest { token: endpoint.token, target: target.to_string(), paths })?;
+    stream.set_read_timeout(Some(read_timeout))?;
+    let mut request = serde_json::to_vec(&request(endpoint.token)?)?;
     request.push(b'\n');
     (&stream).write_all(&request)?;
     let mut line = String::new();
     BufReader::new(&stream).read_line(&mut line)?;
     Ok(serde_json::from_str(&line)?)
+}
+
+/// A plain second launch of Continuity on Linux or Windows — from the app
+/// menu, the Start menu, or the installer's "Launch Continuity now" while
+/// it's already running: asks the running instance to show its window, so
+/// the launch does what someone clicking the icon expects instead of
+/// starting a second tray app on the same identity. True when an instance
+/// answered (even to say no, as a version without this would), and this
+/// one should exit; false when none is running and this one should start.
+/// An answer refusing the token isn't this profile's instance: the endpoint
+/// file was left behind, and its port has since gone to another one.
+/// (macOS doesn't need this: launching an app that's already running just
+/// reactivates it — see `Event::Reopen` in main.rs.)
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
+pub fn hand_off_to_running_instance(profile: &str) -> bool {
+    let response = request_running_instance(profile, Duration::from_secs(3), |token| {
+        Ok(serde_json::json!({ "op": "open_window", "token": token }))
+    });
+    match response {
+        Ok(response) if response.ok => true,
+        Ok(response) if response.message == WRONG_TOKEN => false,
+        Ok(response) => {
+            eprintln!("Continuity is already running, but couldn't show its window: {}", response.message);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 /// Brings the right-click entries in line with who's connected right now.
@@ -648,7 +704,11 @@ mod tests {
             platform: continuity_proto::Platform::Linux,
             version: "test".into(),
         };
-        ControlState::new(device, dir.path().join("trust.json"), dir.path().join("Received"), None)
+        ControlState::new(device, dir.path().join("trust.json"), dir.path().join("Received"), None, None, Default::default())
+    }
+
+    fn no_window() -> OpenWindow {
+        Arc::new(|| {})
     }
 
     /// Sends one request line to the running server and returns its first
@@ -676,7 +736,7 @@ mod tests {
         let connected: ConnectedPeers = Arc::new(Mutex::new(peers(&[("peer1", "Pixel")])));
         let profile = format!("share-test-{}", rand::random::<u32>());
         let dir = tempfile::tempdir().unwrap();
-        let server = start_server(&profile, commands, connected, control_state(&dir)).expect("server starts");
+        let server = start_server(&profile, commands, connected, control_state(&dir), no_window()).expect("server starts");
 
         let file = std::env::temp_dir().join(format!("continuity-share-test-{}.txt", rand::random::<u32>()));
         std::fs::write(&file, b"hi").unwrap();
@@ -719,7 +779,7 @@ mod tests {
         let profile = format!("control-test-{}", rand::random::<u32>());
         let dir = tempfile::tempdir().unwrap();
         let control = control_state(&dir);
-        let server = start_server(&profile, commands, connected, control.clone()).expect("server starts");
+        let server = start_server(&profile, commands, connected, control.clone(), no_window()).expect("server starts");
 
         let (status, _) = request(&profile, serde_json::json!({ "op": "status" }));
         assert_eq!(status["ok"], true);
@@ -737,6 +797,19 @@ mod tests {
         let (unknown, _) = request(&profile, serde_json::json!({ "op": "format_disk" }));
         assert_eq!(unknown["ok"], false);
 
+        // Contract B's newer requests go the same way, and say what's wrong.
+        let chosen = dir.path().join("Incoming");
+        let (moved, _) = request(&profile, serde_json::json!({ "op": "set_received_files_dir", "path": chosen }));
+        assert_eq!(moved["ok"], true, "{moved}");
+        assert!(matches!(sent.try_recv(), Ok(EngineCommand::SetReceivedFilesDir { .. })));
+        let (status, _) = request(&profile, serde_json::json!({ "op": "status" }));
+        assert_eq!(status["status"]["received_files_dir"], chosen.display().to_string());
+        let (relative, _) = request(&profile, serde_json::json!({ "op": "set_received_files_dir", "path": "Incoming" }));
+        assert_eq!(relative["ok"], false);
+        assert!(!relative["message"].as_str().unwrap().is_empty());
+        let (unlisted, _) = request(&profile, serde_json::json!({ "op": "open_transfer", "id": "nope", "reveal": true }));
+        assert_eq!(unlisted["ok"], false);
+
         // A watch gets the status straight away, then again on a change.
         let (first, mut watch) = request(&profile, serde_json::json!({ "op": "watch" }));
         assert_eq!(first["status"]["paused"], false);
@@ -747,5 +820,40 @@ mod tests {
         assert_eq!(next["status"]["paused"], true);
 
         server.shutdown();
+    }
+
+    #[test]
+    fn a_second_launch_hands_off_to_the_running_instance() {
+        let profile = format!("handoff-test-{}", rand::random::<u32>());
+        assert!(!hand_off_to_running_instance(&profile), "nothing running: start normally");
+
+        let (commands, _sent) = tokio::sync::mpsc::unbounded_channel();
+        let dir = tempfile::tempdir().unwrap();
+        let opened = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = opened.clone();
+        let open_window: OpenWindow = Arc::new(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        let server =
+            start_server(&profile, commands, Arc::new(Mutex::new(HashMap::new())), control_state(&dir), open_window).expect("server starts");
+        assert!(hand_off_to_running_instance(&profile), "running: hand off and exit");
+        assert_eq!(opened.load(std::sync::atomic::Ordering::SeqCst), 1, "the running one was asked to show its window");
+
+        let (refused, _) = request(&profile, serde_json::json!({ "op": "open_window", "token": "guess" }));
+        assert_eq!(refused["ok"], false);
+        assert_eq!(opened.load(std::sync::atomic::Ordering::SeqCst), 1, "not without the token");
+
+        // Another profile's endpoint file, left behind, naming the port
+        // this instance now has: not that profile's instance.
+        let other = format!("{profile}-other");
+        let port = serde_json::from_slice::<Endpoint>(&std::fs::read(endpoint_path(&profile).unwrap()).unwrap()).unwrap().port;
+        let stale = Endpoint { port, token: "from-a-run-long-gone".into() };
+        write_private_file(&endpoint_path(&other).unwrap(), &serde_json::to_vec(&stale).unwrap()).unwrap();
+        assert!(!hand_off_to_running_instance(&other), "a stale endpoint: start normally");
+        assert_eq!(opened.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let _ = std::fs::remove_file(endpoint_path(&other).unwrap());
+
+        server.shutdown();
+        assert!(!hand_off_to_running_instance(&profile), "an instance that quit doesn't count");
     }
 }

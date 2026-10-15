@@ -22,6 +22,14 @@
 #define MyAppPublisher "hardope"
 #define MyAppURL "https://github.com/hardope/continuity"
 #define MyAppExeName "continuityd.exe"
+; Who Continuity is to Windows' notifications (see init_notifications in
+; core/continuityd/src/main.rs, which uses the same id): a toast filed
+; under an id Windows doesn't know is dropped without a word, and one
+; filed under PowerShell's — notify-rust's fallback — says "Windows
+; PowerShell". The app registers it again for the user every time it
+; starts; registering it here too covers notifications sent before then,
+; and lets the uninstaller remove the key.
+#define MyAppUserModelID "app.continuity.desktop"
 
 [Setup]
 AppId={{DE73E4CD-2239-42D4-99F9-8596F72F63B6}
@@ -58,11 +66,14 @@ Name: "startup"; Description: "Launch {#MyAppName} automatically when you sign i
 Source: "{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
+; The same AppUserModelID as the app's notifications and windows, so the
+; Start-menu entry, the taskbar button and the toasts are all one app.
+Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; AppUserModelID: "{#MyAppUserModelID}"
 Name: "{group}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"
 
 [Registry]
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "{#MyAppName}"; ValueData: """{app}\{#MyAppExeName}"""; Flags: uninsdeletevalue; Tasks: startup
+Root: HKCU; Subkey: "Software\Classes\AppUserModelId\{#MyAppUserModelID}"; ValueType: string; ValueName: "DisplayName"; ValueData: "{#MyAppName}"; Flags: uninsdeletekey
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName} now"; Flags: nowait postinstall skipifsilent runasoriginaluser

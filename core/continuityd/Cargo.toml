@@ -151,15 +151,18 @@ windows = { version = "0.58", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_HiDpi",
     # IShellLinkW — share.rs writes Explorer "Send to" shortcuts, one per
-    # connected device.
+    # connected device. Also SetCurrentProcessExplicitAppUserModelID, for
+    # Continuity's own identity in notifications and the taskbar (main.rs).
     "Win32_UI_Shell",
     # LockWorkStation — screen_lock_windows.rs, remote lock.
     "Win32_System_Shutdown",
-    # The Windows version for the settings window's info panel (control.rs).
+    # The Windows version for the Continuity window's info panel
+    # (control.rs), and registering Continuity's AppUserModelID so its
+    # notifications are shown (main.rs).
     "Win32_System_Registry",
 ] }
 
-# The settings window on Linux and Windows (settings_window.rs): one HTML
+# The Continuity window on Linux and Windows (settings_window.rs): one HTML
 # page in the system's own webview — WebKitGTK 4.1 on Linux, already
 # installed with GNOME and KDE and pulled in by the .deb's auto-computed
 # Depends:; WebView2 on Windows, which ships with Windows 11 — inside a tao
@@ -172,7 +175,8 @@ wry = "0.57"
 # carries rfd's Linux dialog backend (see the non-Linux `rfd` entry above
 # for why this can't just add a feature on top of that one): `default-
 # features = false` + `gtk3` only, no `xdg-portal`. `rfd::MessageDialog`
-# (Reset confirmation, pairing-request accept/decline) has no XDG Desktop
+# (the pairing- and remote-control-request prompts' fallback, and once the
+# tray's Reset confirmation) has no XDG Desktop
 # Portal equivalent at all — Portal has no message-dialog API — so on a
 # portal-only build rfd falls back to shelling out to the external
 # `zenity` binary, which does nothing useful if it isn't installed (a real
@@ -187,7 +191,7 @@ wry = "0.57"
 # requirement.
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = "4"
-# The file picker (file_chooser_linux.rs): GTK's own, shown from the main
+# The file and folder pickers (file_chooser_linux.rs): GTK's own, shown from the main
 # thread — the GTK tao and wry already use, so nothing new to build.
 gtk = "0.18"
 rfd = { version = "0.15", default-features = false, features = ["gtk3"] }
