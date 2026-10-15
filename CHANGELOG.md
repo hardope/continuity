@@ -33,6 +33,11 @@ All notable user-facing changes to Continuity are documented here.
   a PC, so shortcuts stay where your hands expect them — and drags and
   double-clicks.
 - A refresh button under Nearby in the macOS window looks for devices again.
+- **Cancel a transfer** from either device: a Cancel button on every file
+  on its way, in the Continuity window and the Android app. The other
+  device stops too, and says it was cancelled there.
+- Controlling a Mac is smoother: its screen is sent at a sensible size
+  rather than at full Retina resolution.
 
 ### Fixed
 
@@ -46,6 +51,19 @@ All notable user-facing changes to Continuity are documented here.
 - Starting Continuity twice in quick succession no longer runs two copies.
 - Holding a key while controlling a Linux computer no longer leaves it stuck
   down there.
+- Any device on the network could stop Continuity accepting connections —
+  reconnects, files, screen sharing — by opening one and never finishing
+  it.
+- If the folder chosen for received files goes away (a USB drive
+  unplugged), files are saved in `Downloads/Continuity` until it's back,
+  instead of failing.
+- Half-received files left behind by a transfer that was interrupted are
+  cleaned up the next time Continuity starts.
+- Games and remote-desktop apps on a controlled Windows PC now see the
+  right keys.
+- On macOS the window shows as "Continuity" in the Dock and Cmd-Tab, not
+  "Continuity Settings"; on Linux, GNOME groups it under Continuity's icon.
+- On Android, starting a send no longer pops up a notification.
 
 ## [0.1.6] - 2026-10-08
 
