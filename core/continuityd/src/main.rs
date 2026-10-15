@@ -1027,13 +1027,13 @@ fn check_viewer_watchdog(
 }
 
 /// Opens the Continuity window on macOS: the SwiftUI app bundled inside
-/// Continuity.app (`Contents/Helpers/Continuity Settings.app`, built from
+/// Continuity.app (`Contents/Helpers/Continuity.app`, built from
 /// apps/macos/ContinuitySettings), which talks to this process over the
 /// local control socket. `CONTINUITY_SETTINGS_APP` points a development
 /// build (no bundle around it) at a locally built copy.
 #[cfg(target_os = "macos")]
 fn open_settings(profile: &str) {
-    let bundled = std::env::current_exe().ok().and_then(|exe| Some(exe.parent()?.parent()?.join("Helpers/Continuity Settings.app")));
+    let bundled = std::env::current_exe().ok().and_then(|exe| Some(exe.parent()?.parent()?.join("Helpers/Continuity.app")));
     let app = std::env::var_os("CONTINUITY_SETTINGS_APP").map(PathBuf::from).or(bundled).filter(|app| app.exists());
     let Some(app) = app else {
         notify("The Continuity window isn't included in this build of Continuity.");

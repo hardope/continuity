@@ -1,7 +1,7 @@
 // swift-tools-version:5.9
 //
 // The macOS window for Continuity: a small SwiftUI app bundled
-// inside Continuity.app (Contents/Helpers/Continuity Settings.app) that
+// inside Continuity.app (Contents/Helpers/Continuity.app) that
 // talks to the running `continuityd` over its local control socket (see
 // core/continuityd/src/control.rs). Build the .app with build-app.sh.
 

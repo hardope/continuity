@@ -234,8 +234,9 @@ jobs:
           done
           iconutil -c icns AppIcon.iconset -o "$APP/Contents/Resources/AppIcon.icns"
 
-          # The settings window (apps/macos/ContinuitySettings), a SwiftUI
-          # app the tray's "Settings…" opens from Contents/Helpers. Built
+          # The Continuity window (apps/macos/ContinuitySettings), a SwiftUI
+          # app the tray's "Open Continuity" opens from
+          # Contents/Helpers/Continuity.app. Built
           # with the newest non-beta Xcode on the runner: the macOS 26 SDK
           # is what gives it Liquid Glass (an older SDK still builds it,
           # with the classic look).

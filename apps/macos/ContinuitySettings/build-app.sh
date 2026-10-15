@@ -1,8 +1,10 @@
 #!/bin/bash
-# Builds "Continuity Settings.app" — universal (Apple silicon + Intel) —
-# into <output dir>. CI then copies it into Continuity.app/Contents/Helpers/,
-# where continuityd's "Open Continuity" menu item looks for it. The bundle
-# keeps that file name; to the user (Info.plist) the app is "Continuity".
+# Builds "Continuity.app" — the Continuity window, universal (Apple silicon +
+# Intel) — into <output dir>. CI builds it into Continuity.app's
+# Contents/Helpers/, where continuityd's "Open Continuity" menu item looks
+# for it. Named like the app it's part of: the Dock and Cmd-Tab show a
+# bundle's file name, which as "Continuity Settings.app" said "Continuity
+# Settings" there although it's the main window.
 #
 #   ./build-app.sh <output dir> [version] [AppIcon.icns]
 #
@@ -26,7 +28,7 @@ cd "$(dirname "$0")"
 swift build -c release --arch arm64 --arch x86_64 --product ContinuitySettings
 BIN="$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)/ContinuitySettings"
 
-APP="$OUT/Continuity Settings.app"
+APP="$OUT/Continuity.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/ContinuitySettings"
