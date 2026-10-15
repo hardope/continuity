@@ -5,6 +5,25 @@ anything. Repository: `hardope/continuity` (Rust core in `core/`, Android app in
 `apps/android`, macOS SwiftUI window app in `apps/macos/ContinuitySettings`,
 installers in `installers/`).
 
+## State at handoff (read this first)
+
+- Everything is committed and pushed on `tmp/review-fixes`; the working tree was
+  clean, nothing half-done is lost. The full verification list below passed on
+  the final commit (Linux build + all unit/integration tests, Windows and macOS
+  type-checks, lite build). The Android compile passed before the last few
+  desktop/engine fixes and none of those touched Android.
+- Fixed from the review so far (ticked in REVIEW-NOTES.md): transfer-engine-1,
+  -4, -5, -7, -8; desktop-shell-1, -3, -5, -6, -7, -10.
+- Next up, in this order: transfer-engine-2 (was about to start), -9, -3, -6;
+  desktop-shell-2, -8, -4 + -9 together; then the remote-control and Android
+  findings at the bottom of this file. remote-control-2 is probably already
+  fixed by commit "Control one computer at a time from the window" (it ends the
+  previous session before opening a new viewer) — check, then tick it.
+- The review of the macOS SwiftUI app + cross-component contracts never
+  reported — do that review yourself (see "What is left", item 1).
+- The skeptic pass that tries to refute each finding never finished, so confirm
+  each finding against the code before fixing it.
+
 ## The owner's rules (non-negotiable)
 
 1. Commits are authored as **hardope <adeyeriopeoluwa05@gmail.com>**. Set it first:
@@ -35,9 +54,9 @@ trailers.
 - `tmp/review-fixes` — safety copy of ALL work: phase 1 + phase 2 + review
   notes + fixes. **Continue here.** Its `REVIEW-NOTES.md` is the checklist of
   findings (ticked = fixed).
-- `tmp/review-fixes-engine` (may exist) — transfer-engine fixes made in a separate
-  worktree by a fixer agent. If it exists and has commits, cherry-pick them onto
-  `tmp/review-fixes` (they only touch `core/continuity-daemon`, `-net`, `-proto`).
+- `tmp/review-fixes-engine` — already merged into `tmp/review-fixes` (its 3
+  commits were cherry-picked); nothing to do with it except delete it at the
+  end, with the owner's OK.
 
 Final step once everything is fixed and the owner agrees: move the commits onto
 `feature/fast-transfers` (it's a strict prefix of `tmp/review-fixes`, so a
