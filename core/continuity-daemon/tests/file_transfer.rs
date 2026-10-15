@@ -169,6 +169,19 @@ async fn connected_pair(a_name: &str, b_name: &str) -> (EngineHandle, EngineHand
     (a, b, a_id, b_id, a_dir, b_dir)
 }
 
+/// Shuts the engines down and deletes their directories (trust store and
+/// received files, the parents of `received_dirs`) and `other_dirs`. Only
+/// reached when a test passes, so a failing one leaves everything behind
+/// to look at.
+fn finish(engines: Vec<EngineHandle>, received_dirs: &[&Path], other_dirs: &[&Path]) {
+    for engine in engines {
+        engine.shutdown();
+    }
+    for dir in received_dirs.iter().filter_map(|d| d.parent()).chain(other_dirs.iter().copied()) {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
 /// Brings a dropped mesh connection back, returning everything seen until
 /// A reports it connected. Either side may be the one with the other's
 /// mDNS address cached, so the two take turns asking to reconnect — never
@@ -222,7 +235,7 @@ fn failures(log: &[(Side, SyncEvent)]) -> Vec<String> {
 /// tracked on both sides the same way the in-band path always was.
 #[tokio::test]
 async fn a_multi_mib_file_goes_over_the_data_connection() {
-    let (mut a, mut b, _a_id, b_id, _a_dir, b_dir) = connected_pair("DataA", "DataB").await;
+    let (mut a, mut b, _a_id, b_id, a_dir, b_dir) = connected_pair("DataA", "DataB").await;
 
     let source_dir = temp_dir("data-source");
     let source = source_dir.join("holiday video.mp4");
@@ -267,9 +280,7 @@ async fn a_multi_mib_file_goes_over_the_data_connection() {
     assert_eq!(b.test_hooks().data_channel_files_received.load(Ordering::Relaxed), 1);
     assert_eq!(b.test_hooks().in_band_files_received.load(Ordering::Relaxed), 0);
 
-    a.shutdown();
-    b.shutdown();
-    let _ = std::fs::remove_dir_all(&source_dir);
+    finish(vec![a, b], &[&a_dir, &b_dir], &[&source_dir]);
 }
 
 /// Cutting the data connection partway through stalls the transfer on
@@ -278,7 +289,7 @@ async fn a_multi_mib_file_goes_over_the_data_connection() {
 /// already has, and the file finishes from there — whole and correct.
 #[tokio::test]
 async fn a_cut_data_connection_resumes_where_it_left_off() {
-    let (mut a, mut b, _a_id, b_id, _a_dir, b_dir) = connected_pair("ResumeA", "ResumeB").await;
+    let (mut a, mut b, _a_id, b_id, a_dir, b_dir) = connected_pair("ResumeA", "ResumeB").await;
 
     let source_dir = temp_dir("resume-source");
     let source = source_dir.join("archive.tar");
@@ -317,9 +328,7 @@ async fn a_cut_data_connection_resumes_where_it_left_off() {
     assert_eq!(count(&log, Side::B, |e| matches!(e, SyncEvent::FileReceived { .. })), 1);
     assert_eq!(b.test_hooks().data_channel_files_received.load(Ordering::Relaxed), 1);
 
-    a.shutdown();
-    b.shutdown();
-    let _ = std::fs::remove_dir_all(&source_dir);
+    finish(vec![a, b], &[&a_dir, &b_dir], &[&source_dir]);
 }
 
 /// The mesh connection going down too while a transfer is stalled: the
@@ -329,7 +338,7 @@ async fn a_cut_data_connection_resumes_where_it_left_off() {
 /// file still finishes from where it stopped.
 #[tokio::test]
 async fn a_stalled_transfer_resumes_after_the_mesh_connection_comes_back() {
-    let (mut a, mut b, a_id, b_id, _a_dir, b_dir) = connected_pair("MeshDropA", "MeshDropB").await;
+    let (mut a, mut b, a_id, b_id, a_dir, b_dir) = connected_pair("MeshDropA", "MeshDropB").await;
 
     let source_dir = temp_dir("mesh-drop-source");
     let source = source_dir.join("photos.zip");
@@ -384,9 +393,7 @@ async fn a_stalled_transfer_resumes_after_the_mesh_connection_comes_back() {
         "B should have read A's reconnect before handing it to the mesh"
     );
 
-    a.shutdown();
-    b.shutdown();
-    let _ = std::fs::remove_dir_all(&source_dir);
+    finish(vec![a, b], &[&a_dir, &b_dir], &[&source_dir]);
 }
 
 /// A v3 receiver that answers the data-connection offer with
@@ -394,7 +401,7 @@ async fn a_stalled_transfer_resumes_after_the_mesh_connection_comes_back() {
 /// the same way it would have either way.
 #[tokio::test]
 async fn a_receiver_that_refuses_the_data_connection_gets_it_in_band() {
-    let (mut a, mut b, _a_id, b_id, _a_dir, b_dir) = connected_pair("RefuseA", "RefuseB").await;
+    let (mut a, mut b, _a_id, b_id, a_dir, b_dir) = connected_pair("RefuseA", "RefuseB").await;
     b.test_hooks().refuse_data_channel.store(true, Ordering::Relaxed);
 
     let source_dir = temp_dir("refuse-source");
@@ -422,16 +429,14 @@ async fn a_receiver_that_refuses_the_data_connection_gets_it_in_band() {
         "the in-band path should still know the file's name: {log:?}"
     );
 
-    a.shutdown();
-    b.shutdown();
-    let _ = std::fs::remove_dir_all(&source_dir);
+    finish(vec![a, b], &[&a_dir, &b_dir], &[&source_dir]);
 }
 
 /// A peer that announced protocol v2 is never offered a data connection:
 /// the file goes in-band from the start.
 #[tokio::test]
 async fn a_v2_peer_is_sent_files_in_band() {
-    let (mut a, mut b, a_id, b_id, _a_dir, _b_dir) = connected_pair("OldPeerA", "OldPeerB").await;
+    let (mut a, mut b, a_id, b_id, a_dir, b_dir) = connected_pair("OldPeerA", "OldPeerB").await;
 
     // Make B announce v2 on a fresh connection: hook first, then drop the
     // connection and bring it back so A hears the new announcement.
@@ -467,9 +472,7 @@ async fn a_v2_peer_is_sent_files_in_band() {
     assert_eq!(b.test_hooks().in_band_files_received.load(Ordering::Relaxed), 1);
     assert_eq!(b.test_hooks().data_channel_files_received.load(Ordering::Relaxed), 0);
 
-    a.shutdown();
-    b.shutdown();
-    let _ = std::fs::remove_dir_all(&source_dir);
+    finish(vec![a, b], &[&a_dir, &b_dir], &[&source_dir]);
 }
 
 /// A real old-format sender: a hand-driven connection speaking v2's raw
@@ -533,7 +536,7 @@ async fn an_old_format_offer_from_a_v2_sender_is_received_in_band() {
     assert_eq!(path, received_dir.join("from v2.bin"));
     assert_eq!(std::fs::read(&path).unwrap(), content);
 
-    engine.shutdown();
+    finish(vec![engine], &[&received_dir], &[]);
 }
 
 async fn write_raw(conn: &mut continuity_net::Connection, json: &[u8]) {
@@ -555,7 +558,7 @@ async fn write_raw(conn: &mut continuity_net::Connection, json: &[u8]) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn measure_512_mib_loopback_throughput() {
-    let (mut a, mut b, _a_id, b_id, _a_dir, _b_dir) = connected_pair("SpeedA", "SpeedB").await;
+    let (mut a, mut b, _a_id, b_id, a_dir, b_engine_dir) = connected_pair("SpeedA", "SpeedB").await;
     let source_dir = match std::env::var_os("CONTINUITY_BENCH_DIR") {
         Some(base) => {
             let dir = PathBuf::from(base).join(format!("continuity-bench-{:08x}", rand::random::<u32>()));
@@ -599,7 +602,5 @@ async fn measure_512_mib_loopback_throughput() {
     }
     assert!(part_files_in(&b_dir).is_empty());
 
-    a.shutdown();
-    b.shutdown();
-    let _ = std::fs::remove_dir_all(&source_dir);
+    finish(vec![a, b], &[&a_dir, &b_engine_dir], &[&source_dir]);
 }
