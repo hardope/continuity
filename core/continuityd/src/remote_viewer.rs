@@ -83,7 +83,8 @@ pub struct ViewerPeer<'a> {
 pub struct RemoteViewer {
     window: Rc<Window>,
     surface: softbuffer::Surface<Rc<Window>, Rc<Window>>,
-    peer_id: String,
+    /// The peer and the session this window is for.
+    session: SessionKey,
     commands: UnboundedSender<EngineCommand>,
     keyboard: KeyboardForwarder,
     /// Mouse buttons pressed on the peer and not yet released — released
@@ -199,7 +200,7 @@ impl RemoteViewer {
         Ok(Self {
             window,
             surface,
-            peer_id: peer.id.to_string(),
+            session: SessionKey::new(peer.id, peer.session_id),
             commands,
             keyboard: KeyboardForwarder::new(KeyTranslator::new(cfg!(target_os = "macos"), peer.platform)),
             held_buttons: Vec::new(),
@@ -220,7 +221,14 @@ impl RemoteViewer {
     }
 
     pub fn peer_id(&self) -> &str {
-        &self.peer_id
+        &self.session.peer_id
+    }
+
+    /// Whether this window shows `session_id` with `peer_id` — a session
+    /// ending with that peer may be a different one (see main.rs's
+    /// `RemoteControlSessionEnded` handling).
+    pub fn shows(&self, peer_id: &str, session_id: &str) -> bool {
+        self.session.matches(peer_id, session_id)
     }
 
     /// True once the window has gone `RENDER_WATCHDOG` without ever
@@ -312,7 +320,7 @@ impl RemoteViewer {
                 // Before the session ends, while the peer still accepts
                 // input — nothing should stay held down over there.
                 self.release_all();
-                let _ = self.commands.send(EngineCommand::EndRemoteControlSession { peer_crypto_id: self.peer_id.clone() });
+                let _ = self.commands.send(EngineCommand::EndRemoteControlSession { peer_crypto_id: self.session.peer_id.clone() });
                 return ViewerAction::Closed;
             }
             WindowEvent::Resized(size) => {
@@ -457,7 +465,7 @@ impl RemoteViewer {
     }
 
     fn send(&self, event: InputEventKind) {
-        let _ = self.commands.send(EngineCommand::SendInputEvent { peer_crypto_id: self.peer_id.clone(), event });
+        let _ = self.commands.send(EngineCommand::SendInputEvent { peer_crypto_id: self.session.peer_id.clone(), event });
     }
 }
 

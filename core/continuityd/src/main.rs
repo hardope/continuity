@@ -964,10 +964,17 @@ fn handle_remote_control_sync_event(
                 }
             }
         }
-        SyncEvent::RemoteControlSessionEnded { peer_id, .. } => {
+        SyncEvent::RemoteControlSessionEnded { peer_id, session_id, .. } => {
+            // Only this viewer's own session. **Real bug fixed here**: it
+            // used to close on the peer alone, so the same peer's request
+            // to control *this* device, declined (this device being
+            // controlled by someone else already, say), closed the window
+            // for the session controlling it — which stayed live, its
+            // screen still streaming here to nobody, and a later Control
+            // for it was ignored since the engine already had a session.
             // Dropping the viewer releases whatever it held down, closes
             // its window and stops its decoder thread.
-            let matches = viewer.borrow().as_ref().is_some_and(|v| v.peer_id() == peer_id);
+            let matches = viewer.borrow().as_ref().is_some_and(|v| v.shows(peer_id, session_id));
             if matches {
                 *viewer.borrow_mut() = None;
             }
