@@ -54,9 +54,11 @@ pub async fn read_message<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Messag
 /// much a connection can make the receiver allocate for one frame.
 const MAX_FRAME_BYTES: u32 = 16 * 1024 * 1024;
 
-/// Raw length-prefixed bytes, no JSON envelope — used only for the screen
-/// stream (see `Message::ScreenStreamHandshake`), after that one JSON
-/// handshake message switches the connection over to this leaner framing.
+/// Raw length-prefixed bytes, no JSON envelope — used for the screen
+/// stream (see `Message::ScreenStreamHandshake`) and, since v3, a file's
+/// data connection (`Message::FileStreamHandshake`, via
+/// `write_frame_unflushed`), after that one JSON handshake message switches
+/// the connection over to this leaner framing.
 /// Skipping JSON/base64 here isn't just an optimization: a continuous
 /// 10-15fps stream pays that ~1.33x base64 cost (fine for an occasional
 /// file chunk) on every single frame, which is exactly the kind of
@@ -65,10 +67,22 @@ const MAX_FRAME_BYTES: u32 = 16 * 1024 * 1024;
 /// without the JSON payload in between, so both framings stay trivially
 /// easy to reason about side by side on the wire.
 pub async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, data: &[u8]) -> Result<(), FramingError> {
+    write_frame_unflushed(writer, data).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+/// `write_frame` without the flush — for a bulk stream where nothing is
+/// waiting on any one frame (a v3 file data connection, see
+/// `Message::FileStreamHandshake`), so frames can follow each other as fast
+/// as the socket takes them. The screen stream keeps flushing per frame,
+/// since there a frame sitting in a buffer is a frame shown late. Whoever
+/// writes the last frame must flush (or follow it with `write_message`,
+/// which does).
+pub async fn write_frame_unflushed<W: AsyncWrite + Unpin>(writer: &mut W, data: &[u8]) -> Result<(), FramingError> {
     let len = u32::try_from(data.len()).map_err(|_| FramingError::TooLarge(u32::MAX))?;
     writer.write_all(&len.to_be_bytes()).await?;
     writer.write_all(data).await?;
-    writer.flush().await?;
     Ok(())
 }
 
