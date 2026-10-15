@@ -70,7 +70,20 @@ enum AppEvent {
     /// Time to make the settings window, hidden (see `SETTINGS_PREPARE_DELAY`).
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     PrepareSettings,
+    /// The remote-control viewer's decoder thread has a frame ready to
+    /// show — at most one of these is ever in flight (see remote_viewer.rs).
+    /// Screen frames themselves never come through here.
+    #[cfg(feature = "remote-control")]
+    ViewerFrameReady,
 }
+
+/// Where the engine thread sends screen frames instead of the event loop
+/// (see `start_engine_thread`): the viewer's frame router, or nowhere in a
+/// build without the viewer.
+#[cfg(feature = "remote-control")]
+type FrameSink = Arc<remote_viewer::FrameRouter>;
+#[cfg(not(feature = "remote-control"))]
+type FrameSink = ();
 
 /// A webview takes a few seconds to start, so on Linux and Windows the
 /// settings window is made, hidden, this long after Continuity starts — late
@@ -251,7 +264,18 @@ fn main() -> anyhow::Result<()> {
         .with_icon(build_icon(false))
         .build()?;
 
-    let (commands, device_id) = start_engine_thread(profile(), device_name.clone(), proxy)?;
+    // Shared by the engine thread, which hands it every screen frame, and
+    // the viewer window below, which it feeds — see remote_viewer.rs.
+    #[cfg(feature = "remote-control")]
+    let frame_router = remote_viewer::FrameRouter::new();
+    #[cfg(feature = "remote-control")]
+    let frame_sink: FrameSink = frame_router.clone();
+    #[cfg(not(feature = "remote-control"))]
+    let frame_sink: FrameSink = ();
+    // How the viewer's decoder thread wakes this loop when a frame is ready.
+    #[cfg(feature = "remote-control")]
+    let viewer_proxy = event_loop.create_proxy();
+    let (commands, device_id) = start_engine_thread(profile(), device_name.clone(), proxy, frame_sink)?;
     // What the settings window reads and changes, over the same local
     // socket as "Send with Continuity" (see control.rs).
     let control = control::ControlState::new(
@@ -308,7 +332,7 @@ fn main() -> anyhow::Result<()> {
             let mut should_close = false;
             if let Some(v) = viewer.borrow_mut().as_mut() {
                 if v.window_id() == *window_id {
-                    if matches!(v.handle_window_event(window_event, &commands), remote_viewer::ViewerAction::Closed) {
+                    if matches!(v.handle_window_event(window_event), remote_viewer::ViewerAction::Closed) {
                         should_close = true;
                     }
                 }
@@ -345,7 +369,15 @@ fn main() -> anyhow::Result<()> {
             tao::event::Event::UserEvent(AppEvent::Engine(sync_event)) => {
                 control.observe(&sync_event);
                 #[cfg(feature = "remote-control")]
-                handle_remote_control_sync_event(&sync_event, target, &viewer, &connected_peer_platforms, &commands);
+                handle_remote_control_sync_event(
+                    &sync_event,
+                    target,
+                    &viewer,
+                    &connected_peer_platforms,
+                    &commands,
+                    &frame_router,
+                    &viewer_proxy,
+                );
                 #[cfg(target_os = "linux")]
                 let unlock_menu_update = unlock_menu_update(&sync_event);
                 handle_sync_event(
@@ -386,6 +418,14 @@ fn main() -> anyhow::Result<()> {
                 if let Some(window) = settings.as_mut() {
                     let context = settings_window::Context { control: &control, commands: &commands, connected: &connected_peers };
                     window.handle(message, &context, &settings_route);
+                }
+            }
+            // Only ever picks up a frame the decoder thread already sized
+            // for the window — the decoding never happens on this thread.
+            #[cfg(feature = "remote-control")]
+            tao::event::Event::UserEvent(AppEvent::ViewerFrameReady) => {
+                if let Some(v) = viewer.borrow_mut().as_mut() {
+                    v.show_ready_frame();
                 }
             }
             #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -808,14 +848,10 @@ fn handle_sync_event(
             let _ = tray_icon.set_icon(Some(build_icon(false)));
             let _ = tray_icon.set_tooltip(Some("Continuity"));
         }
-        // The real routing to an open viewer window happens in
-        // `handle_remote_control_sync_event` (feature-gated, needs the
-        // window/softbuffer machinery) — this arm always compiles
-        // regardless of the `remote-control` feature, so it can only
-        // ever log, never touch a viewer.
-        SyncEvent::ScreenFrameReceived { frame, .. } => {
-            tracing::debug!("screen frame received ({} bytes)", frame.len());
-        }
+        // Never arrives here: `start_engine_thread` sends screen frames
+        // straight to the viewer's decoder (see `route_screen_frame`)
+        // instead of through the event loop.
+        SyncEvent::ScreenFrameReceived { .. } => {}
         // Always announced — an unlock is the one thing a peer can do here
         // without anyone at this computer saying yes at that moment, and a
         // refused attempt is either a device that needs allowing first or
@@ -1073,6 +1109,8 @@ fn handle_remote_control_sync_event(
     viewer: &std::rc::Rc<std::cell::RefCell<Option<remote_viewer::RemoteViewer>>>,
     connected_peer_platforms: &Arc<Mutex<HashMap<String, Platform>>>,
     commands: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
+    frame_router: &Arc<remote_viewer::FrameRouter>,
+    viewer_proxy: &tao::event_loop::EventLoopProxy<AppEvent>,
 ) {
     match event {
         SyncEvent::Connected { peer } => {
@@ -1087,7 +1125,7 @@ fn handle_remote_control_sync_event(
         SyncEvent::WasReset => {
             connected_peer_platforms.lock().unwrap().clear();
         }
-        SyncEvent::RemoteControlSessionStarted { peer_id, peer_name, role, .. } => {
+        SyncEvent::RemoteControlSessionStarted { peer_id, peer_name, session_id, role } => {
             if *role != continuity_daemon::RemoteControlRole::Controlling {
                 return;
             }
@@ -1095,7 +1133,10 @@ fn handle_remote_control_sync_event(
                 tracing::warn!("no known platform for peer '{peer_name}' ({peer_id}) — defaulting to macOS key codes, which will be wrong if it isn't one");
                 Platform::MacOs
             });
-            match remote_viewer::RemoteViewer::open(target, peer_id.clone(), peer_name, platform) {
+            let peer = remote_viewer::ViewerPeer { id: peer_id, name: peer_name, session_id, platform };
+            let wake_proxy = viewer_proxy.clone();
+            let wake: remote_viewer::Wake = Box::new(move || wake_proxy.send_event(AppEvent::ViewerFrameReady).is_ok());
+            match remote_viewer::RemoteViewer::open(target, peer, frame_router, wake, commands.clone()) {
                 Ok(new_viewer) => *viewer.borrow_mut() = Some(new_viewer),
                 Err(e) => {
                     tracing::warn!("couldn't open remote control viewer window: {e}");
@@ -1104,37 +1145,44 @@ fn handle_remote_control_sync_event(
             }
         }
         SyncEvent::RemoteControlSessionEnded { peer_id, .. } => {
+            // Dropping the viewer releases whatever it held down, closes
+            // its window and stops its decoder thread.
             let matches = viewer.borrow().as_ref().is_some_and(|v| v.peer_id() == peer_id);
             if matches {
                 *viewer.borrow_mut() = None;
             }
         }
-        SyncEvent::ScreenFrameReceived { peer_id, frame, .. } => {
-            let mut viewer_ref = viewer.borrow_mut();
-            match viewer_ref.as_mut() {
-                Some(v) if v.peer_id() == peer_id => v.handle_frame(frame),
-                Some(v) => tracing::debug!(
-                    "ScreenFrameReceived for peer '{peer_id}' ({} bytes) but the open viewer is for a different peer ('{}') — dropped",
-                    frame.len(),
-                    v.peer_id()
-                ),
-                None => tracing::debug!("ScreenFrameReceived for peer '{peer_id}' ({} bytes) but no viewer window is open — dropped", frame.len()),
-            }
-            drop(viewer_ref);
-            check_viewer_watchdog(viewer, commands);
-        }
+        // `ScreenFrameReceived` never reaches the event loop — see
+        // `route_screen_frame`.
         _ => {}
     }
+}
+
+/// Engine thread: where a screen frame goes instead of the event loop. It
+/// used to be queued there like every other event and decoded on the UI
+/// thread, which froze the whole app once frames came faster than they
+/// could be decoded (see remote_viewer.rs's module doc comment). Now the
+/// frame router drops it straight into the open viewer's latest-frame
+/// slot, replacing any older frame not yet decoded.
+#[cfg(feature = "remote-control")]
+fn route_screen_frame(frames: &FrameSink, peer_id: &str, session_id: &str, frame: Vec<u8>) {
+    frames.offer(peer_id, session_id, frame);
+}
+
+/// A build without the viewer can't be the controlling side, so frames
+/// shouldn't arrive at all — but if one does, it mustn't pile up anywhere.
+#[cfg(not(feature = "remote-control"))]
+fn route_screen_frame(_frames: &FrameSink, peer_id: &str, _session_id: &str, frame: Vec<u8>) {
+    tracing::trace!("dropped a {}-byte screen frame from '{peer_id}': this build has no remote-control viewer", frame.len());
 }
 
 /// Tears the session down if the open viewer window (if any) has gone
 /// `RENDER_WATCHDOG` without painting a single real frame — see
 /// `RemoteViewer::is_stuck`'s doc comment for why that state is treated
 /// as a fatal viewer failure rather than something worth leaving open
-/// indefinitely. Called both right after a frame arrives (the original
-/// path) and on every event-loop tick (see the `WaitUntil` polling next
-/// to `check_viewer_watchdog`'s call sites) so a session that never
-/// receives *any* frame at all still gets caught, not just one that
+/// indefinitely. Called on every event-loop tick (see the `WaitUntil`
+/// polling next to `check_viewer_watchdog`'s call sites) so a session that
+/// never receives *any* frame at all still gets caught, not just one that
 /// receives some but fails to render them.
 #[cfg(feature = "remote-control")]
 fn check_viewer_watchdog(
@@ -1343,6 +1391,7 @@ fn start_engine_thread(
     profile: String,
     device_name: String,
     proxy: tao::event_loop::EventLoopProxy<AppEvent>,
+    frames: FrameSink,
 ) -> anyhow::Result<(tokio::sync::mpsc::UnboundedSender<EngineCommand>, String)> {
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
 
@@ -1420,6 +1469,17 @@ fn start_engine_thread(
                 Ok((mut engine, device_id)) => {
                     let _ = ready_tx.send(Ok((engine.command_sender(), device_id)));
                     while let Some(event) = engine.events.recv().await {
+                        // Screen frames (~10 a second during a session)
+                        // bypass the event loop entirely — nothing there
+                        // needs them but the viewer, and queued there they
+                        // froze the app (see `route_screen_frame`).
+                        let event = match event {
+                            SyncEvent::ScreenFrameReceived { peer_id, session_id, frame } => {
+                                route_screen_frame(&frames, &peer_id, &session_id, frame);
+                                continue;
+                            }
+                            event => event,
+                        };
                         if proxy.send_event(AppEvent::Engine(event)).is_err() {
                             break;
                         }
