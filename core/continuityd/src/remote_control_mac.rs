@@ -39,8 +39,8 @@ use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep};
 use objc2_core_foundation::{CFRetained, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
     CGBitmapContextCreate, CGBitmapContextCreateImage, CGColorSpace, CGContext, CGDisplayBounds, CGDisplayPixelsHigh, CGDisplayPixelsWide,
-    CGEvent, CGEventTapLocation, CGEventType, CGImage, CGImageAlphaInfo, CGMainDisplayID, CGMouseButton, CGPreflightScreenCaptureAccess,
-    CGRequestScreenCaptureAccess, CGScrollEventUnit,
+    CGEvent, CGEventField, CGEventFlags, CGEventTapLocation, CGEventType, CGImage, CGImageAlphaInfo, CGMainDisplayID, CGMouseButton,
+    CGPreflightScreenCaptureAccess, CGRequestScreenCaptureAccess, CGScrollEventUnit,
 };
 use objc2_foundation::NSDictionary;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -150,6 +150,9 @@ pub struct MacRemoteControlHost {
     /// `MouseMove` of a session arrives, so nothing's drawn before there's
     /// a real position to draw.
     last_cursor: Arc<Mutex<Option<(f64, f64)>>>,
+    /// The keys and modifiers the controlling device currently holds down
+    /// here — see `HeldKeys`.
+    held: Mutex<HeldKeys>,
 }
 
 impl MacRemoteControlHost {
@@ -158,6 +161,18 @@ impl MacRemoteControlHost {
             capturing: Arc::new(AtomicBool::new(false)),
             display_sleep_assertion: Mutex::new(None),
             last_cursor: Arc::new(Mutex::new(None)),
+            held: Mutex::new(HeldKeys::default()),
+        }
+    }
+
+    /// Lets go of everything the controlling device left held down. A
+    /// session can end without its key-ups ever arriving (the other
+    /// computer slept, the network dropped), and an injected modifier left
+    /// down here would go on modifying the local person's own typing.
+    fn release_held_keys(&self) {
+        let releases = self.held.lock().unwrap().release_all();
+        for release in &releases {
+            post_key(release);
         }
     }
 }
@@ -173,10 +188,14 @@ impl RemoteControlHost for MacRemoteControlHost {
         if let InputEventKind::MouseMove { x, y } = event {
             *self.last_cursor.lock().unwrap() = Some((x, y));
         }
-        inject_event(event);
+        inject_event(event, &mut self.held.lock().unwrap());
     }
 
     fn start_capture(&self) -> Option<mpsc::Receiver<Vec<u8>>> {
+        // Nothing should be held at the start of a session; if a previous
+        // one somehow left something, let go of it before it can combine
+        // with this session's first keys.
+        self.release_held_keys();
         ensure_screen_recording_trust();
         let display_id = CGMainDisplayID();
         // Fresh session, no move injected yet — otherwise a marker from
@@ -242,6 +261,7 @@ impl RemoteControlHost for MacRemoteControlHost {
 
     fn stop_capture(&self) {
         self.capturing.store(false, Ordering::Relaxed);
+        self.release_held_keys();
         if let Some(id) = self.display_sleep_assertion.lock().unwrap().take() {
             unsafe {
                 IOPMAssertionRelease(id);
@@ -371,19 +391,31 @@ fn composite_cursor_marker(image: &CGImage, nx: f64, ny: f64) -> Option<CFRetain
 /// with this dev machine's test binary untrusted, a `MouseMove` event
 /// posted correctly but the real system cursor never moved at all — see
 /// `verify_mouse_move_reaches_real_cursor_position` below.
-fn inject_event(event: InputEventKind) {
+///
+/// Every event carries the modifiers `held` says are down — see `HeldKeys`
+/// for why that has to be done by hand.
+fn inject_event(event: InputEventKind, held: &mut HeldKeys) {
     crate::media_mac::ensure_accessibility_trust();
     let display_id = CGMainDisplayID();
     let bounds = CGDisplayBounds(display_id);
     let width = CGDisplayPixelsWide(display_id) as f64;
     let height = CGDisplayPixelsHigh(display_id) as f64;
+    let flags = held.flags();
 
     match event {
-        InputEventKind::KeyDown { code } => post(CGEvent::new_keyboard_event(None, code as u16, true)),
-        InputEventKind::KeyUp { code } => post(CGEvent::new_keyboard_event(None, code as u16, false)),
+        // Codes past `u16` can't be a key; truncating one could alias a
+        // real key, so it's dropped instead.
+        InputEventKind::KeyDown { code } => match u16::try_from(code).ok().and_then(|code| held.key_down(code)) {
+            Some(press) => post_key(&press),
+            None => tracing::trace!("key down {code:#x}: nothing to post"),
+        },
+        InputEventKind::KeyUp { code } => match u16::try_from(code).ok().and_then(|code| held.key_up(code)) {
+            Some(release) => post_key(&release),
+            None => tracing::trace!("key up {code:#x}: nothing to post"),
+        },
         InputEventKind::MouseMove { x, y } => {
             let point = CGPoint { x: bounds.origin.x + x * width, y: bounds.origin.y + y * height };
-            post(CGEvent::new_mouse_event(None, CGEventType::MouseMoved, point, CGMouseButton::Left));
+            post(CGEvent::new_mouse_event(None, CGEventType::MouseMoved, point, CGMouseButton::Left), flags);
         }
         InputEventKind::MouseButton { button, down } => {
             let point = current_mouse_location();
@@ -395,7 +427,7 @@ fn inject_event(event: InputEventKind) {
                 (ProtoMouseButton::Middle, true) => (CGEventType::OtherMouseDown, CGMouseButton::Center),
                 (ProtoMouseButton::Middle, false) => (CGEventType::OtherMouseUp, CGMouseButton::Center),
             };
-            post(CGEvent::new_mouse_event(None, event_type, point, cg_button));
+            post(CGEvent::new_mouse_event(None, event_type, point, cg_button), flags);
         }
         InputEventKind::MouseScroll { delta_x, delta_y } => {
             // Pixel units, not "line" units — the controller's delta is
@@ -403,24 +435,171 @@ fn inject_event(event: InputEventKind) {
             // a touch gesture or a mouse wheel), closer in spirit to
             // pixel-precision scrolling than a fixed number of
             // discrete lines.
-            post(CGEvent::new_scroll_wheel_event2(
-                None,
-                CGScrollEventUnit::Pixel,
-                2,
-                delta_y as i32,
-                delta_x as i32,
-                0,
-            ));
+            post(CGEvent::new_scroll_wheel_event2(None, CGScrollEventUnit::Pixel, 2, delta_y as i32, delta_x as i32, 0), flags);
         }
     }
 }
 
-fn post(event: Option<objc2_core_foundation::CFRetained<CGEvent>>) {
+/// Posts `event` with `held` as its modifier flags (see `HeldKeys`).
+fn post(event: Option<objc2_core_foundation::CFRetained<CGEvent>>, held: u64) {
     let Some(event) = event else {
         tracing::debug!("couldn't construct synthetic input event");
         return;
     };
+    // Only the modifier bits this file manages are replaced; anything
+    // else the system set on the new event (Caps Lock's state, the
+    // non-coalesced bit) is left as it was.
+    let flags = CGEvent::flags(Some(&event)).0;
+    CGEvent::set_flags(Some(&event), CGEventFlags((flags & !MANAGED_MODIFIER_FLAGS) | held));
     CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+}
+
+/// Posts one key event worked out by `HeldKeys`.
+fn post_key(key: &KeyPost) {
+    let event = CGEvent::new_keyboard_event(None, key.code, key.down);
+    if let Some(event) = &event {
+        match key.kind {
+            // What a real keyboard sends for a modifier: not a key down or
+            // up but a "flags changed", carrying the new set of modifiers.
+            KeyPostKind::FlagsChanged => CGEvent::set_type(Some(event), CGEventType::FlagsChanged),
+            KeyPostKind::Key { autorepeat: true } => {
+                CGEvent::set_integer_value_field(Some(event), CGEventField::KeyboardEventAutorepeat, 1)
+            }
+            KeyPostKind::Key { autorepeat: false } => {}
+        }
+    }
+    post(event, key.flags);
+}
+
+// Carbon's `kVK_*` codes for the modifier keys (`Events.h`).
+const KVK_COMMAND: u16 = 0x37;
+const KVK_RIGHT_COMMAND: u16 = 0x36;
+const KVK_SHIFT: u16 = 0x38;
+const KVK_RIGHT_SHIFT: u16 = 0x3C;
+const KVK_OPTION: u16 = 0x3A;
+const KVK_RIGHT_OPTION: u16 = 0x3D;
+const KVK_CONTROL: u16 = 0x3B;
+const KVK_RIGHT_CONTROL: u16 = 0x3E;
+
+// The left/right-specific halves of the modifier flags (IOKit's
+// `IOLLEvent.h`, `NX_DEVICE*KEYMASK`), which real keyboard events carry
+// alongside the device-independent `CGEventFlags` masks and which apps
+// that tell left from right look at.
+const DEVICE_LEFT_CONTROL: u64 = 0x0000_0001;
+const DEVICE_LEFT_SHIFT: u64 = 0x0000_0002;
+const DEVICE_RIGHT_SHIFT: u64 = 0x0000_0004;
+const DEVICE_LEFT_COMMAND: u64 = 0x0000_0008;
+const DEVICE_RIGHT_COMMAND: u64 = 0x0000_0010;
+const DEVICE_LEFT_OPTION: u64 = 0x0000_0020;
+const DEVICE_RIGHT_OPTION: u64 = 0x0000_0040;
+const DEVICE_RIGHT_CONTROL: u64 = 0x0000_2000;
+
+/// Every flag bit `modifier_flags` can set — the part of an injected
+/// event's flags this file owns.
+const MANAGED_MODIFIER_FLAGS: u64 = CGEventFlags::MaskShift.0
+    | CGEventFlags::MaskControl.0
+    | CGEventFlags::MaskAlternate.0
+    | CGEventFlags::MaskCommand.0
+    | DEVICE_LEFT_CONTROL
+    | DEVICE_LEFT_SHIFT
+    | DEVICE_RIGHT_SHIFT
+    | DEVICE_LEFT_COMMAND
+    | DEVICE_RIGHT_COMMAND
+    | DEVICE_LEFT_OPTION
+    | DEVICE_RIGHT_OPTION
+    | DEVICE_RIGHT_CONTROL;
+
+/// The flags a modifier key sets while it's held; `None` for any other key.
+fn modifier_flags(code: u16) -> Option<u64> {
+    Some(match code {
+        KVK_COMMAND => CGEventFlags::MaskCommand.0 | DEVICE_LEFT_COMMAND,
+        KVK_RIGHT_COMMAND => CGEventFlags::MaskCommand.0 | DEVICE_RIGHT_COMMAND,
+        KVK_SHIFT => CGEventFlags::MaskShift.0 | DEVICE_LEFT_SHIFT,
+        KVK_RIGHT_SHIFT => CGEventFlags::MaskShift.0 | DEVICE_RIGHT_SHIFT,
+        KVK_OPTION => CGEventFlags::MaskAlternate.0 | DEVICE_LEFT_OPTION,
+        KVK_RIGHT_OPTION => CGEventFlags::MaskAlternate.0 | DEVICE_RIGHT_OPTION,
+        KVK_CONTROL => CGEventFlags::MaskControl.0 | DEVICE_LEFT_CONTROL,
+        KVK_RIGHT_CONTROL => CGEventFlags::MaskControl.0 | DEVICE_RIGHT_CONTROL,
+        _ => return None,
+    })
+}
+
+/// What the controlling device is holding down on this Mac.
+///
+/// A key event posted with `CGEventPost` can't be relied on to pick up
+/// modifiers from earlier posted events — posting Command down and then C
+/// is widely reported to type a plain "c" in many apps rather than
+/// trigger Command-C. A real keyboard's events each carry the full set of
+/// modifiers held at that moment, so this tracks them from the modifier
+/// keys' own downs and ups and stamps them onto every key and mouse event
+/// (Shift-click, Command-click too). The modifier keys themselves go out
+/// as "flags changed" events, like a real keyboard's. Codes from the
+/// Android app (letters, digits, space, Return, Delete — never a modifier)
+/// pass through as before, with no modifier flags.
+#[derive(Default)]
+struct HeldKeys {
+    /// Modifier key codes held, in press order.
+    modifiers: Vec<u16>,
+    /// Other key codes held — a second down for one of these is the
+    /// controlling side's auto-repeat.
+    keys: Vec<u16>,
+}
+
+#[derive(Debug, PartialEq)]
+struct KeyPost {
+    code: u16,
+    down: bool,
+    kind: KeyPostKind,
+    /// The modifier flags to post with — for a modifier key, the set after
+    /// this press or release, as a "flags changed" event reports it.
+    flags: u64,
+}
+
+#[derive(Debug, PartialEq)]
+enum KeyPostKind {
+    FlagsChanged,
+    Key { autorepeat: bool },
+}
+
+impl HeldKeys {
+    fn flags(&self) -> u64 {
+        self.modifiers.iter().filter_map(|&code| modifier_flags(code)).fold(0, |all, flags| all | flags)
+    }
+
+    fn key_down(&mut self, code: u16) -> Option<KeyPost> {
+        if modifier_flags(code).is_some() {
+            // Modifiers don't repeat on a real keyboard.
+            if self.modifiers.contains(&code) {
+                return None;
+            }
+            self.modifiers.push(code);
+            return Some(KeyPost { code, down: true, kind: KeyPostKind::FlagsChanged, flags: self.flags() });
+        }
+        let autorepeat = self.keys.contains(&code);
+        if !autorepeat {
+            self.keys.push(code);
+        }
+        Some(KeyPost { code, down: true, kind: KeyPostKind::Key { autorepeat }, flags: self.flags() })
+    }
+
+    fn key_up(&mut self, code: u16) -> Option<KeyPost> {
+        if modifier_flags(code).is_some() {
+            let index = self.modifiers.iter().position(|&held| held == code)?;
+            self.modifiers.remove(index);
+            return Some(KeyPost { code, down: false, kind: KeyPostKind::FlagsChanged, flags: self.flags() });
+        }
+        // Posted even if it wasn't held: a stray key-up is harmless, a key
+        // left down isn't.
+        self.keys.retain(|&held| held != code);
+        Some(KeyPost { code, down: false, kind: KeyPostKind::Key { autorepeat: false }, flags: self.flags() })
+    }
+
+    /// Releases for everything held — keys first, then modifiers, each
+    /// last-pressed first.
+    fn release_all(&mut self) -> Vec<KeyPost> {
+        let keys: Vec<u16> = self.keys.iter().rev().chain(self.modifiers.iter().rev()).copied().collect();
+        keys.into_iter().filter_map(|code| self.key_up(code)).collect()
+    }
 }
 
 /// `CGEventCreateMouseEvent` needs a position even for a button-only
@@ -485,19 +664,40 @@ mod manual_verification {
     fn send_test_keystroke() {
         // 'A' key, per-platform virtual keycode (kVK_ANSI_A = 0x00) —
         // types into whatever's focused when this runs.
-        inject_event(InputEventKind::KeyDown { code: 0x00 });
+        let mut held = HeldKeys::default();
+        inject_event(InputEventKind::KeyDown { code: 0x00 }, &mut held);
         std::thread::sleep(Duration::from_millis(50));
-        inject_event(InputEventKind::KeyUp { code: 0x00 });
+        inject_event(InputEventKind::KeyUp { code: 0x00 }, &mut held);
+    }
+
+    /// Shift-A then Command-A: an "A", then everything in the focused
+    /// text field selected — proof the modifier flags reach the target.
+    #[test]
+    #[ignore]
+    fn send_test_shortcuts() {
+        let mut held = HeldKeys::default();
+        for modifier in [KVK_SHIFT, KVK_COMMAND] {
+            for event in [
+                InputEventKind::KeyDown { code: modifier.into() },
+                InputEventKind::KeyDown { code: 0x00 },
+                InputEventKind::KeyUp { code: 0x00 },
+                InputEventKind::KeyUp { code: modifier.into() },
+            ] {
+                inject_event(event, &mut held);
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
     }
 
     #[test]
     #[ignore]
     fn send_test_click() {
-        inject_event(InputEventKind::MouseMove { x: 0.5, y: 0.5 });
+        let mut held = HeldKeys::default();
+        inject_event(InputEventKind::MouseMove { x: 0.5, y: 0.5 }, &mut held);
         std::thread::sleep(Duration::from_millis(50));
-        inject_event(InputEventKind::MouseButton { button: ProtoMouseButton::Left, down: true });
+        inject_event(InputEventKind::MouseButton { button: ProtoMouseButton::Left, down: true }, &mut held);
         std::thread::sleep(Duration::from_millis(50));
-        inject_event(InputEventKind::MouseButton { button: ProtoMouseButton::Left, down: false });
+        inject_event(InputEventKind::MouseButton { button: ProtoMouseButton::Left, down: false }, &mut held);
     }
 
     /// Self-contained — doesn't depend on any app being focused. Moves
@@ -516,13 +716,91 @@ mod manual_verification {
         let height = CGDisplayPixelsHigh(display_id) as f64;
 
         for (x, y) in [(0.25, 0.25), (0.75, 0.6)] {
-            inject_event(InputEventKind::MouseMove { x, y });
+            inject_event(InputEventKind::MouseMove { x, y }, &mut HeldKeys::default());
             std::thread::sleep(Duration::from_millis(100));
             let expected = CGPoint { x: bounds.origin.x + x * width, y: bounds.origin.y + y * height };
             let actual = current_mouse_location();
             println!("requested ({x}, {y}) normalized -> expected {expected:?}, real cursor now at {actual:?}");
             assert!((actual.x - expected.x).abs() < 1.0, "cursor x didn't move to the requested position");
             assert!((actual.y - expected.y).abs() < 1.0, "cursor y didn't move to the requested position");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const COMMAND: u64 = 0x0010_0000 | DEVICE_LEFT_COMMAND;
+    const SHIFT: u64 = 0x0002_0000 | DEVICE_LEFT_SHIFT;
+    const KVK_ANSI_C: u16 = 0x08;
+
+    fn key(code: u16, down: bool, autorepeat: bool, flags: u64) -> Option<KeyPost> {
+        Some(KeyPost { code, down, kind: KeyPostKind::Key { autorepeat }, flags })
+    }
+
+    fn modifier(code: u16, down: bool, flags: u64) -> Option<KeyPost> {
+        Some(KeyPost { code, down, kind: KeyPostKind::FlagsChanged, flags })
+    }
+
+    #[test]
+    fn command_c_carries_the_command_flag() {
+        let mut held = HeldKeys::default();
+        assert_eq!(held.key_down(KVK_COMMAND), modifier(KVK_COMMAND, true, COMMAND));
+        assert_eq!(held.key_down(KVK_ANSI_C), key(KVK_ANSI_C, true, false, COMMAND));
+        assert_eq!(held.key_up(KVK_ANSI_C), key(KVK_ANSI_C, false, false, COMMAND));
+        // The modifier's own release reports the set *after* it.
+        assert_eq!(held.key_up(KVK_COMMAND), modifier(KVK_COMMAND, false, 0));
+        assert_eq!(held.key_down(KVK_ANSI_C), key(KVK_ANSI_C, true, false, 0));
+    }
+
+    #[test]
+    fn modifiers_combine_and_left_right_stay_apart() {
+        let mut held = HeldKeys::default();
+        held.key_down(KVK_SHIFT);
+        assert_eq!(held.key_down(KVK_COMMAND), modifier(KVK_COMMAND, true, COMMAND | SHIFT));
+        held.key_down(KVK_RIGHT_COMMAND);
+        held.key_up(KVK_COMMAND);
+        // Right Command still down: still Command, but only the right one.
+        assert_eq!(held.flags(), 0x0010_0000 | DEVICE_RIGHT_COMMAND | SHIFT);
+    }
+
+    #[test]
+    fn repeats_are_marked_and_modifiers_dont_repeat() {
+        let mut held = HeldKeys::default();
+        assert_eq!(held.key_down(KVK_ANSI_C), key(KVK_ANSI_C, true, false, 0));
+        assert_eq!(held.key_down(KVK_ANSI_C), key(KVK_ANSI_C, true, true, 0));
+        held.key_down(KVK_SHIFT);
+        assert_eq!(held.key_down(KVK_SHIFT), None);
+        // A release of a modifier that isn't down changes nothing.
+        assert_eq!(held.key_up(KVK_OPTION), None);
+    }
+
+    #[test]
+    fn release_all_lets_go_keys_first_then_modifiers() {
+        let mut held = HeldKeys::default();
+        held.key_down(KVK_COMMAND);
+        held.key_down(KVK_SHIFT);
+        held.key_down(KVK_ANSI_C);
+        assert_eq!(
+            held.release_all(),
+            vec![
+                key(KVK_ANSI_C, false, false, COMMAND | SHIFT).unwrap(),
+                modifier(KVK_SHIFT, false, COMMAND).unwrap(),
+                modifier(KVK_COMMAND, false, 0).unwrap(),
+            ]
+        );
+        assert!(held.release_all().is_empty());
+        assert_eq!(held.flags(), 0);
+    }
+
+    #[test]
+    fn android_codes_pass_through_without_flags() {
+        let mut held = HeldKeys::default();
+        // kVK_ANSI_A, kVK_Space, kVK_Return, kVK_Delete.
+        for code in [0x00, 0x31, 0x24, 0x33] {
+            assert_eq!(held.key_down(code), key(code, true, false, 0));
+            assert_eq!(held.key_up(code), key(code, false, false, 0));
         }
     }
 }
