@@ -6,3 +6,4 @@ Exec=continuityd
 Icon=continuity
 Terminal=false
 Categories=Utility;Network;
+StartupWMClass=continuityd
