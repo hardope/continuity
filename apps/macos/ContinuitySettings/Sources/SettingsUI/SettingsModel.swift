@@ -90,6 +90,12 @@ public final class SettingsModel: ObservableObject {
         perform(["op": "disconnect", "device": id])
     }
 
+    /// Looks for nearby devices again, and redials paired ones that aren't
+    /// connected — what the tray's Refresh used to do.
+    public func refreshNearby() {
+        perform(["op": "refresh_nearby"])
+    }
+
     public func forget(_ device: PairedDevice) {
         if selection == .device(device.id) {
             selection = .thisDevice

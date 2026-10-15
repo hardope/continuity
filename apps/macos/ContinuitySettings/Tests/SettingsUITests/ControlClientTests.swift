@@ -165,8 +165,8 @@ final class ControlClientTests: XCTestCase {
     /// (`requests_parse_by_op` in core/continuityd/src/control.rs).
     @MainActor
     func testTransfersFoldersAndRemoteControlRequests() async throws {
-        let arrived = expectation(description: "four requests")
-        arrived.expectedFulfillmentCount = 4
+        let arrived = expectation(description: "five requests")
+        arrived.expectedFulfillmentCount = 5
         var requests: [String: [String: Any]] = [:]
         let server = try FakeContinuityd(token: "secret") { request in
             XCTAssertEqual(request["token"] as? String, "secret")
@@ -189,6 +189,7 @@ final class ControlClientTests: XCTestCase {
         model.setReceivedFilesDir("/Users/me/Incoming")
         model.openReceivedFilesDir()
         model.openTransfer(photo, reveal: true)
+        model.refreshNearby()
         await fulfillment(of: [arrived], timeout: 5)
         server.stop()
 
@@ -197,6 +198,7 @@ final class ControlClientTests: XCTestCase {
         XCTAssertEqual(requests["open_received_files_dir"]?.keys.sorted(), ["op", "token"])
         XCTAssertEqual(requests["open_transfer"]?["id"] as? String, "t2")
         XCTAssertEqual(requests["open_transfer"]?["reveal"] as? Bool, true)
+        XCTAssertEqual(requests["refresh_nearby"]?.keys.sorted(), ["op", "token"])
     }
 
     func testNotRunningWhenThereIsNoEndpoint() async {

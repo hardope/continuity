@@ -93,12 +93,29 @@ struct Sidebar: View {
                     .tag(SidebarItem.device(device.id))
                 }
             }
-            if !status.nearby.isEmpty {
-                Section("Nearby") {
-                    ForEach(status.nearby) { device in
-                        DeviceRow(name: device.name, symbol: device.platform.symbol, detail: "Not paired", online: nil)
-                            .tag(SidebarItem.nearby(device.id))
+            // Always shown, with a way to look again: it's where pairing
+            // starts.
+            Section {
+                if status.nearby.isEmpty {
+                    Text("None found")
+                        .foregroundStyle(.secondary)
+                }
+                ForEach(status.nearby) { device in
+                    DeviceRow(name: device.name, symbol: device.platform.symbol, detail: "Not paired", online: nil)
+                        .tag(SidebarItem.nearby(device.id))
+                }
+            } header: {
+                HStack {
+                    Text("Nearby")
+                    Spacer()
+                    Button {
+                        model.refreshNearby()
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
                     }
+                    .buttonStyle(.borderless)
+                    .help("Look for nearby devices again")
+                    .accessibilityLabel("Look for nearby devices again")
                 }
             }
         }
