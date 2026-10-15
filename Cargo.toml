@@ -34,3 +34,31 @@ hex = "0.4"
 [profile.release]
 opt-level = "z"
 lto = true
+
+# Size-optimized overall (above), but the few crates every byte of a file
+# transfer, screen frame or TLS record runs through are built for speed:
+# hashing (sha2), JPEG decode/resize for the screen stream (image,
+# zune-jpeg, zune-core), base64 and JSON for messages, and TLS and its
+# crypto (rustls, ring, aws-lc-rs, aws-lc-sys). They're a small share of
+# the binary, and with them at "z" a 512 MiB loopback file transfer ran at
+# well under half the speed (see "File transfer" in docs/protocol.md).
+[profile.release.package.sha2]
+opt-level = 3
+[profile.release.package.image]
+opt-level = 3
+[profile.release.package.zune-jpeg]
+opt-level = 3
+[profile.release.package.zune-core]
+opt-level = 3
+[profile.release.package.base64]
+opt-level = 3
+[profile.release.package.serde_json]
+opt-level = 3
+[profile.release.package.rustls]
+opt-level = 3
+[profile.release.package.ring]
+opt-level = 3
+[profile.release.package.aws-lc-rs]
+opt-level = 3
+[profile.release.package.aws-lc-sys]
+opt-level = 3
