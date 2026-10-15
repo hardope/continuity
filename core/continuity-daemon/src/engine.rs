@@ -323,15 +323,23 @@ struct SharedState {
     /// the write outright once it gives up — that's a real error, handled
     /// by the writer loop's own `break` on failure, completely
     /// independent of this staleness heuristic.
+    ///
+    /// In-band transfers only. A v3 transfer's data goes over its own
+    /// connection, so nothing it sends ever queues ahead of this mesh
+    /// connection's pings, and the staleness check stays meaningful while
+    /// one runs. **Real bug fixed here**: v3 data connections used to count
+    /// toward this suppression too (a separate `data_streams_in_flight`
+    /// counter). A sender whose receiver vanished mid-file (new address
+    /// after docking, out of range) then kept its equally dead mesh
+    /// connection open for as long as the data write stayed blocked, which
+    /// with unacknowledged data in flight is TCP's own retransmission limit,
+    /// about 15 minutes, since keepalive probes don't run then. The
+    /// receiver's reconnect from its new address was refused as "already
+    /// connected" for all that time. Dropping the mesh connection mid-file
+    /// costs a v3 transfer nothing: its data connection carries on by
+    /// itself, and the mesh is only needed again to re-offer after an
+    /// interruption, which waits for the reconnect.
     file_transfers_in_flight: Mutex<HashMap<String, u32>>,
-    /// The same suppression for v3 transfers, counted separately: a v3
-    /// transfer's data goes over its own connection, which can outlive the
-    /// mesh connection (`clear_file_transfers` runs on every mesh teardown
-    /// and would otherwise zero a count a data connection still holds).
-    /// Counted only while a data connection is actually streaming — see
-    /// `transfer::DataStreamGuard` — not while a transfer is stalled
-    /// waiting to resume, when there's nothing on the wire to protect.
-    data_streams_in_flight: Mutex<HashMap<String, u32>>,
     /// Engine-wide (not per-connection) v3 transfer state — see the
     /// `transfer` module. Incoming keyed by (peer id, transfer id), since a
     /// transfer id is only unique per sender; outgoing by transfer id.
@@ -444,7 +452,6 @@ impl SharedState {
 
     fn has_file_transfer_in_flight(&self, peer_crypto_id: &str) -> bool {
         self.file_transfers_in_flight.lock().unwrap().contains_key(peer_crypto_id)
-            || self.data_streams_in_flight.lock().unwrap().contains_key(peer_crypto_id)
     }
 
     /// Unconditionally zeroes out `peer_crypto_id`'s in-flight count —
@@ -838,7 +845,6 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
         pending_pairings: Mutex::new(HashMap::new()),
         pending_file_accepts: Mutex::new(HashMap::new()),
         file_transfers_in_flight: Mutex::new(HashMap::new()),
-        data_streams_in_flight: Mutex::new(HashMap::new()),
         incoming_transfers: Mutex::new(HashMap::new()),
         outgoing_transfers: Mutex::new(HashMap::new()),
         incoming_transfers_changed: Notify::new(),

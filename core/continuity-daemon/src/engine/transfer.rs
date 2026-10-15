@@ -83,6 +83,20 @@ const DATA_DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 /// and a data connection its handshake.
 const FIRST_MESSAGE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long one frame write on a data connection (or the end of the
+/// stream) may go without completing before the sender gives up on that
+/// connection and resumes on a new one. **Real bug fixed here**: these
+/// writes had no limit at all. A receiver that vanishes without a reset (a
+/// laptop docking onto Ethernet and getting a new address, a phone leaving
+/// the network) leaves unacknowledged data in flight, and in that state the
+/// OS sends no keepalive probes: the write just blocked until TCP's own
+/// retransmission limit, about 15 minutes. By then the receiver, whose
+/// idle end keepalive closes in about 2, had expired its partial file, so
+/// the resume started over from 0. A minute of no progress at all is far
+/// past any link that's merely slow (it's 1 MiB, so under 17 KiB/s), and
+/// what it costs a live but stalled one is a resume, not the transfer.
+const WRITE_PROGRESS_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// How long the sender waits for `FileVerified` after `FileComplete`. The
 /// receiver only has its last few queued frames left to write by then (it
 /// hashes as it goes), plus a rename.
@@ -185,35 +199,6 @@ struct PartFile {
     file: std::fs::File,
     hasher: IncrementalHash,
     written: u64,
-}
-
-/// Counts a running data connection toward
-/// `SharedState::data_streams_in_flight` for as long as it lives — a guard
-/// rather than paired calls, because these tasks are aborted from outside
-/// (resume, cancel, shutdown) and an abort runs no code after the await it
-/// stops at, only destructors.
-struct DataStreamGuard {
-    state: Arc<SharedState>,
-    peer_id: String,
-}
-
-impl DataStreamGuard {
-    fn new(state: &Arc<SharedState>, peer_id: &str) -> Self {
-        *state.data_streams_in_flight.lock().unwrap().entry(peer_id.to_string()).or_insert(0) += 1;
-        Self { state: state.clone(), peer_id: peer_id.to_string() }
-    }
-}
-
-impl Drop for DataStreamGuard {
-    fn drop(&mut self) {
-        let mut in_flight = self.state.data_streams_in_flight.lock().unwrap();
-        if let Some(count) = in_flight.get_mut(&self.peer_id) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                in_flight.remove(&self.peer_id);
-            }
-        }
-    }
 }
 
 fn emit_progress(state: &SharedState, transfer_id: &str, before: u64, now: u64, total: u64, direction: FileTransferDirection) {
@@ -643,7 +628,6 @@ async fn receive_stream(mut conn: Connection, state: Arc<SharedState>, key: (Str
     let StreamClaim { epoch, part, part_path, file_name, peer_name, size_bytes } = claim;
     let transfer_id = key.1.clone();
     let offset = part.written;
-    let _in_flight = DataStreamGuard::new(&state, &key.0);
     if offset > 0 {
         // Picking up after a stall — the next progress event is what tells
         // a shell it resumed (see `SyncEvent::FileTransferStalled`).
@@ -1133,7 +1117,6 @@ async fn stream_file(state: &Arc<SharedState>, o: &Outgoing, addr: SocketAddr, o
         return Err(StreamError::Dial(format!("couldn't start the data connection: {e}")));
     }
 
-    let _in_flight = DataStreamGuard::new(state, &o.peer_id);
     if offset > 0 {
         state.emit(SyncEvent::FileTransferProgress {
             transfer_id: o.transfer_id.clone(),
@@ -1144,9 +1127,12 @@ async fn stream_file(state: &Arc<SharedState>, o: &Outgoing, addr: SocketAddr, o
     }
     let cut_after = state.test_hooks.cut_data_connection_after.swap(0, Ordering::Relaxed);
     let mut sent = 0u64;
+    let stalled = || format!("the receiver took nothing for {} seconds", WRITE_PROGRESS_TIMEOUT.as_secs());
     while let Some(chunk) = chunks_rx.recv().await {
-        if let Err(e) = write_frame_unflushed(&mut conn, &chunk).await {
-            return Err(StreamError::Interrupted { sent, reason: e.to_string() });
+        match tokio::time::timeout(WRITE_PROGRESS_TIMEOUT, write_frame_unflushed(&mut conn, &chunk)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(StreamError::Interrupted { sent, reason: e.to_string() }),
+            Err(_) => return Err(StreamError::Interrupted { sent, reason: stalled() }),
         }
         let before = offset + sent;
         sent += chunk.len() as u64;
@@ -1166,10 +1152,11 @@ async fn stream_file(state: &Arc<SharedState>, o: &Outgoing, addr: SocketAddr, o
         // `write_message` flushes, which also pushes out any frame still
         // buffered from the loop above.
         write_message(&mut conn, &Message::FileComplete { transfer_id: o.transfer_id.clone(), content_hash }).await
-    }
-    .await;
-    if let Err(e) = end {
-        return Err(StreamError::Interrupted { sent, reason: e.to_string() });
+    };
+    match tokio::time::timeout(WRITE_PROGRESS_TIMEOUT, end).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(StreamError::Interrupted { sent, reason: e.to_string() }),
+        Err(_) => return Err(StreamError::Interrupted { sent, reason: stalled() }),
     }
     match tokio::time::timeout(VERIFY_TIMEOUT, read_message(&mut conn)).await {
         Ok(Ok(Message::FileVerified { ok: true, .. })) => Ok(()),
