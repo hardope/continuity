@@ -20,7 +20,7 @@
 use continuity_daemon::RemoteControlHost;
 use continuity_proto::{InputEventKind, MouseButton as ProtoMouseButton};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use windows::Win32::Graphics::Gdi::{
@@ -28,9 +28,9 @@ use windows::Win32::Graphics::Gdi::{
     BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HGDIOBJ, SRCCOPY,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
-    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
-    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT, VIRTUAL_KEY,
+    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
+    MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
+    MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT, VIRTUAL_KEY,
 };
 use windows::Win32::Foundation::GetLastError;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -41,11 +41,24 @@ const CAPTURE_FPS: u64 = 10;
 
 pub struct WindowsRemoteControlHost {
     capturing: Arc<AtomicBool>,
+    /// Virtual keys the controlling device currently holds down here, so
+    /// a session that ends without their key-ups (the other computer
+    /// slept, the network dropped) can still let go of them — an injected
+    /// Ctrl or Shift left down would go on modifying the local person's
+    /// own typing until they happened to press and release it themselves.
+    held_keys: Mutex<Vec<u16>>,
 }
 
 impl WindowsRemoteControlHost {
     pub fn new() -> Self {
-        Self { capturing: Arc::new(AtomicBool::new(false)) }
+        Self { capturing: Arc::new(AtomicBool::new(false)), held_keys: Mutex::new(Vec::new()) }
+    }
+
+    fn release_held_keys(&self) {
+        let held = std::mem::take(&mut *self.held_keys.lock().unwrap());
+        for vk in held.into_iter().rev() {
+            send_key_event(vk, true);
+        }
     }
 }
 
@@ -57,10 +70,29 @@ impl Default for WindowsRemoteControlHost {
 
 impl RemoteControlHost for WindowsRemoteControlHost {
     fn inject(&self, event: InputEventKind) {
+        match event {
+            // Codes past `u16` can't be a virtual key; truncating one could
+            // alias a real key, so it's dropped instead.
+            InputEventKind::KeyDown { code } | InputEventKind::KeyUp { code } if u16::try_from(code).is_err() => {
+                tracing::debug!("ignoring out-of-range key code {code:#x}");
+                return;
+            }
+            InputEventKind::KeyDown { code } => {
+                let mut held = self.held_keys.lock().unwrap();
+                if !held.contains(&(code as u16)) {
+                    held.push(code as u16);
+                }
+            }
+            InputEventKind::KeyUp { code } => self.held_keys.lock().unwrap().retain(|&vk| vk != code as u16),
+            _ => {}
+        }
         inject_event(event);
     }
 
     fn start_capture(&self) -> Option<mpsc::Receiver<Vec<u8>>> {
+        // Nothing should be held at the start of a session; if a previous
+        // one somehow left something, let go of it first.
+        self.release_held_keys();
         // Unlike macOS's Screen Recording permission, plain GDI
         // `BitBlt`-based capture needs no special OS permission grant at
         // all on Windows — this probe is purely "does capture actually
@@ -93,6 +125,7 @@ impl RemoteControlHost for WindowsRemoteControlHost {
 
     fn stop_capture(&self) {
         self.capturing.store(false, Ordering::Relaxed);
+        self.release_held_keys();
     }
 }
 
@@ -336,17 +369,16 @@ fn inject_event(event: InputEventKind) {
 }
 
 fn send_key_event(vk: u16, key_up: bool) {
+    let mut flags = KEYBD_EVENT_FLAGS::default();
+    if key_up {
+        flags |= KEYEVENTF_KEYUP;
+    }
+    if is_extended_key(vk) {
+        flags |= KEYEVENTF_EXTENDEDKEY;
+    }
     let input = INPUT {
         r#type: INPUT_KEYBOARD,
-        Anonymous: INPUT_0 {
-            ki: KEYBDINPUT {
-                wVk: VIRTUAL_KEY(vk),
-                wScan: 0,
-                dwFlags: if key_up { KEYEVENTF_KEYUP } else { Default::default() },
-                time: 0,
-                dwExtraInfo: 0,
-            },
-        },
+        Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: VIRTUAL_KEY(vk), wScan: 0, dwFlags: flags, time: 0, dwExtraInfo: 0 } },
     };
     // SAFETY: `input` is a single, correctly-sized, stack-local `INPUT`
     // matching what `SendInput` expects — same justification as
@@ -356,11 +388,54 @@ fn send_key_event(vk: u16, key_up: bool) {
     }
 }
 
+/// The keys a real keyboard sends with the "extended" (E0-prefixed) scan
+/// code — Microsoft's list: the arrows and the Insert/Delete/Home/End/
+/// Page Up/Page Down block beside them, the right-hand Ctrl and Alt, both
+/// Windows keys and the Menu key, Num Lock, Print Screen, and the keypad's
+/// divide (its Enter shares `VK_RETURN` with the main one, so it can't be
+/// told apart here). Without the flag, apps that read a key's extended bit
+/// rather than only its virtual key take an arrow or Home/End for the
+/// keypad key in the same place — Shift-arrow text selection is the
+/// well-known casualty — and can't tell right Ctrl/Alt from left.
+fn is_extended_key(vk: u16) -> bool {
+    matches!(
+        vk,
+        0x21..=0x28 // VK_PRIOR, VK_NEXT, VK_END, VK_HOME, VK_LEFT, VK_UP, VK_RIGHT, VK_DOWN
+            | 0x2C // VK_SNAPSHOT
+            | 0x2D // VK_INSERT
+            | 0x2E // VK_DELETE
+            | 0x5B // VK_LWIN
+            | 0x5C // VK_RWIN
+            | 0x5D // VK_APPS
+            | 0x6F // VK_DIVIDE
+            | 0x90 // VK_NUMLOCK
+            | 0xA3 // VK_RCONTROL
+            | 0xA5 // VK_RMENU
+    )
+}
+
 fn send_mouse_input(mi: MOUSEINPUT) {
     let input = INPUT { r#type: INPUT_MOUSE, Anonymous: INPUT_0 { mi } };
     // SAFETY: same as `send_key_event` above, just the mouse variant of
     // the same `INPUT` union.
     unsafe {
         SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extended_keys_are_the_documented_ones() {
+        for vk in [0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x2D, 0x2E, 0x5B, 0x5C, 0x6F, 0x90, 0xA3, 0xA5] {
+            assert!(is_extended_key(vk), "{vk:#x}");
+        }
+        // Left-hand modifiers, Right Shift (its own scan code), the main
+        // block and the rest of the keypad aren't.
+        for vk in [0x08, 0x09, 0x0D, 0x14, 0x1B, 0x20, 0x41, 0x60, 0x6A, 0x6B, 0x6D, 0x6E, 0x70, 0xA0, 0xA1, 0xA2, 0xA4, 0xBA] {
+            assert!(!is_extended_key(vk), "{vk:#x}");
+        }
     }
 }
