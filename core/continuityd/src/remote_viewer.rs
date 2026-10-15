@@ -35,13 +35,14 @@
 //!   in flight.
 //! - The UI thread only copies that buffer into the window and presents.
 //!
-//! Keyboard input reuses the same deliberately-small subset the Android
-//! app's bridge covers (lowercase letters, digits, space, enter,
-//! backspace — see `MainActivity.kt`'s `macKeyCodeFor`/
-//! `windowsKeyCodeFor`), mapped from `tao`'s layout-independent
-//! `physical_key` instead of a typed character, for the same reason
-//! `InputEventKind` itself uses raw platform key codes: the receiving
-//! side's platform, not this one, decides what a code means.
+//! Keyboard input maps `tao`'s layout-independent `physical_key` to the
+//! *peer's* platform-native key codes (`InputEventKind` carries raw
+//! platform codes — the receiving side's platform, not this one, decides
+//! what a code means), covering the whole US-layout keyboard: letters,
+//! digits, punctuation, editing and navigation keys, F1–F12, both sides'
+//! modifiers and the keypad. Between a Mac and a PC, Command and Control
+//! trade places (see [`KeyTranslator`]), so the shortcut a person's hands
+//! already know does the same thing on the other computer.
 //!
 //! **Unverified beyond compiling and unit tests** — there's no way in
 //! this environment to actually open a real window, receive a real frame,
@@ -84,10 +85,10 @@ pub struct RemoteViewer {
     surface: softbuffer::Surface<Rc<Window>, Rc<Window>>,
     peer_id: String,
     commands: UnboundedSender<EngineCommand>,
-    peer_platform: Platform,
+    keyboard: KeyboardForwarder,
     /// Mouse buttons pressed on the peer and not yet released — released
-    /// on focus loss and close, so a drag interrupted by Cmd-Tab/Alt-Tab
-    /// doesn't stay "held" over there.
+    /// on focus loss and close, like `keyboard`'s held keys, so a drag
+    /// interrupted by Cmd-Tab/Alt-Tab doesn't stay "held" over there.
     held_buttons: Vec<ProtoMouseButton>,
     /// The most recent decoded frame, already sized for the window by the
     /// decoder thread — `None` until the first one arrives, so `redraw`
@@ -193,7 +194,7 @@ impl RemoteViewer {
             surface,
             peer_id: peer.id.to_string(),
             commands,
-            peer_platform: peer.platform,
+            keyboard: KeyboardForwarder::new(KeyTranslator::new(cfg!(target_os = "macos"), peer.platform)),
             held_buttons: Vec::new(),
             frame: None,
             placement: None,
@@ -302,7 +303,7 @@ impl RemoteViewer {
         match event {
             WindowEvent::CloseRequested => {
                 // Before the session ends, while the peer still accepts
-                // input — no button should stay held down over there.
+                // input — nothing should stay held down over there.
                 self.release_all();
                 let _ = self.commands.send(EngineCommand::EndRemoteControlSession { peer_crypto_id: self.peer_id.clone() });
                 return ViewerAction::Closed;
@@ -344,31 +345,41 @@ impl RemoteViewer {
                     self.send(InputEventKind::MouseScroll { delta_x, delta_y });
                 }
             }
-            WindowEvent::KeyboardInput { event, .. } => {
-                tracing::debug!("handle_window_event: KeyboardInput physical_key={:?} state={:?} repeat={}", event.physical_key, event.state, event.repeat);
-                if !event.repeat {
-                    match target_key_code(event.physical_key, self.peer_platform) {
-                        Some(code) => {
-                            let kind = if event.state == ElementState::Pressed {
-                                InputEventKind::KeyDown { code }
-                            } else {
-                                InputEventKind::KeyUp { code }
-                            };
-                            self.send(kind);
-                        }
-                        None => tracing::debug!(
-                            "handle_window_event: no target key code for {:?} on platform {:?} — outside the supported subset",
-                            event.physical_key,
-                            self.peer_platform
-                        ),
-                    }
+            WindowEvent::KeyboardInput { event, is_synthetic, .. } => {
+                tracing::trace!(
+                    "handle_window_event: KeyboardInput physical_key={:?} state={:?} repeat={} synthetic={is_synthetic}",
+                    event.physical_key,
+                    event.state,
+                    event.repeat
+                );
+                // tao makes up presses for keys already held when the
+                // window gains focus (and releases when it loses it) on
+                // some platforms. Forwarding a made-up press would hold,
+                // say, the Alt that was part of the Alt-Tab into this
+                // window down on the peer; focus loss is handled below.
+                if *is_synthetic {
+                    return ViewerAction::None;
+                }
+                let pressed = match event.state {
+                    ElementState::Pressed => true,
+                    ElementState::Released => false,
+                    _ => return ViewerAction::None,
+                };
+                match self.keyboard.key(event.physical_key, pressed) {
+                    Some(kind) => self.send(kind),
+                    None if self.keyboard.translator.code(event.physical_key).is_none() => tracing::debug!(
+                        "handle_window_event: no target key code for {:?} on platform {:?}",
+                        event.physical_key,
+                        self.keyboard.translator.peer
+                    ),
+                    None => {}
                 }
             }
             WindowEvent::Focused(focused) => {
                 tracing::debug!("handle_window_event: window focus changed to {focused}");
                 if !*focused {
-                    // A button let go of now goes to whichever window has
-                    // focus, never to this one — so release here.
+                    // Key-ups for whatever's held go to whichever window
+                    // has focus now, never to this one — so release here.
                     self.release_all();
                 }
             }
@@ -427,11 +438,14 @@ impl RemoteViewer {
         }
     }
 
-    /// Lets go of every mouse button this viewer still holds down on the
-    /// peer.
+    /// Lets go of every key and mouse button this viewer still holds down
+    /// on the peer.
     fn release_all(&mut self) {
         for button in std::mem::take(&mut self.held_buttons) {
             self.send(InputEventKind::MouseButton { button, down: false });
+        }
+        for event in self.keyboard.release_all() {
+            self.send(event);
         }
     }
 
@@ -804,167 +818,430 @@ fn paint(buffer: &mut [u32], window: (u32, u32), frame: Option<(&ReadyFrame, Pla
     }
 }
 
-/// Translates a physical key position to the *target* (peer's) platform
-/// native code — same intentionally small subset as the Android
-/// keyboard bridge (see that file's own doc comment for why): lowercase
-/// letters, digits, space, enter, backspace. Anything else (shift,
-/// symbols, arrows, function keys) is silently dropped rather than sent
-/// as a wrong/misleading code.
-fn target_key_code(key: KeyCode, platform: Platform) -> Option<u32> {
-    match platform {
-        Platform::Windows => windows_key_code(key),
-        Platform::Linux => linux_key_code(key),
-        _ => mac_key_code(key),
+// ---------------------------------------------------------------------------
+// Keyboard
+// ---------------------------------------------------------------------------
+
+/// Turns this machine's physical keys into the peer's native key codes.
+///
+/// Between a Mac and a PC (Windows or Linux), Command and Control trade
+/// places, so the shortcut someone's hands already know does the same
+/// thing over there: from a Mac, Command arrives as Control and Control as
+/// the Windows/Super key; from a PC, Control arrives as Command and the
+/// Windows/Super key as Control. Mac to Mac and PC to PC send every key as
+/// it is. Since both directions are the same exchange, a key that crosses
+/// over and back comes home unchanged.
+#[derive(Clone, Copy, Debug)]
+struct KeyTranslator {
+    peer: Platform,
+    swap_command_and_control: bool,
+}
+
+impl KeyTranslator {
+    fn new(this_is_mac: bool, peer: Platform) -> Self {
+        Self { peer, swap_command_and_control: this_is_mac != (peer == Platform::MacOs) }
+    }
+
+    /// The physical key the peer should see pressed.
+    fn peer_key(&self, key: KeyCode) -> KeyCode {
+        if self.swap_command_and_control {
+            swap_command_and_control(key)
+        } else {
+            key
+        }
+    }
+
+    fn code(&self, key: KeyCode) -> Option<u32> {
+        native_key_code(self.peer_key(key), self.peer).map(u32::from)
     }
 }
 
-/// macOS `kVK_ANSI_*` codes — same table as `MainActivity.kt`'s
-/// `macKeyCodeFor`, just keyed by `tao::keyboard::KeyCode` instead of a
-/// typed character.
-fn mac_key_code(key: KeyCode) -> Option<u32> {
-    Some(match key {
-        KeyCode::KeyA => 0x00,
-        KeyCode::KeyS => 0x01,
-        KeyCode::KeyD => 0x02,
-        KeyCode::KeyF => 0x03,
-        KeyCode::KeyH => 0x04,
-        KeyCode::KeyG => 0x05,
-        KeyCode::KeyZ => 0x06,
-        KeyCode::KeyX => 0x07,
-        KeyCode::KeyC => 0x08,
-        KeyCode::KeyV => 0x09,
-        KeyCode::KeyB => 0x0B,
-        KeyCode::KeyQ => 0x0C,
-        KeyCode::KeyW => 0x0D,
-        KeyCode::KeyE => 0x0E,
-        KeyCode::KeyR => 0x0F,
-        KeyCode::KeyY => 0x10,
-        KeyCode::KeyT => 0x11,
-        KeyCode::Digit1 => 0x12,
-        KeyCode::Digit2 => 0x13,
-        KeyCode::Digit3 => 0x14,
-        KeyCode::Digit4 => 0x15,
-        KeyCode::Digit6 => 0x16,
-        KeyCode::Digit5 => 0x17,
-        KeyCode::Digit9 => 0x19,
-        KeyCode::Digit7 => 0x1A,
-        KeyCode::Digit8 => 0x1C,
-        KeyCode::Digit0 => 0x1D,
-        KeyCode::KeyO => 0x1F,
-        KeyCode::KeyU => 0x20,
-        KeyCode::KeyI => 0x22,
-        KeyCode::KeyP => 0x23,
-        KeyCode::KeyL => 0x25,
-        KeyCode::KeyJ => 0x26,
-        KeyCode::KeyK => 0x28,
-        KeyCode::KeyN => 0x2D,
-        KeyCode::KeyM => 0x2E,
-        KeyCode::Space => 0x31,
-        KeyCode::Enter => 0x24,
-        KeyCode::Backspace => 0x33,
-        _ => return None,
-    })
+fn swap_command_and_control(key: KeyCode) -> KeyCode {
+    match key {
+        KeyCode::ControlLeft => KeyCode::SuperLeft,
+        KeyCode::ControlRight => KeyCode::SuperRight,
+        KeyCode::SuperLeft => KeyCode::ControlLeft,
+        KeyCode::SuperRight => KeyCode::ControlRight,
+        other => other,
+    }
 }
 
-/// Windows virtual-key codes — the alphanumeric range is just the ASCII
-/// uppercase-letter/digit values, same as `MainActivity.kt`'s
-/// `windowsKeyCodeFor`.
-fn windows_key_code(key: KeyCode) -> Option<u32> {
-    Some(match key {
-        KeyCode::KeyA => b'A' as u32,
-        KeyCode::KeyB => b'B' as u32,
-        KeyCode::KeyC => b'C' as u32,
-        KeyCode::KeyD => b'D' as u32,
-        KeyCode::KeyE => b'E' as u32,
-        KeyCode::KeyF => b'F' as u32,
-        KeyCode::KeyG => b'G' as u32,
-        KeyCode::KeyH => b'H' as u32,
-        KeyCode::KeyI => b'I' as u32,
-        KeyCode::KeyJ => b'J' as u32,
-        KeyCode::KeyK => b'K' as u32,
-        KeyCode::KeyL => b'L' as u32,
-        KeyCode::KeyM => b'M' as u32,
-        KeyCode::KeyN => b'N' as u32,
-        KeyCode::KeyO => b'O' as u32,
-        KeyCode::KeyP => b'P' as u32,
-        KeyCode::KeyQ => b'Q' as u32,
-        KeyCode::KeyR => b'R' as u32,
-        KeyCode::KeyS => b'S' as u32,
-        KeyCode::KeyT => b'T' as u32,
-        KeyCode::KeyU => b'U' as u32,
-        KeyCode::KeyV => b'V' as u32,
-        KeyCode::KeyW => b'W' as u32,
-        KeyCode::KeyX => b'X' as u32,
-        KeyCode::KeyY => b'Y' as u32,
-        KeyCode::KeyZ => b'Z' as u32,
-        KeyCode::Digit0 => b'0' as u32,
-        KeyCode::Digit1 => b'1' as u32,
-        KeyCode::Digit2 => b'2' as u32,
-        KeyCode::Digit3 => b'3' as u32,
-        KeyCode::Digit4 => b'4' as u32,
-        KeyCode::Digit5 => b'5' as u32,
-        KeyCode::Digit6 => b'6' as u32,
-        KeyCode::Digit7 => b'7' as u32,
-        KeyCode::Digit8 => b'8' as u32,
-        KeyCode::Digit9 => b'9' as u32,
-        KeyCode::Space => 0x20,
-        KeyCode::Enter => 0x0D,
-        KeyCode::Backspace => 0x08,
-        _ => return None,
-    })
+/// Keys that hold a state rather than type something, so a held one is
+/// never repeated (Windows auto-repeats a held Shift; macOS would see each
+/// repeat as a fresh modifier change).
+fn is_modifier(key: KeyCode) -> bool {
+    matches!(
+        key,
+        KeyCode::ShiftLeft
+            | KeyCode::ShiftRight
+            | KeyCode::ControlLeft
+            | KeyCode::ControlRight
+            | KeyCode::AltLeft
+            | KeyCode::AltRight
+            | KeyCode::SuperLeft
+            | KeyCode::SuperRight
+            | KeyCode::CapsLock
+            | KeyCode::NumLock
+    )
 }
 
-/// Linux evdev `KEY_*` codes (`linux/input-event-codes.h`) — what
-/// `remote_control_linux.rs`'s `NotifyKeyboardKeycode` call expects
-/// directly. Same table as `MainActivity.kt`'s `linuxKeyCodeFor`.
-fn linux_key_code(key: KeyCode) -> Option<u32> {
-    Some(match key {
-        KeyCode::KeyQ => 16,
-        KeyCode::KeyW => 17,
-        KeyCode::KeyE => 18,
-        KeyCode::KeyR => 19,
-        KeyCode::KeyT => 20,
-        KeyCode::KeyY => 21,
-        KeyCode::KeyU => 22,
-        KeyCode::KeyI => 23,
-        KeyCode::KeyO => 24,
-        KeyCode::KeyP => 25,
-        KeyCode::KeyA => 30,
-        KeyCode::KeyS => 31,
-        KeyCode::KeyD => 32,
-        KeyCode::KeyF => 33,
-        KeyCode::KeyG => 34,
-        KeyCode::KeyH => 35,
-        KeyCode::KeyJ => 36,
-        KeyCode::KeyK => 37,
-        KeyCode::KeyL => 38,
-        KeyCode::KeyZ => 44,
-        KeyCode::KeyX => 45,
-        KeyCode::KeyC => 46,
-        KeyCode::KeyV => 47,
-        KeyCode::KeyB => 48,
-        KeyCode::KeyN => 49,
-        KeyCode::KeyM => 50,
-        KeyCode::Digit1 => 2,
-        KeyCode::Digit2 => 3,
-        KeyCode::Digit3 => 4,
-        KeyCode::Digit4 => 5,
-        KeyCode::Digit5 => 6,
-        KeyCode::Digit6 => 7,
-        KeyCode::Digit7 => 8,
-        KeyCode::Digit8 => 9,
-        KeyCode::Digit9 => 10,
-        KeyCode::Digit0 => 11,
-        KeyCode::Space => 57,
-        KeyCode::Enter => 28,
-        KeyCode::Backspace => 14,
-        _ => return None,
-    })
+/// Which keys are down on the peer because of this viewer — the codes
+/// sent a `KeyDown` and no `KeyUp` yet, in press order.
+struct KeyboardForwarder {
+    translator: KeyTranslator,
+    held: Vec<u32>,
 }
+
+impl KeyboardForwarder {
+    fn new(translator: KeyTranslator) -> Self {
+        Self { translator, held: Vec::new() }
+    }
+
+    /// The event to send for one local key press or release, if any. A
+    /// held key's auto-repeat goes out as another `KeyDown`, which is how
+    /// the peer repeats it too (injected keys don't auto-repeat on macOS
+    /// or Windows). Only keys this viewer pressed get released, so a key
+    /// already down when the window got focus doesn't send a stray `KeyUp`.
+    fn key(&mut self, key: KeyCode, pressed: bool) -> Option<InputEventKind> {
+        let code = self.translator.code(key)?;
+        let held = self.held.iter().position(|&c| c == code);
+        if pressed {
+            match held {
+                Some(_) if is_modifier(key) => None,
+                Some(_) => Some(InputEventKind::KeyDown { code }),
+                None => {
+                    self.held.push(code);
+                    Some(InputEventKind::KeyDown { code })
+                }
+            }
+        } else {
+            self.held.remove(held?);
+            Some(InputEventKind::KeyUp { code })
+        }
+    }
+
+    /// `KeyUp`s for everything still held, last pressed first — so a
+    /// shortcut lets go of its letter before its modifier, as hands do.
+    fn release_all(&mut self) -> Vec<InputEventKind> {
+        self.held.drain(..).rev().map(|code| InputEventKind::KeyUp { code }).collect()
+    }
+}
+
+/// A physical key's native code on `platform`: macOS `kVK_*` virtual key
+/// codes (Carbon's `Events.h`), Windows `VK_*` virtual-key codes
+/// (`WinUser.h`), Linux evdev `KEY_*` codes (`linux/input-event-codes.h` —
+/// what `remote_control_linux.rs`'s `NotifyKeyboardKeycode` expects).
+/// `None` for keys outside `KEY_CODES` and for Android/iOS, which can't be
+/// controlled.
+fn native_key_code(key: KeyCode, platform: Platform) -> Option<u16> {
+    let row = KEY_CODES.iter().find(|row| row.0 == key)?;
+    match platform {
+        Platform::MacOs => row.1,
+        Platform::Windows => row.2,
+        Platform::Linux => row.3,
+        Platform::Android | Platform::Ios => None,
+    }
+}
+
+/// `(key, macOS, Windows, Linux)` — a US-layout keyboard, by position.
+/// The letters, digits, space, Return and Backspace are the same codes the
+/// Android app sends (`macKeyCodeFor`/`windowsKeyCodeFor`/`linuxKeyCodeFor`
+/// in `MainActivity.kt`), so the controlled side handles both alike.
+/// A `None` is a key that platform doesn't have — see each one's comment.
+#[rustfmt::skip]
+const KEY_CODES: &[(KeyCode, Option<u16>, Option<u16>, Option<u16>)] = &[
+    (KeyCode::KeyA, Some(0x00), Some(0x41), Some(30)),
+    (KeyCode::KeyB, Some(0x0B), Some(0x42), Some(48)),
+    (KeyCode::KeyC, Some(0x08), Some(0x43), Some(46)),
+    (KeyCode::KeyD, Some(0x02), Some(0x44), Some(32)),
+    (KeyCode::KeyE, Some(0x0E), Some(0x45), Some(18)),
+    (KeyCode::KeyF, Some(0x03), Some(0x46), Some(33)),
+    (KeyCode::KeyG, Some(0x05), Some(0x47), Some(34)),
+    (KeyCode::KeyH, Some(0x04), Some(0x48), Some(35)),
+    (KeyCode::KeyI, Some(0x22), Some(0x49), Some(23)),
+    (KeyCode::KeyJ, Some(0x26), Some(0x4A), Some(36)),
+    (KeyCode::KeyK, Some(0x28), Some(0x4B), Some(37)),
+    (KeyCode::KeyL, Some(0x25), Some(0x4C), Some(38)),
+    (KeyCode::KeyM, Some(0x2E), Some(0x4D), Some(50)),
+    (KeyCode::KeyN, Some(0x2D), Some(0x4E), Some(49)),
+    (KeyCode::KeyO, Some(0x1F), Some(0x4F), Some(24)),
+    (KeyCode::KeyP, Some(0x23), Some(0x50), Some(25)),
+    (KeyCode::KeyQ, Some(0x0C), Some(0x51), Some(16)),
+    (KeyCode::KeyR, Some(0x0F), Some(0x52), Some(19)),
+    (KeyCode::KeyS, Some(0x01), Some(0x53), Some(31)),
+    (KeyCode::KeyT, Some(0x11), Some(0x54), Some(20)),
+    (KeyCode::KeyU, Some(0x20), Some(0x55), Some(22)),
+    (KeyCode::KeyV, Some(0x09), Some(0x56), Some(47)),
+    (KeyCode::KeyW, Some(0x0D), Some(0x57), Some(17)),
+    (KeyCode::KeyX, Some(0x07), Some(0x58), Some(45)),
+    (KeyCode::KeyY, Some(0x10), Some(0x59), Some(21)),
+    (KeyCode::KeyZ, Some(0x06), Some(0x5A), Some(44)),
+    (KeyCode::Digit1, Some(0x12), Some(0x31), Some(2)),
+    (KeyCode::Digit2, Some(0x13), Some(0x32), Some(3)),
+    (KeyCode::Digit3, Some(0x14), Some(0x33), Some(4)),
+    (KeyCode::Digit4, Some(0x15), Some(0x34), Some(5)),
+    (KeyCode::Digit5, Some(0x17), Some(0x35), Some(6)),
+    (KeyCode::Digit6, Some(0x16), Some(0x36), Some(7)),
+    (KeyCode::Digit7, Some(0x1A), Some(0x37), Some(8)),
+    (KeyCode::Digit8, Some(0x1C), Some(0x38), Some(9)),
+    (KeyCode::Digit9, Some(0x19), Some(0x39), Some(10)),
+    (KeyCode::Digit0, Some(0x1D), Some(0x30), Some(11)),
+    // Punctuation: kVK_ANSI_*, VK_OEM_*, KEY_*.
+    (KeyCode::Minus,        Some(0x1B), Some(0xBD), Some(12)),
+    (KeyCode::Equal,        Some(0x18), Some(0xBB), Some(13)),
+    (KeyCode::BracketLeft,  Some(0x21), Some(0xDB), Some(26)),
+    (KeyCode::BracketRight, Some(0x1E), Some(0xDD), Some(27)),
+    (KeyCode::Backslash,    Some(0x2A), Some(0xDC), Some(43)),
+    (KeyCode::Semicolon,    Some(0x29), Some(0xBA), Some(39)),
+    (KeyCode::Quote,        Some(0x27), Some(0xDE), Some(40)),
+    (KeyCode::Backquote,    Some(0x32), Some(0xC0), Some(41)),
+    (KeyCode::Comma,        Some(0x2B), Some(0xBC), Some(51)),
+    (KeyCode::Period,       Some(0x2F), Some(0xBE), Some(52)),
+    (KeyCode::Slash,        Some(0x2C), Some(0xBF), Some(53)),
+    (KeyCode::Space,     Some(0x31), Some(0x20), Some(57)),
+    (KeyCode::Enter,     Some(0x24), Some(0x0D), Some(28)),
+    (KeyCode::Tab,       Some(0x30), Some(0x09), Some(15)),
+    // macOS calls Backspace "Delete" (kVK_Delete) and Delete
+    // "Forward Delete" (kVK_ForwardDelete).
+    (KeyCode::Backspace, Some(0x33), Some(0x08), Some(14)),
+    (KeyCode::Escape,    Some(0x35), Some(0x1B), Some(1)),
+    (KeyCode::Delete,    Some(0x75), Some(0x2E), Some(111)),
+    // Mac keyboards have Help (kVK_Help) where PC ones have Insert; tao
+    // reports Help as Insert, so the two map onto each other.
+    (KeyCode::Insert,    Some(0x72), Some(0x2D), Some(110)),
+    (KeyCode::Home,      Some(0x73), Some(0x24), Some(102)),
+    (KeyCode::End,       Some(0x77), Some(0x23), Some(107)),
+    (KeyCode::PageUp,    Some(0x74), Some(0x21), Some(104)),
+    (KeyCode::PageDown,  Some(0x79), Some(0x22), Some(109)),
+    (KeyCode::ArrowLeft,  Some(0x7B), Some(0x25), Some(105)),
+    (KeyCode::ArrowRight, Some(0x7C), Some(0x27), Some(106)),
+    (KeyCode::ArrowUp,    Some(0x7E), Some(0x26), Some(103)),
+    (KeyCode::ArrowDown,  Some(0x7D), Some(0x28), Some(108)),
+    (KeyCode::F1,  Some(0x7A), Some(0x70), Some(59)),
+    (KeyCode::F2,  Some(0x78), Some(0x71), Some(60)),
+    (KeyCode::F3,  Some(0x63), Some(0x72), Some(61)),
+    (KeyCode::F4,  Some(0x76), Some(0x73), Some(62)),
+    (KeyCode::F5,  Some(0x60), Some(0x74), Some(63)),
+    (KeyCode::F6,  Some(0x61), Some(0x75), Some(64)),
+    (KeyCode::F7,  Some(0x62), Some(0x76), Some(65)),
+    (KeyCode::F8,  Some(0x64), Some(0x77), Some(66)),
+    (KeyCode::F9,  Some(0x65), Some(0x78), Some(67)),
+    (KeyCode::F10, Some(0x6D), Some(0x79), Some(68)),
+    (KeyCode::F11, Some(0x67), Some(0x7A), Some(87)),
+    (KeyCode::F12, Some(0x6F), Some(0x7B), Some(88)),
+    // Modifiers, left and right apart: Shift, Control, Alt/Option and
+    // Super (Command on a Mac, the Windows key on Windows, Meta on Linux).
+    (KeyCode::CapsLock,     Some(0x39), Some(0x14), Some(58)),
+    (KeyCode::ShiftLeft,    Some(0x38), Some(0xA0), Some(42)),
+    (KeyCode::ShiftRight,   Some(0x3C), Some(0xA1), Some(54)),
+    (KeyCode::ControlLeft,  Some(0x3B), Some(0xA2), Some(29)),
+    (KeyCode::ControlRight, Some(0x3E), Some(0xA3), Some(97)),
+    (KeyCode::AltLeft,      Some(0x3A), Some(0xA4), Some(56)),
+    (KeyCode::AltRight,     Some(0x3D), Some(0xA5), Some(100)),
+    (KeyCode::SuperLeft,    Some(0x37), Some(0x5B), Some(125)),
+    (KeyCode::SuperRight,   Some(0x36), Some(0x5C), Some(126)),
+    // Keypad: kVK_ANSI_Keypad*, VK_NUMPAD*/VK_MULTIPLY etc., KEY_KP*.
+    (KeyCode::Numpad0, Some(0x52), Some(0x60), Some(82)),
+    (KeyCode::Numpad1, Some(0x53), Some(0x61), Some(79)),
+    (KeyCode::Numpad2, Some(0x54), Some(0x62), Some(80)),
+    (KeyCode::Numpad3, Some(0x55), Some(0x63), Some(81)),
+    (KeyCode::Numpad4, Some(0x56), Some(0x64), Some(75)),
+    (KeyCode::Numpad5, Some(0x57), Some(0x65), Some(76)),
+    (KeyCode::Numpad6, Some(0x58), Some(0x66), Some(77)),
+    (KeyCode::Numpad7, Some(0x59), Some(0x67), Some(71)),
+    (KeyCode::Numpad8, Some(0x5B), Some(0x68), Some(72)),
+    (KeyCode::Numpad9, Some(0x5C), Some(0x69), Some(73)),
+    (KeyCode::NumpadDecimal,  Some(0x41), Some(0x6E), Some(83)),
+    (KeyCode::NumpadAdd,      Some(0x45), Some(0x6B), Some(78)),
+    (KeyCode::NumpadSubtract, Some(0x4E), Some(0x6D), Some(74)),
+    (KeyCode::NumpadMultiply, Some(0x43), Some(0x6A), Some(55)),
+    (KeyCode::NumpadDivide,   Some(0x4B), Some(0x6F), Some(98)),
+    // Windows has one virtual key for both Enters (the keypad one differs
+    // only by a scan-code flag a VK can't carry), so the keypad's arrives
+    // as the main Enter there.
+    (KeyCode::NumpadEnter,    Some(0x4C), Some(0x0D), Some(96)),
+    // Mac and Linux keypads have "="; Windows has no virtual key for one.
+    (KeyCode::NumpadEqual,    Some(0x51), None,       Some(117)),
+    // A Mac keypad's Clear (kVK_ANSI_KeypadClear) sits where Num Lock is,
+    // and tao reports it as Num Lock.
+    (KeyCode::NumLock,        Some(0x47), Some(0x90), Some(69)),
+];
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const DESKTOPS: [Platform; 3] = [Platform::MacOs, Platform::Windows, Platform::Linux];
+
+    /// Every key the viewer is meant to send — the brief's full list.
+    const EXPECTED_KEYS: &[KeyCode] = &[
+        KeyCode::KeyA, KeyCode::KeyB, KeyCode::KeyC, KeyCode::KeyD, KeyCode::KeyE, KeyCode::KeyF, KeyCode::KeyG,
+        KeyCode::KeyH, KeyCode::KeyI, KeyCode::KeyJ, KeyCode::KeyK, KeyCode::KeyL, KeyCode::KeyM, KeyCode::KeyN,
+        KeyCode::KeyO, KeyCode::KeyP, KeyCode::KeyQ, KeyCode::KeyR, KeyCode::KeyS, KeyCode::KeyT, KeyCode::KeyU,
+        KeyCode::KeyV, KeyCode::KeyW, KeyCode::KeyX, KeyCode::KeyY, KeyCode::KeyZ,
+        KeyCode::Digit0, KeyCode::Digit1, KeyCode::Digit2, KeyCode::Digit3, KeyCode::Digit4,
+        KeyCode::Digit5, KeyCode::Digit6, KeyCode::Digit7, KeyCode::Digit8, KeyCode::Digit9,
+        KeyCode::Minus, KeyCode::Equal, KeyCode::BracketLeft, KeyCode::BracketRight, KeyCode::Backslash,
+        KeyCode::Semicolon, KeyCode::Quote, KeyCode::Backquote, KeyCode::Comma, KeyCode::Period, KeyCode::Slash,
+        KeyCode::Tab, KeyCode::Escape, KeyCode::Enter, KeyCode::Backspace, KeyCode::Delete, KeyCode::Insert,
+        KeyCode::Home, KeyCode::End, KeyCode::PageUp, KeyCode::PageDown,
+        KeyCode::ArrowLeft, KeyCode::ArrowRight, KeyCode::ArrowUp, KeyCode::ArrowDown,
+        KeyCode::F1, KeyCode::F2, KeyCode::F3, KeyCode::F4, KeyCode::F5, KeyCode::F6,
+        KeyCode::F7, KeyCode::F8, KeyCode::F9, KeyCode::F10, KeyCode::F11, KeyCode::F12,
+        KeyCode::CapsLock, KeyCode::ShiftLeft, KeyCode::ShiftRight, KeyCode::ControlLeft, KeyCode::ControlRight,
+        KeyCode::AltLeft, KeyCode::AltRight, KeyCode::SuperLeft, KeyCode::SuperRight, KeyCode::Space,
+        KeyCode::Numpad0, KeyCode::Numpad1, KeyCode::Numpad2, KeyCode::Numpad3, KeyCode::Numpad4,
+        KeyCode::Numpad5, KeyCode::Numpad6, KeyCode::Numpad7, KeyCode::Numpad8, KeyCode::Numpad9,
+        KeyCode::NumpadDecimal, KeyCode::NumpadAdd, KeyCode::NumpadSubtract, KeyCode::NumpadMultiply,
+        KeyCode::NumpadDivide, KeyCode::NumpadEnter, KeyCode::NumpadEqual, KeyCode::NumLock,
+    ];
+
+    /// The `None`s in `KEY_CODES`, on purpose.
+    const DELIBERATELY_ABSENT: &[(KeyCode, Platform)] = &[(KeyCode::NumpadEqual, Platform::Windows)];
+
+    /// Keys that share a code with another on one platform, on purpose.
+    const ALIASES: &[(KeyCode, KeyCode, Platform)] = &[(KeyCode::NumpadEnter, KeyCode::Enter, Platform::Windows)];
+
+    #[test]
+    fn every_expected_key_has_a_code_on_every_desktop_or_is_deliberately_absent() {
+        for &key in EXPECTED_KEYS {
+            for platform in DESKTOPS {
+                let absent = DELIBERATELY_ABSENT.contains(&(key, platform));
+                assert_eq!(native_key_code(key, platform).is_none(), absent, "{key:?} on {platform:?}");
+            }
+        }
+        // And the table holds nothing beyond the list, each key once.
+        assert_eq!(KEY_CODES.len(), EXPECTED_KEYS.len());
+        for (i, row) in KEY_CODES.iter().enumerate() {
+            assert!(EXPECTED_KEYS.contains(&row.0), "{:?} isn't expected", row.0);
+            assert!(KEY_CODES[..i].iter().all(|earlier| earlier.0 != row.0), "{:?} listed twice", row.0);
+        }
+    }
+
+    #[test]
+    fn no_two_keys_share_a_code_on_one_platform_except_known_aliases() {
+        for platform in DESKTOPS {
+            for (i, a) in KEY_CODES.iter().enumerate() {
+                for b in &KEY_CODES[i + 1..] {
+                    let (Some(code_a), Some(code_b)) = (native_key_code(a.0, platform), native_key_code(b.0, platform)) else {
+                        continue;
+                    };
+                    if code_a == code_b {
+                        assert!(ALIASES.contains(&(b.0, a.0, platform)), "{:?} and {:?} both send {code_a:#x} to {platform:?}", a.0, b.0);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn keys_android_also_sends_keep_their_codes() {
+        // Straight from MainActivity.kt's tables, which controlled sides
+        // already handle.
+        assert_eq!(native_key_code(KeyCode::KeyA, Platform::MacOs), Some(0x00));
+        assert_eq!(native_key_code(KeyCode::KeyQ, Platform::MacOs), Some(0x0C));
+        assert_eq!(native_key_code(KeyCode::Digit0, Platform::MacOs), Some(0x1D));
+        assert_eq!(native_key_code(KeyCode::Space, Platform::MacOs), Some(0x31));
+        assert_eq!(native_key_code(KeyCode::Enter, Platform::MacOs), Some(0x24));
+        assert_eq!(native_key_code(KeyCode::Backspace, Platform::MacOs), Some(0x33));
+        for (i, key) in [KeyCode::KeyA, KeyCode::KeyB, KeyCode::KeyC].into_iter().enumerate() {
+            assert_eq!(native_key_code(key, Platform::Windows), Some(b'A' as u16 + i as u16));
+        }
+        assert_eq!(native_key_code(KeyCode::KeyZ, Platform::Windows), Some(b'Z' as u16));
+        assert_eq!(native_key_code(KeyCode::Digit7, Platform::Windows), Some(b'7' as u16));
+        assert_eq!(native_key_code(KeyCode::Enter, Platform::Windows), Some(0x0D));
+        assert_eq!(native_key_code(KeyCode::Backspace, Platform::Windows), Some(0x08));
+        assert_eq!(native_key_code(KeyCode::KeyQ, Platform::Linux), Some(16));
+        assert_eq!(native_key_code(KeyCode::KeyM, Platform::Linux), Some(50));
+        assert_eq!(native_key_code(KeyCode::Digit0, Platform::Linux), Some(11));
+        assert_eq!(native_key_code(KeyCode::Space, Platform::Linux), Some(57));
+        assert_eq!(native_key_code(KeyCode::Enter, Platform::Linux), Some(28));
+        assert_eq!(native_key_code(KeyCode::Backspace, Platform::Linux), Some(14));
+    }
+
+    #[test]
+    fn phones_have_no_key_codes() {
+        assert_eq!(native_key_code(KeyCode::KeyA, Platform::Android), None);
+        assert_eq!(native_key_code(KeyCode::KeyA, Platform::Ios), None);
+    }
+
+    #[test]
+    fn command_and_control_swap_only_between_mac_and_pc() {
+        let mac_to_mac = KeyTranslator::new(true, Platform::MacOs);
+        let mac_to_windows = KeyTranslator::new(true, Platform::Windows);
+        let mac_to_linux = KeyTranslator::new(true, Platform::Linux);
+        let windows_to_mac = KeyTranslator::new(false, Platform::MacOs);
+        let linux_to_windows = KeyTranslator::new(false, Platform::Windows);
+        let windows_to_linux = KeyTranslator::new(false, Platform::Linux);
+
+        // Mac -> PC: Command -> Control, Control -> Windows/Super.
+        assert_eq!(mac_to_windows.code(KeyCode::SuperLeft), Some(0xA2)); // VK_LCONTROL
+        assert_eq!(mac_to_windows.code(KeyCode::SuperRight), Some(0xA3)); // VK_RCONTROL
+        assert_eq!(mac_to_windows.code(KeyCode::ControlLeft), Some(0x5B)); // VK_LWIN
+        assert_eq!(mac_to_linux.code(KeyCode::SuperLeft), Some(29)); // KEY_LEFTCTRL
+        assert_eq!(mac_to_linux.code(KeyCode::ControlRight), Some(126)); // KEY_RIGHTMETA
+        // PC -> Mac: Control -> Command, Windows/Super -> Control.
+        assert_eq!(windows_to_mac.code(KeyCode::ControlLeft), Some(0x37)); // kVK_Command
+        assert_eq!(windows_to_mac.code(KeyCode::ControlRight), Some(0x36)); // kVK_RightCommand
+        assert_eq!(windows_to_mac.code(KeyCode::SuperLeft), Some(0x3B)); // kVK_Control
+        // Same family: unchanged.
+        assert_eq!(mac_to_mac.code(KeyCode::SuperLeft), Some(0x37));
+        assert_eq!(mac_to_mac.code(KeyCode::ControlLeft), Some(0x3B));
+        assert_eq!(linux_to_windows.code(KeyCode::ControlLeft), Some(0xA2));
+        assert_eq!(windows_to_linux.code(KeyCode::SuperLeft), Some(125));
+        // Everything else is never touched, in any direction.
+        for translator in [mac_to_mac, mac_to_windows, mac_to_linux, windows_to_mac, linux_to_windows, windows_to_linux] {
+            for &key in EXPECTED_KEYS {
+                if !matches!(key, KeyCode::ControlLeft | KeyCode::ControlRight | KeyCode::SuperLeft | KeyCode::SuperRight) {
+                    assert_eq!(translator.peer_key(key), key);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_swap_round_trips() {
+        let mac_to_pc = KeyTranslator::new(true, Platform::Windows);
+        let pc_to_mac = KeyTranslator::new(false, Platform::MacOs);
+        let mac_to_mac = KeyTranslator::new(true, Platform::MacOs);
+        for &key in EXPECTED_KEYS {
+            // A key that crosses Mac -> PC and back lands as itself...
+            assert_eq!(pc_to_mac.peer_key(mac_to_pc.peer_key(key)), key);
+            assert_eq!(swap_command_and_control(swap_command_and_control(key)), key);
+            // ...so it reaches a Mac with the code a Mac would have sent.
+            assert_eq!(pc_to_mac.code(mac_to_pc.peer_key(key)), mac_to_mac.code(key), "{key:?}");
+        }
+    }
+
+    #[test]
+    fn held_keys_repeat_and_release_once() {
+        let mut keyboard = KeyboardForwarder::new(KeyTranslator::new(false, Platform::Windows));
+        assert_eq!(keyboard.key(KeyCode::KeyA, true), Some(InputEventKind::KeyDown { code: 0x41 }));
+        // Auto-repeat: another KeyDown, still one key held.
+        assert_eq!(keyboard.key(KeyCode::KeyA, true), Some(InputEventKind::KeyDown { code: 0x41 }));
+        assert_eq!(keyboard.held, vec![0x41]);
+        assert_eq!(keyboard.key(KeyCode::KeyA, false), Some(InputEventKind::KeyUp { code: 0x41 }));
+        // A release for a key this viewer never pressed goes nowhere.
+        assert_eq!(keyboard.key(KeyCode::KeyA, false), None);
+        // Modifiers don't repeat.
+        assert_eq!(keyboard.key(KeyCode::ShiftLeft, true), Some(InputEventKind::KeyDown { code: 0xA0 }));
+        assert_eq!(keyboard.key(KeyCode::ShiftLeft, true), None);
+        // Unmapped keys send nothing and aren't tracked.
+        assert_eq!(keyboard.key(KeyCode::PrintScreen, true), None);
+        assert_eq!(keyboard.held, vec![0xA0]);
+    }
+
+    #[test]
+    fn release_all_lets_go_of_everything_last_pressed_first() {
+        let mut keyboard = KeyboardForwarder::new(KeyTranslator::new(true, Platform::Windows));
+        keyboard.key(KeyCode::SuperLeft, true); // Command -> VK_LCONTROL
+        keyboard.key(KeyCode::KeyC, true);
+        assert_eq!(keyboard.release_all(), vec![InputEventKind::KeyUp { code: 0x43 }, InputEventKind::KeyUp { code: 0xA2 }]);
+        assert!(keyboard.release_all().is_empty());
+        // A key released after release_all (the real key-up arriving late)
+        // doesn't send a second KeyUp.
+        assert_eq!(keyboard.key(KeyCode::KeyC, false), None);
+    }
 
     #[test]
     fn fit_within_preserves_aspect_ratio() {
