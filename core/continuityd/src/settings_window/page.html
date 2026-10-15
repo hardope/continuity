@@ -434,8 +434,18 @@ function send(op, fields = {}, onAnswer) {
 window.continuity = {
   receive(message) {
     if (message.status) {
+      // A transfer moving pushes a status about four times a second.
+      // Rebuilding the page for each one swallowed clicks (a button
+      // replaced between mouse down and up gets no click) and threw away
+      // keyboard focus and selected text, so a status that only moved
+      // progress along updates those few elements in place.
+      const progressOnly = state.status && document.getElementById("main") && withoutProgress(state.status) === withoutProgress(message.status);
       state.status = message.status;
       measureRates(message.status);
+      if (progressOnly) {
+        showProgress(message.status);
+        return;
+      }
       fixSelection();
       render();
       return;
@@ -638,6 +648,12 @@ function percent(t) {
   return t.size_bytes > 0 ? Math.min(100, Math.floor((t.bytes_done / t.size_bytes) * 100)) : 0;
 }
 
+function activeDetail(t) {
+  const rate = state.rates.get(t.id);
+  const speed = rate && rate.rate !== null ? ` · ${bytes(Math.round(rate.rate))}/s` : "";
+  return `${t.direction === "sending" ? "To" : "From"} ${t.peer_name} · ${bytes(t.bytes_done)} of ${bytes(t.size_bytes)}${speed}`;
+}
+
 function transferRow(t) {
   const sending = t.direction === "sending";
   const who = `${sending ? "To" : "From"} ${t.peer_name}`;
@@ -646,9 +662,7 @@ function transferRow(t) {
   let bar = "";
   let buttons = "";
   if (t.state === "active") {
-    const rate = state.rates.get(t.id);
-    const speed = rate && rate.rate !== null ? ` · ${bytes(Math.round(rate.rate))}/s` : "";
-    detail = `${who} · ${bytes(t.bytes_done)} of ${bytes(t.size_bytes)}${speed}`;
+    detail = activeDetail(t);
     bar = `<span class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent(t)}"><span style="width:${percent(t)}%"></span></span>`;
   } else if (t.state === "stalled") {
     detail = `${who} · Waiting to reconnect…`;
@@ -666,7 +680,7 @@ function transferRow(t) {
     tone = "danger";
   }
   const title = t.state === "stalled" && t.reason ? ` title="${esc(t.reason)}"` : "";
-  return `<div class="row"><span class="glyph">${icon(sending ? "upload" : "download")}</span>
+  return `<div class="row" data-transfer="${esc(t.id)}"><span class="glyph">${icon(sending ? "upload" : "download")}</span>
     <span class="text"><span class="title file selectable">${esc(t.file_name)}</span><span class="detail ${tone}"${title}>${esc(detail)}</span>${bar}</span>${buttons}</div>`;
 }
 
@@ -770,6 +784,30 @@ function dialogHtml() {
 }
 
 // ── Rendering ──────────────────────────────────────────────────────────────
+
+// A status with every transfer's progress taken out: two statuses that
+// match on this differ only in how far their transfers have got.
+function withoutProgress(status) {
+  return JSON.stringify({ ...status, transfers: (status.transfers || []).map((t) => ({ ...t, bytes_done: null })) });
+}
+
+// Brings what shows progress up to date without rebuilding anything around
+// it: the Transfers entry in the sidebar, and each row moving on the
+// Transfers page if it's open.
+function showProgress(status) {
+  const transfers = status.transfers || [];
+  const summary = document.querySelector('#sidebar [data-kind="transfers"] .sub');
+  if (summary) summary.textContent = transfersSummary(transfers);
+  for (const row of document.querySelectorAll("#content [data-transfer]")) {
+    const t = transfers.find((t) => t.id === row.dataset.transfer);
+    if (!t || (t.state !== "active" && t.state !== "stalled")) continue;
+    if (t.state === "active") row.querySelector(".detail").textContent = activeDetail(t);
+    const bar = row.querySelector(".progress");
+    if (!bar) continue;
+    if (bar.hasAttribute("aria-valuenow")) bar.setAttribute("aria-valuenow", percent(t));
+    bar.firstElementChild.style.width = `${percent(t)}%`;
+  }
+}
 
 function fixSelection() {
   const status = state.status;
