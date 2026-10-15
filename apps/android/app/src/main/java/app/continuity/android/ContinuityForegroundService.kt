@@ -163,6 +163,15 @@ class ContinuityForegroundService : Service() {
                 NotificationManager.IMPORTANCE_HIGH,
             ).apply { description = getString(R.string.notification_channel_transfers_description) },
         )
+        // A send you just started doesn't need to pop up to tell you so —
+        // its progress goes here, quietly. How it ends still pops up.
+        manager.createNotificationChannel(
+            NotificationChannel(
+                TransferNotifications.SENDING_CHANNEL_ID,
+                getString(R.string.notification_channel_sending),
+                NotificationManager.IMPORTANCE_LOW,
+            ).apply { description = getString(R.string.notification_channel_sending_description) },
+        )
     }
 
     private fun statusNotification(): Notification =

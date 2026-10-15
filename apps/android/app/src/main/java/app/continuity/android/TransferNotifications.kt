@@ -19,7 +19,9 @@ import uniffi.continuity_ffi.FfiFileTransferDirection
  * A channel's importance can't be raised once created, hence a new one
  * rather than changing that.
  *
- * - Start: "Receiving 'x'" / "Sending 'x'" pops up once.
+ * - Start: "Receiving 'x'" pops up once. "Sending 'x'" doesn't — the
+ *   user just started it — so a send's progress goes on a quiet channel
+ *   of its own ([SENDING_CHANNEL_ID]).
  * - Then a determinate progress bar, updated from `FileTransferProgress`
  *   at most twice a second per transfer and four times a second overall —
  *   the system drops a package's notification *updates* beyond about five
@@ -227,12 +229,12 @@ class TransferNotifications(private val context: Context) {
             total > 0 -> "$peer · ${formatBytes(done)} of ${formatBytes(total)}"
             else -> peer
         }
-        val builder = NotificationCompat.Builder(context, CHANNEL_ID)
+        val builder = NotificationCompat.Builder(context, if (receiving) CHANNEL_ID else SENDING_CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(if (receiving) "Receiving '${transfer.fileName}'" else "Sending '${transfer.fileName}'")
             .setContentText(text)
             .setCategory(NotificationCompat.CATEGORY_PROGRESS)
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setPriority(if (receiving) NotificationCompat.PRIORITY_HIGH else NotificationCompat.PRIORITY_LOW)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setContentIntent(openApp)
@@ -260,6 +262,10 @@ class TransferNotifications(private val context: Context) {
 
     companion object {
         const val CHANNEL_ID = "continuity_transfers"
+
+        /** Low importance: a send in progress, which the user started and
+         * doesn't need to be interrupted about. */
+        const val SENDING_CHANNEL_ID = "continuity_sending"
 
         /** Fixed; the tag tells transfers apart. Distinct from the service's
          * status (1) and events (1000 + hash) ids regardless. */

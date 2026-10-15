@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<lint>
+    <!-- The generated UniFFI bindings (src/main/java/uniffi, regenerated
+         from continuity-ffi and never edited by hand) use
+         java.lang.ref.Cleaner, which is API 33, only after checking at run
+         time that it exists, and fall back to JNA's own cleaner otherwise.
+         Lint can't see that check. -->
+    <issue id="NewApi">
+        <ignore path="src/main/java/uniffi/**" />
+    </issue>
+</lint>

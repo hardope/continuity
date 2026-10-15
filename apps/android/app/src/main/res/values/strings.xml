@@ -4,6 +4,8 @@
     <string name="notification_channel_events">Continuity events</string>
     <string name="notification_channel_transfers">File transfers</string>
     <string name="notification_channel_transfers_description">Files being sent and received, with their progress</string>
+    <string name="notification_channel_sending">Files being sent</string>
+    <string name="notification_channel_sending_description">The progress of files you send, shown without popping up</string>
     <string name="foreground_notification_title">Continuity is running</string>
     <string name="share_target_label">Continuity</string>
     <string name="foreground_notification_text">Syncing clipboard and files with paired devices</string>
