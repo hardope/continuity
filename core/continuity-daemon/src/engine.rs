@@ -1815,6 +1815,10 @@ async fn handle_connection_inner(
                     data_channel,
                     resume,
                 }) => {
+                    // The name is the peer's to choose, so it's reduced to
+                    // one plain file name before anything joins it onto the
+                    // received-files folder — see `safe_received_file_name`.
+                    let file_name = safe_received_file_name(&file_name);
                     if data_channel && !state.test_hooks.refuse_data_channel.load(Ordering::Relaxed) {
                         // Answered from its own task (free-space check,
                         // creating the `.part` file, possibly waiting for
@@ -2295,6 +2299,60 @@ async fn handle_file_complete(
         file_name: rf.file_name,
         path: rf.path.display().to_string(),
     });
+}
+
+/// Longest name, in bytes, a received file is saved under. File systems cap
+/// a name at 255 bytes (or UTF-16 units), and the v3 path first writes
+/// `<name>.part` and may later add ` (n)` to avoid a clash — a name right at
+/// the limit on the sender would fail on both. 200 leaves room for those.
+const MAX_RECEIVED_NAME_BYTES: usize = 200;
+
+/// Reduces a peer-supplied file name to one plain name that is safe to join
+/// onto the received-files folder. **Real bug fixed here**: the name from a
+/// `FileOffer` used to be joined as-is, so a paired device sending
+/// `../../.config/autostart/x.desktop` — or an absolute path, which
+/// `Path::join` takes *instead of* the folder — could write anywhere the
+/// user can, startup folders included. Only the last path component is
+/// kept (split on both `/` and `\`, whatever this platform's separator),
+/// control characters and the characters Windows and Android's shared
+/// storage refuse (`<>:"|?*` — `:` would also open an NTFS alternate data
+/// stream) become `_`, Windows' reserved device names get a `_` prefix,
+/// trailing dots and spaces (which Windows silently drops) are trimmed,
+/// over-long names are shortened keeping their extension, and anything left
+/// empty becomes "file".
+pub(crate) fn safe_received_file_name(name: &str) -> String {
+    let last = name.rsplit(['/', '\\']).find(|part| !part.is_empty()).unwrap_or("");
+    let mut cleaned: String = last
+        .chars()
+        .map(|c| if c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*') { '_' } else { c })
+        .collect();
+    cleaned = cleaned.trim().trim_end_matches(['.', ' ']).to_string();
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
+        return "file".to_string();
+    }
+
+    let stem_upper = cleaned.split('.').next().unwrap_or("").trim_end().to_ascii_uppercase();
+    let reserved = matches!(stem_upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((stem_upper.starts_with("COM") || stem_upper.starts_with("LPT"))
+            && stem_upper.len() == 4
+            && stem_upper.as_bytes()[3].is_ascii_digit());
+    if reserved {
+        cleaned.insert(0, '_');
+    }
+
+    if cleaned.len() > MAX_RECEIVED_NAME_BYTES {
+        let path = Path::new(&cleaned);
+        let ext = path.extension().and_then(|e| e.to_str()).filter(|e| e.len() <= 20).map(|e| format!(".{e}"));
+        let ext = ext.unwrap_or_default();
+        let budget = MAX_RECEIVED_NAME_BYTES - ext.len();
+        let stem = if ext.is_empty() { cleaned.as_str() } else { &cleaned[..cleaned.len() - ext.len()] };
+        let mut cut = budget.min(stem.len());
+        while !stem.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        cleaned = format!("{}{ext}", stem[..cut].trim_end());
+    }
+    cleaned
 }
 
 fn unique_destination_path(dir: &Path, file_name: &str) -> PathBuf {
@@ -2865,5 +2923,54 @@ fn detect_platform() -> Platform {
         Platform::Ios
     } else {
         Platform::Linux
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn received_names_cannot_leave_the_folder() {
+        assert_eq!(safe_received_file_name("../../.config/autostart/x.desktop"), "x.desktop");
+        assert_eq!(safe_received_file_name("/home/alice/.config/autostart/x.desktop"), "x.desktop");
+        assert_eq!(safe_received_file_name(r"..\..\AppData\Roaming\Startup\x.bat"), "x.bat");
+        assert_eq!(safe_received_file_name(r"C:\Windows\x.bat"), "x.bat");
+        assert_eq!(safe_received_file_name("photos/"), "photos");
+        for empty in ["", "/", "..", ".", "../", "  ", "...", r"\\"] {
+            assert_eq!(safe_received_file_name(empty), "file", "{empty:?}");
+        }
+        let dir = Path::new("/tmp/received");
+        for hostile in ["../x", "/etc/x", r"..\x", "a/../../b", "..", "C:x"] {
+            let joined = dir.join(safe_received_file_name(hostile));
+            assert_eq!(joined.parent(), Some(dir), "{hostile:?} escaped as {joined:?}");
+        }
+    }
+
+    #[test]
+    fn received_names_lose_characters_other_systems_refuse() {
+        assert_eq!(safe_received_file_name("Meeting: notes?.txt"), "Meeting_ notes_.txt");
+        assert_eq!(safe_received_file_name("a\u{0}b\nc.txt"), "a_b_c.txt");
+        assert_eq!(safe_received_file_name("notes.txt. . "), "notes.txt");
+        assert_eq!(safe_received_file_name("con.txt"), "_con.txt");
+        assert_eq!(safe_received_file_name("LPT1"), "_LPT1");
+        assert_eq!(safe_received_file_name("console.txt"), "console.txt");
+        assert_eq!(safe_received_file_name("COM10.txt"), "COM10.txt");
+        assert_eq!(safe_received_file_name("résumé 2026.pdf"), "résumé 2026.pdf");
+        assert_eq!(safe_received_file_name(".hidden"), ".hidden");
+    }
+
+    #[test]
+    fn long_received_names_are_shortened_keeping_the_extension() {
+        let long = format!("{}.mp4", "動".repeat(84));
+        let short = safe_received_file_name(&long);
+        assert!(short.len() <= MAX_RECEIVED_NAME_BYTES, "{} bytes", short.len());
+        assert!(short.ends_with(".mp4"));
+        assert!(short.starts_with('動'));
+        assert!(format!("{short}.part").len() <= 255);
+
+        let no_ext = "x".repeat(300);
+        assert_eq!(safe_received_file_name(&no_ext).len(), MAX_RECEIVED_NAME_BYTES);
+        assert_eq!(safe_received_file_name("short.txt"), "short.txt");
     }
 }
