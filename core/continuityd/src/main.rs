@@ -1177,9 +1177,23 @@ fn open_path(path: &str) -> std::io::Result<()> {
     {
         std::process::Command::new("open").arg(path).spawn()?;
     }
+    // **Real bug fixed here**: this used to run `cmd /C start "" <path>`.
+    // cmd re-parses its whole command line, and Rust only quotes an
+    // argument that contains a space — so a received file a peer had named
+    // `notes&calc` (no space, nothing the name check refuses) ran `calc`
+    // the moment someone clicked Open. ShellExecuteW opens the file with
+    // its default app directly, with no shell parsing in between.
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new("cmd").args(["/C", "start", "", path]).spawn()?;
+        use windows::core::{HSTRING, PCWSTR};
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::Shell::ShellExecuteW;
+        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        // Values above 32 mean success (the documented, if odd, contract).
+        let result = unsafe { ShellExecuteW(HWND::default(), &HSTRING::from("open"), &HSTRING::from(path), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL) };
+        if result.0 as isize <= 32 {
+            return Err(std::io::Error::other(format!("ShellExecuteW failed ({})", result.0 as isize)));
+        }
     }
     #[cfg(target_os = "linux")]
     {
