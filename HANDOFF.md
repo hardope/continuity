@@ -159,6 +159,12 @@ Approved decisions (all implemented):
 
 ## Approved by the owner on 2026-10-15 (after the review fixes)
 
+**Status: all of this is implemented and pushed** (listener 20d5d51,
+StartupWMClass 105eec5, .part sweep d7663cc, Windows scan codes 2482cbf,
+macOS frame scaling eefe24f, Android quiet send + lint.xml ed4e917, folder
+fallback 23267e5, Continuity.app rename 276f203, cancel 9b1120b, docs
+fb9c2a5). Next: the CI run, then the branch move and deleting tmp branches.
+
 - Fix the listener: run each inbound TLS handshake in its own task with a
   timeout (a LAN host could freeze the listener with one idle connection).
 - From the list below, items 1, 2, 3, 5, 6, 7, 8, 9 — everything except the
