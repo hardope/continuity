@@ -52,7 +52,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::task::{AbortHandle, JoinHandle};
 
@@ -100,6 +100,11 @@ const FIRST_MESSAGE_TIMEOUT: Duration = Duration::from_secs(30);
 /// past any link that's merely slow (it's 1 MiB, so under 17 KiB/s), and
 /// what it costs a live but stalled one is a resume, not the transfer.
 const WRITE_PROGRESS_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long a sender giving up on a data connection waits for it to close
+/// properly (see `stream_file`) — only as long as a peer that's reading
+/// needs; one that isn't won't take the close either.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How long the sender waits for `FileVerified` after `FileComplete`. The
 /// receiver only has its last few queued frames left to write by then (it
@@ -1334,7 +1339,7 @@ fn retry_delay(retries: u32) -> Duration {
 async fn stream_file(state: &Arc<SharedState>, o: &Outgoing, addr: SocketAddr, offset: u64) -> Result<(), StreamError> {
     // Reading (and re-hashing what the receiver already has) starts before
     // the dial, so the disk is busy while the TLS handshake happens.
-    let (chunks_tx, mut chunks_rx) = mpsc::channel::<Vec<u8>>(PIPELINE_DEPTH);
+    let (chunks_tx, chunks_rx) = mpsc::channel::<Vec<u8>>(PIPELINE_DEPTH);
     let reader = {
         let path = o.path.clone();
         let size = o.size_bytes;
@@ -1357,6 +1362,31 @@ async fn stream_file(state: &Arc<SharedState>, o: &Outgoing, addr: SocketAddr, o
         return Err(StreamError::Dial(format!("couldn't start the data connection: {e}")));
     }
 
+    let result = stream_over(state, o, &mut conn, offset, chunks_rx, reader).await;
+    if result.is_err() {
+        // Giving up on it: a proper TLS close first, so the receiver sees
+        // the end straight away and reports the transfer stalled. **Real
+        // bug fixed here**: just dropping the connection — the TLS layer
+        // sends nothing then — left a macOS receiver reading forever when
+        // the last frames were still on their way: no end, no error, until
+        // the resume offer ended that connection for it. A peer that's
+        // gone, or not reading, doesn't take the close either, hence the
+        // limit.
+        let _ = tokio::time::timeout(CLOSE_TIMEOUT, conn.shutdown()).await;
+    }
+    result
+}
+
+/// `stream_file` once the data connection is open: the file from `offset`,
+/// its end, and the receiver's verdict.
+async fn stream_over(
+    state: &Arc<SharedState>,
+    o: &Outgoing,
+    conn: &mut Connection,
+    offset: u64,
+    mut chunks_rx: mpsc::Receiver<Vec<u8>>,
+    reader: JoinHandle<Result<String, String>>,
+) -> Result<(), StreamError> {
     if offset > 0 {
         state.emit(SyncEvent::FileTransferProgress {
             transfer_id: o.transfer_id.clone(),
@@ -1369,7 +1399,7 @@ async fn stream_file(state: &Arc<SharedState>, o: &Outgoing, addr: SocketAddr, o
     let mut sent = 0u64;
     let stalled = || format!("the receiver took nothing for {} seconds", WRITE_PROGRESS_TIMEOUT.as_secs());
     while let Some(chunk) = chunks_rx.recv().await {
-        match tokio::time::timeout(WRITE_PROGRESS_TIMEOUT, write_frame_unflushed(&mut conn, &chunk)).await {
+        match tokio::time::timeout(WRITE_PROGRESS_TIMEOUT, write_frame_unflushed(&mut *conn, &chunk)).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => return Err(StreamError::Interrupted { sent, reason: e.to_string() }),
             Err(_) => return Err(StreamError::Interrupted { sent, reason: stalled() }),
@@ -1388,17 +1418,17 @@ async fn stream_file(state: &Arc<SharedState>, o: &Outgoing, addr: SocketAddr, o
     };
 
     let end = async {
-        write_frame_unflushed(&mut conn, &[]).await?;
+        write_frame_unflushed(&mut *conn, &[]).await?;
         // `write_message` flushes, which also pushes out any frame still
         // buffered from the loop above.
-        write_message(&mut conn, &Message::FileComplete { transfer_id: o.transfer_id.clone(), content_hash }).await
+        write_message(&mut *conn, &Message::FileComplete { transfer_id: o.transfer_id.clone(), content_hash }).await
     };
     match tokio::time::timeout(WRITE_PROGRESS_TIMEOUT, end).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => return Err(StreamError::Interrupted { sent, reason: e.to_string() }),
         Err(_) => return Err(StreamError::Interrupted { sent, reason: stalled() }),
     }
-    match tokio::time::timeout(VERIFY_TIMEOUT, read_message(&mut conn)).await {
+    match tokio::time::timeout(VERIFY_TIMEOUT, read_message(&mut *conn)).await {
         Ok(Ok(Message::FileVerified { ok: true, .. })) => Ok(()),
         Ok(Ok(Message::FileVerified { ok: false, reason, .. })) => {
             Err(StreamError::Rejected(reason.unwrap_or_else(|| "the receiver couldn't verify the file".to_string())))
