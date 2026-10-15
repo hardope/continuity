@@ -48,8 +48,8 @@ use continuity_proto::{DeviceInfo, Message};
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot, Notify};
@@ -221,6 +221,9 @@ struct PartFile {
     file: std::fs::File,
     hasher: IncrementalHash,
     written: u64,
+    /// Bytes still to come, counted against new offers while this file
+    /// exists (see `SpaceReservations`).
+    reserved: Arc<AtomicU64>,
 }
 
 fn emit_progress(state: &SharedState, transfer_id: &str, before: u64, now: u64, total: u64, direction: FileTransferDirection) {
@@ -241,29 +244,109 @@ fn emit_progress(state: &SharedState, transfer_id: &str, before: u64, now: u64, 
 // ---------------------------------------------------------------------------
 
 /// Why a file of which `remaining` bytes are still to come can't be taken
-/// with `available` bytes free — `None` if it can. Pure, so the decision is
-/// unit-tested without a full disk.
-pub(super) fn free_space_refusal(device_name: &str, remaining: u64, available: u64) -> Option<String> {
+/// with `available` bytes free, `promised` of them to other files already
+/// on their way — `None` if it can. Pure, so the decision is unit-tested
+/// without a full disk.
+pub(super) fn free_space_refusal(device_name: &str, remaining: u64, available: u64, promised: u64) -> Option<String> {
     let needed = remaining.saturating_add(FREE_SPACE_MARGIN);
-    if available >= needed {
+    let free = available.saturating_sub(promised);
+    if free >= needed {
         return None;
     }
-    Some(format!(
-        "Not enough free space on {device_name} (needs {}, {} free)",
-        format_bytes(needed),
-        format_bytes(available)
-    ))
+    let free = if promised > 0 {
+        format!("{} free once the files already on their way are in", format_bytes(free))
+    } else {
+        format!("{} free", format_bytes(free))
+    };
+    Some(format!("Not enough free space on {device_name} (needs {}, {free})", format_bytes(needed)))
 }
 
-/// `free_space_refusal` against the volume `dir` is on. A volume that
-/// can't report its free space isn't grounds to refuse — creating the
-/// file will fail on its own if the directory is really unusable.
-pub(super) fn free_space_refusal_for(dir: &Path, device_name: &str, remaining: u64) -> Option<String> {
-    match fs4::available_space(dir) {
-        Ok(available) => free_space_refusal(device_name, remaining, available),
-        Err(e) => {
-            tracing::debug!("couldn't read the free space in {}: {e}", dir.display());
-            None
+/// Space promised to files being received, so that a new offer is checked
+/// against what will be free once they're all in, not just what's free
+/// now. **Real bug fixed here**: each offer used to be checked on its own,
+/// so three 3 GB files offered together to a phone with 5 GB free all
+/// passed — nothing had been written yet — and the disk then filled up
+/// partway through, which the margin is there to prevent.
+///
+/// Each incoming file, on either path, holds an `Arc` counter of the
+/// bytes it still has to write and lowers it as it writes; this keeps only
+/// a `Weak` to it, so a transfer that ends any way at all — saved, failed,
+/// cancelled, expired, its connection gone — stops counting the moment
+/// its state is dropped, with no cleanup call anywhere to forget.
+#[derive(Default)]
+pub(super) struct SpaceReservations {
+    /// The received-files directory each file started in, and its counter.
+    /// Only files in the directory being checked count: one on another
+    /// volume takes nothing from this one.
+    entries: Mutex<Vec<(PathBuf, Weak<AtomicU64>)>>,
+}
+
+impl SpaceReservations {
+    /// Whether `remaining` more bytes fit in `dir` alongside everything
+    /// already promised there; `own` is a resuming transfer's own share of
+    /// that, which it doesn't need twice. A volume that can't report its
+    /// free space isn't grounds to refuse — creating the file will fail on
+    /// its own if the directory is really unusable.
+    pub(super) fn check(&self, dir: &Path, device_name: &str, remaining: u64, own: u64) -> Option<String> {
+        self.check_with(dir, device_name, remaining, own, || fs4::available_space(dir))
+    }
+
+    /// `check`, and if the file fits, the counter for it to hold — under one
+    /// lock, so offers answered at the same moment can't each find the same
+    /// space free.
+    pub(super) fn reserve(&self, dir: &Path, device_name: &str, size: u64) -> Result<Arc<AtomicU64>, String> {
+        self.reserve_with(dir, device_name, size, || fs4::available_space(dir))
+    }
+
+    fn check_with(
+        &self,
+        dir: &Path,
+        device_name: &str,
+        remaining: u64,
+        own: u64,
+        available: impl FnOnce() -> std::io::Result<u64>,
+    ) -> Option<String> {
+        let mut entries = self.entries.lock().unwrap();
+        Self::refusal(&mut entries, dir, device_name, remaining, own, available)
+    }
+
+    fn reserve_with(
+        &self,
+        dir: &Path,
+        device_name: &str,
+        size: u64,
+        available: impl FnOnce() -> std::io::Result<u64>,
+    ) -> Result<Arc<AtomicU64>, String> {
+        let mut entries = self.entries.lock().unwrap();
+        if let Some(reason) = Self::refusal(&mut entries, dir, device_name, size, 0, available) {
+            return Err(reason);
+        }
+        let counter = Arc::new(AtomicU64::new(size));
+        entries.push((dir.to_path_buf(), Arc::downgrade(&counter)));
+        Ok(counter)
+    }
+
+    fn refusal(
+        entries: &mut Vec<(PathBuf, Weak<AtomicU64>)>,
+        dir: &Path,
+        device_name: &str,
+        remaining: u64,
+        own: u64,
+        available: impl FnOnce() -> std::io::Result<u64>,
+    ) -> Option<String> {
+        entries.retain(|(_, counter)| counter.strong_count() > 0);
+        let promised: u64 = entries
+            .iter()
+            .filter(|(d, _)| d == dir)
+            .filter_map(|(_, counter)| counter.upgrade())
+            .map(|counter| counter.load(Ordering::Relaxed))
+            .fold(0, u64::saturating_add);
+        match available() {
+            Ok(available) => free_space_refusal(device_name, remaining, available, promised.saturating_sub(own)),
+            Err(e) => {
+                tracing::debug!("couldn't read the free space in {}: {e}", dir.display());
+                None
+            }
         }
     }
 }
@@ -383,7 +466,7 @@ async fn answer_offer(
     // back (an id is random per send, and only this peer's are looked at).
     enum Found {
         Nothing,
-        Resumable { written: u64, size: u64, dir: PathBuf },
+        Resumable { written: u64, size: u64, dir: PathBuf, reserved: u64 },
         Done { size: u64 },
         Failed { reason: String },
         Busy,
@@ -404,6 +487,7 @@ async fn answer_offer(
                             written: entry.part.as_ref().map_or(0, |p| p.written),
                             size: entry.size_bytes,
                             dir: entry.part_path.parent().map(Path::to_path_buf).unwrap_or_default(),
+                            reserved: entry.part.as_ref().map_or(0, |p| p.reserved.load(Ordering::Relaxed)),
                         }
                     }
                     Phase::Completed { .. } => Found::Done { size: entry.size_bytes },
@@ -428,8 +512,8 @@ async fn answer_offer(
             Found::Nothing => break,
             Found::Done { size } => return accept(size),
             Found::Failed { reason } => return refuse(reason),
-            Found::Resumable { written, size, dir } => {
-                if let Some(reason) = free_space_refusal_for(&dir, &state.my_device.name, size - written) {
+            Found::Resumable { written, size, dir, reserved } => {
+                if let Some(reason) = state.reserved_space.check(&dir, &state.my_device.name, size - written, reserved) {
                     tracing::warn!("can't resume '{file_name}' from '{}': {reason}", peer.name);
                     discard_incoming(state, &key, Some(&reason));
                     return refuse(reason);
@@ -462,15 +546,16 @@ async fn answer_offer(
     let dir = state.received_files_dir.lock().unwrap().clone();
     let device_name = state.my_device.name.clone();
     let name = file_name.clone();
+    let blocking_state = state.clone();
     let prepared = tokio::task::spawn_blocking(move || {
-        if let Some(reason) = free_space_refusal_for(&dir, &device_name, size_bytes) {
-            return Err(reason);
-        }
-        create_part_file(&dir, &name).map_err(|e| format!("{device_name} couldn't create the file: {e}"))
+        let reserved = blocking_state.reserved_space.reserve(&dir, &device_name, size_bytes)?;
+        let (part_path, file) =
+            create_part_file(&dir, &name).map_err(|e| format!("{device_name} couldn't create the file: {e}"))?;
+        Ok((part_path, file, reserved))
     })
     .await
     .unwrap_or_else(|e| Err(format!("couldn't prepare the file: {e}")));
-    let (part_path, file) = match prepared {
+    let (part_path, file, reserved) = match prepared {
         Ok(prepared) => prepared,
         Err(reason) => {
             tracing::warn!("refusing '{file_name}' from '{}': {reason}", peer.name);
@@ -502,7 +587,7 @@ async fn answer_offer(
                 file_name: file_name.clone(),
                 size_bytes,
                 part_path,
-                part: Some(PartFile { file, hasher: IncrementalHash::new(), written: 0 }),
+                part: Some(PartFile { file, hasher: IncrementalHash::new(), written: 0, reserved }),
                 phase: Phase::Waiting,
                 stream: None,
                 idle_since: Instant::now(),
@@ -875,6 +960,7 @@ fn write_part(
         part.hasher.update(&frame);
         let before = part.written;
         part.written += frame.len() as u64;
+        part.reserved.store(size_bytes.saturating_sub(part.written), Ordering::Relaxed);
         emit_progress(state, &key.1, before, part.written, size_bytes, FileTransferDirection::Receiving);
     }
     drop(frames);
@@ -927,7 +1013,7 @@ fn return_part(state: &SharedState, key: &(String, String), epoch: u64, part: Pa
 /// Checks a complete `.part` file against the sender's claim and moves it
 /// to its final name. On any failure the `.part` file is deleted.
 fn finalize_part(part: PartFile, part_path: &Path, file_name: &str, size_bytes: u64, claimed_hash: &str) -> Result<(PathBuf, String), String> {
-    let PartFile { file, hasher, written } = part;
+    let PartFile { file, hasher, written, .. } = part;
     // Closed before the rename — Windows can't rename an open file.
     drop(file);
     let actual_hash = hasher.finalize_hex();
@@ -1437,23 +1523,66 @@ mod tests {
 
     #[test]
     fn enough_space_for_the_file_plus_the_margin_is_accepted() {
-        assert_eq!(free_space_refusal("Laptop", 100 * MIB, 100 * MIB + FREE_SPACE_MARGIN), None);
-        assert_eq!(free_space_refusal("Laptop", 0, FREE_SPACE_MARGIN), None);
+        assert_eq!(free_space_refusal("Laptop", 100 * MIB, 100 * MIB + FREE_SPACE_MARGIN, 0), None);
+        assert_eq!(free_space_refusal("Laptop", 0, FREE_SPACE_MARGIN, 0), None);
     }
 
     #[test]
     fn less_than_the_file_plus_the_margin_is_refused_with_both_figures() {
         // Fits the file itself, but not the margin on top.
-        let reason = free_space_refusal("Laptop", 100 * MIB, 100 * MIB).expect("refused");
+        let reason = free_space_refusal("Laptop", 100 * MIB, 100 * MIB, 0).expect("refused");
         assert!(reason.starts_with("Not enough free space on Laptop"), "{reason}");
 
-        let reason = free_space_refusal("Pixel", 1_200_000_000, 300_000_000).expect("refused");
+        let reason = free_space_refusal("Pixel", 1_200_000_000, 300_000_000, 0).expect("refused");
         assert_eq!(reason, "Not enough free space on Pixel (needs 1.3 GB, 300 MB free)");
     }
 
     #[test]
     fn a_huge_file_does_not_overflow_the_check() {
-        assert!(free_space_refusal("Laptop", u64::MAX, u64::MAX - 1).is_some());
+        assert!(free_space_refusal("Laptop", u64::MAX, u64::MAX - 1, 0).is_some());
+        assert!(free_space_refusal("Laptop", 1, u64::MAX, u64::MAX).is_some());
+    }
+
+    const GB: u64 = 1_000_000_000;
+
+    #[test]
+    fn files_on_their_way_take_their_space_from_later_offers() {
+        let space = SpaceReservations::default();
+        let dir = Path::new("/received");
+        let five_gb_free = || Ok(5 * GB);
+        let first = space.reserve_with(dir, "Pixel", 3 * GB, five_gb_free).expect("fits");
+        // Nothing written yet, but the first file's 3 GB are spoken for.
+        let reason = space.reserve_with(dir, "Pixel", 3 * GB, five_gb_free).expect_err("doesn't fit beside it");
+        assert_eq!(reason, "Not enough free space on Pixel (needs 3.1 GB, 2 GB free once the files already on their way are in)");
+
+        // As it writes, the disk's free space and its promise go down
+        // together: with 2 GB of it written, the same 2 GB are left.
+        first.store(GB, Ordering::Relaxed);
+        assert!(space.reserve_with(dir, "Pixel", 3 * GB, || Ok(3 * GB)).is_err());
+        // Ended (any way at all): its state is dropped and its space is free.
+        drop(first);
+        assert!(space.reserve_with(dir, "Pixel", 3 * GB, five_gb_free).is_ok());
+    }
+
+    #[test]
+    fn a_resume_does_not_count_its_own_promise_twice_and_other_folders_dont_count() {
+        let space = SpaceReservations::default();
+        let dir = Path::new("/received");
+        let own = space.reserve_with(dir, "Pixel", 3 * GB, || Ok(4 * GB)).expect("fits");
+        own.store(2 * GB, Ordering::Relaxed);
+        // 1 GB written, 3 GB free now, 2 GB to go: fits, as its own 2 GB
+        // promise is what it's asking for.
+        assert_eq!(space.check_with(dir, "Pixel", 2 * GB, 2 * GB, || Ok(3 * GB)), None);
+        // A file going to a folder on another volume takes nothing here.
+        assert!(space.reserve_with(Path::new("/elsewhere"), "Pixel", 3 * GB, || Ok(4 * GB)).is_ok());
+        drop(own);
+    }
+
+    #[test]
+    fn a_volume_that_cant_report_its_free_space_is_not_refused() {
+        let space = SpaceReservations::default();
+        let unreadable = || Err(std::io::Error::other("not supported"));
+        assert!(space.reserve_with(Path::new("/received"), "Pixel", 3 * GB, unreadable).is_ok());
     }
 
     #[test]

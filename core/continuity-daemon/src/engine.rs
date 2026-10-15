@@ -353,6 +353,9 @@ struct SharedState {
     /// `transfer::SENDS_PER_PEER` at a time, the rest waiting (see
     /// `transfer::send_over_data_channel`).
     outgoing_slots: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
+    /// Space promised to every file being received, either path — see
+    /// `transfer::SpaceReservations`.
+    reserved_space: transfer::SpaceReservations,
     /// Notified (`notify_waiters`) whenever an incoming transfer changes
     /// phase — a resume offer that found its transfer still attached to a
     /// dying data connection waits on this for it to let go.
@@ -856,6 +859,7 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
         incoming_transfers: Mutex::new(HashMap::new()),
         outgoing_transfers: Mutex::new(HashMap::new()),
         outgoing_slots: Mutex::new(HashMap::new()),
+        reserved_space: transfer::SpaceReservations::default(),
         incoming_transfers_changed: Notify::new(),
         next_transfer_epoch: AtomicU64::new(1),
         test_hooks: TestHooks::default(),
@@ -2161,6 +2165,9 @@ struct ReceivingFile {
     file_name: String,
     written: u64,
     expected_size: u64,
+    /// Bytes still to come, counted against new offers while this exists
+    /// (see `transfer::SpaceReservations`).
+    reserved: Arc<AtomicU64>,
     /// Who this transfer is with — `handle_file_chunk`/`handle_file_complete`
     /// need it to call `end_file_transfer`, and neither gets a `peer`
     /// parameter of their own (just `transfer_id`/`data`), so it rides
@@ -2189,17 +2196,20 @@ async fn handle_file_offer(
     // fit. The reason only reaches a v3 sender — older ones ignore the
     // field and report a plain decline.
     let dir = state.received_files_dir.lock().unwrap().clone();
-    if let Some(reason) = transfer::free_space_refusal_for(&dir, &state.my_device.name, size_bytes) {
-        tracing::warn!("refusing '{file_name}' from '{}': {reason}", peer.name);
-        let _ = tx.send(Message::FileAccept {
-            transfer_id,
-            accepted: false,
-            data_channel: false,
-            offset: 0,
-            reason: Some(reason),
-        });
-        return;
-    }
+    let reserved = match state.reserved_space.reserve(&dir, &state.my_device.name, size_bytes) {
+        Ok(reserved) => reserved,
+        Err(reason) => {
+            tracing::warn!("refusing '{file_name}' from '{}': {reason}", peer.name);
+            let _ = tx.send(Message::FileAccept {
+                transfer_id,
+                accepted: false,
+                data_channel: false,
+                offset: 0,
+                reason: Some(reason),
+            });
+            return;
+        }
+    };
 
     let path = unique_destination_path(&dir, &file_name);
     let file = match tokio::fs::File::create(&path).await {
@@ -2238,6 +2248,7 @@ async fn handle_file_offer(
             file_name,
             written: 0,
             expected_size: size_bytes,
+            reserved,
             peer_crypto_id: peer.id.clone(),
         },
     );
@@ -2274,6 +2285,7 @@ async fn handle_file_chunk(
     rf.hasher.update(&data);
     let previous_written = rf.written;
     rf.written += data.len() as u64;
+    rf.reserved.store(rf.expected_size.saturating_sub(rf.written), Ordering::Relaxed);
     // Same throttling as the sending side's writer-loop hook — one event
     // per `PROGRESS_EVENT_BYTES` crossed (or the final chunk), not one
     // per chunk. Unlike sending, there's no enqueue-vs-actually-written
