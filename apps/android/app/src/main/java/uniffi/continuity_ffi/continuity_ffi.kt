@@ -810,6 +810,8 @@ internal open class UniffiVTableCallbackInterfaceEventListener(
 
 
 
+
+
 // A JNA Library to expose the extern-C FFI definitions.
 // This is an implementation detail which will be called internally by the public API.
 
@@ -876,6 +878,8 @@ internal interface UniffiLib : Library {
     fun uniffi_continuity_ffi_fn_method_continuityengine_send_text(`ptr`: Pointer,`peerId`: RustBuffer.ByValue,`text`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_continuity_ffi_fn_method_continuityengine_set_paused(`ptr`: Pointer,`paused`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_continuity_ffi_fn_method_continuityengine_set_received_files_dir(`ptr`: Pointer,`path`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_continuity_ffi_fn_method_continuityengine_set_unlock_allowed(`ptr`: Pointer,`peerId`: RustBuffer.ByValue,`allowed`: Byte,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
@@ -1045,6 +1049,8 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_continuity_ffi_checksum_method_continuityengine_set_paused(
     ): Short
+    fun uniffi_continuity_ffi_checksum_method_continuityengine_set_received_files_dir(
+    ): Short
     fun uniffi_continuity_ffi_checksum_method_continuityengine_set_unlock_allowed(
     ): Short
     fun uniffi_continuity_ffi_checksum_method_eventlistener_on_event(
@@ -1126,6 +1132,9 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_continuity_ffi_checksum_method_continuityengine_set_paused() != 20054.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_continuity_ffi_checksum_method_continuityengine_set_received_files_dir() != 55347.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_continuity_ffi_checksum_method_continuityengine_set_unlock_allowed() != 56413.toShort()) {
@@ -2017,6 +2026,14 @@ public interface ContinuityEngineInterface {
     fun `setPaused`(`paused`: kotlin.Boolean)
     
     /**
+     * Where files received from now on are saved (the `received_files_dir`
+     * passed to `start` until then). A transfer already under way finishes
+     * where it started. The directory is created if missing; if it can't
+     * be used, `FfiSyncEvent::Error` says why and the previous one stays.
+     */
+    fun `setReceivedFilesDir`(`path`: kotlin.String)
+    
+    /**
      * Turns remote unlock of *this* device on/off for one peer. Exposed
      * for symmetry like `respond_to_remote_control_request` — a phone
      * wires in `NoopScreenLockController`, so there's nothing to unlock
@@ -2358,6 +2375,23 @@ open class ContinuityEngine: Disposable, AutoCloseable, ContinuityEngineInterfac
     uniffiRustCall() { _status ->
     UniffiLib.INSTANCE.uniffi_continuity_ffi_fn_method_continuityengine_set_paused(
         it, FfiConverterBoolean.lower(`paused`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Where files received from now on are saved (the `received_files_dir`
+     * passed to `start` until then). A transfer already under way finishes
+     * where it started. The directory is created if missing; if it can't
+     * be used, `FfiSyncEvent::Error` says why and the previous one stays.
+     */override fun `setReceivedFilesDir`(`path`: kotlin.String)
+        = 
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_continuity_ffi_fn_method_continuityengine_set_received_files_dir(
+        it, FfiConverterString.lower(`path`),_status)
 }
     }
     
@@ -3495,6 +3529,17 @@ sealed class FfiSyncEvent {
         companion object
     }
     
+    /**
+     * The transfer lost its connection and is waiting to resume — not an
+     * end state. The next `FileTransferProgress` for it means it resumed;
+     * if it can't within 10 minutes, `FileTransferFailed` follows.
+     */
+    data class FileTransferStalled(
+        val `transferId`: kotlin.String, 
+        val `reason`: kotlin.String) : FfiSyncEvent() {
+        companion object
+    }
+    
     data class Error(
         val `message`: kotlin.String) : FfiSyncEvent() {
         companion object
@@ -3667,71 +3712,75 @@ public object FfiConverterTypeFfiSyncEvent : FfiConverterRustBuffer<FfiSyncEvent
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 )
-            15 -> FfiSyncEvent.Error(
+            15 -> FfiSyncEvent.FileTransferStalled(
+                FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 )
-            16 -> FfiSyncEvent.WasReset
-            17 -> FfiSyncEvent.PausedStateChanged(
+            16 -> FfiSyncEvent.Error(
+                FfiConverterString.read(buf),
+                )
+            17 -> FfiSyncEvent.WasReset
+            18 -> FfiSyncEvent.PausedStateChanged(
                 FfiConverterBoolean.read(buf),
                 )
-            18 -> FfiSyncEvent.ReconnectFailed(
+            19 -> FfiSyncEvent.ReconnectFailed(
                 FfiConverterString.read(buf),
                 )
-            19 -> FfiSyncEvent.NowPlayingChanged(
+            20 -> FfiSyncEvent.NowPlayingChanged(
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 FfiConverterTypeFfiNowPlayingInfo.read(buf),
                 )
-            20 -> FfiSyncEvent.PeerDiscovered(
+            21 -> FfiSyncEvent.PeerDiscovered(
                 FfiConverterTypeFfiDeviceInfo.read(buf),
                 )
-            21 -> FfiSyncEvent.PeerActivity(
+            22 -> FfiSyncEvent.PeerActivity(
                 FfiConverterString.read(buf),
                 FfiConverterULong.read(buf),
                 )
-            22 -> FfiSyncEvent.WasRevoked(
+            23 -> FfiSyncEvent.WasRevoked(
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 )
-            23 -> FfiSyncEvent.RevokedByPeer(
+            24 -> FfiSyncEvent.RevokedByPeer(
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 )
-            24 -> FfiSyncEvent.RemoteControlRequested(
+            25 -> FfiSyncEvent.RemoteControlRequested(
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 )
-            25 -> FfiSyncEvent.RemoteControlDeclined(
+            26 -> FfiSyncEvent.RemoteControlDeclined(
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 )
-            26 -> FfiSyncEvent.RemoteControlSessionStarted(
+            27 -> FfiSyncEvent.RemoteControlSessionStarted(
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 FfiConverterTypeFfiRemoteControlRole.read(buf),
                 )
-            27 -> FfiSyncEvent.RemoteControlSessionEnded(
+            28 -> FfiSyncEvent.RemoteControlSessionEnded(
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 FfiConverterOptionalString.read(buf),
                 )
-            28 -> FfiSyncEvent.ScreenFrameReceived(
+            29 -> FfiSyncEvent.ScreenFrameReceived(
                 FfiConverterString.read(buf),
                 FfiConverterByteArray.read(buf),
                 )
-            29 -> FfiSyncEvent.ScreenLockResult(
+            30 -> FfiSyncEvent.ScreenLockResult(
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 FfiConverterTypeFfiScreenLockAction.read(buf),
                 FfiConverterTypeFfiScreenLockOutcome.read(buf),
                 )
-            30 -> FfiSyncEvent.ScreenLockRequested(
+            31 -> FfiSyncEvent.ScreenLockRequested(
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 FfiConverterTypeFfiScreenLockAction.read(buf),
                 FfiConverterTypeFfiScreenLockOutcome.read(buf),
                 )
-            31 -> FfiSyncEvent.UnlockPermissionChanged(
+            32 -> FfiSyncEvent.UnlockPermissionChanged(
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 FfiConverterBoolean.read(buf),
@@ -3848,6 +3897,14 @@ public object FfiConverterTypeFfiSyncEvent : FfiConverterRustBuffer<FfiSyncEvent
             )
         }
         is FfiSyncEvent.FileTransferFailed -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`transferId`)
+                + FfiConverterString.allocationSize(value.`reason`)
+            )
+        }
+        is FfiSyncEvent.FileTransferStalled -> {
             // Add the size for the Int that specifies the variant plus the size needed for all fields
             (
                 4UL
@@ -4083,96 +4140,94 @@ public object FfiConverterTypeFfiSyncEvent : FfiConverterRustBuffer<FfiSyncEvent
                 FfiConverterString.write(value.`reason`, buf)
                 Unit
             }
-            is FfiSyncEvent.Error -> {
+            is FfiSyncEvent.FileTransferStalled -> {
                 buf.putInt(15)
+                FfiConverterString.write(value.`transferId`, buf)
+                FfiConverterString.write(value.`reason`, buf)
+                Unit
+            }
+            is FfiSyncEvent.Error -> {
+                buf.putInt(16)
                 FfiConverterString.write(value.`message`, buf)
                 Unit
             }
             is FfiSyncEvent.WasReset -> {
-                buf.putInt(16)
+                buf.putInt(17)
                 Unit
             }
             is FfiSyncEvent.PausedStateChanged -> {
-                buf.putInt(17)
+                buf.putInt(18)
                 FfiConverterBoolean.write(value.`paused`, buf)
                 Unit
             }
             is FfiSyncEvent.ReconnectFailed -> {
-                buf.putInt(18)
+                buf.putInt(19)
                 FfiConverterString.write(value.`peerId`, buf)
                 Unit
             }
             is FfiSyncEvent.NowPlayingChanged -> {
-                buf.putInt(19)
+                buf.putInt(20)
                 FfiConverterString.write(value.`peerId`, buf)
                 FfiConverterString.write(value.`peerName`, buf)
                 FfiConverterTypeFfiNowPlayingInfo.write(value.`info`, buf)
                 Unit
             }
             is FfiSyncEvent.PeerDiscovered -> {
-                buf.putInt(20)
+                buf.putInt(21)
                 FfiConverterTypeFfiDeviceInfo.write(value.`device`, buf)
                 Unit
             }
             is FfiSyncEvent.PeerActivity -> {
-                buf.putInt(21)
+                buf.putInt(22)
                 FfiConverterString.write(value.`peerId`, buf)
                 FfiConverterULong.write(value.`secondsSinceActivity`, buf)
                 Unit
             }
             is FfiSyncEvent.WasRevoked -> {
-                buf.putInt(22)
-                FfiConverterString.write(value.`peerId`, buf)
-                FfiConverterString.write(value.`peerName`, buf)
-                Unit
-            }
-            is FfiSyncEvent.RevokedByPeer -> {
                 buf.putInt(23)
                 FfiConverterString.write(value.`peerId`, buf)
                 FfiConverterString.write(value.`peerName`, buf)
                 Unit
             }
-            is FfiSyncEvent.RemoteControlRequested -> {
+            is FfiSyncEvent.RevokedByPeer -> {
                 buf.putInt(24)
                 FfiConverterString.write(value.`peerId`, buf)
                 FfiConverterString.write(value.`peerName`, buf)
                 Unit
             }
-            is FfiSyncEvent.RemoteControlDeclined -> {
+            is FfiSyncEvent.RemoteControlRequested -> {
                 buf.putInt(25)
                 FfiConverterString.write(value.`peerId`, buf)
                 FfiConverterString.write(value.`peerName`, buf)
                 Unit
             }
-            is FfiSyncEvent.RemoteControlSessionStarted -> {
+            is FfiSyncEvent.RemoteControlDeclined -> {
                 buf.putInt(26)
+                FfiConverterString.write(value.`peerId`, buf)
+                FfiConverterString.write(value.`peerName`, buf)
+                Unit
+            }
+            is FfiSyncEvent.RemoteControlSessionStarted -> {
+                buf.putInt(27)
                 FfiConverterString.write(value.`peerId`, buf)
                 FfiConverterString.write(value.`peerName`, buf)
                 FfiConverterTypeFfiRemoteControlRole.write(value.`role`, buf)
                 Unit
             }
             is FfiSyncEvent.RemoteControlSessionEnded -> {
-                buf.putInt(27)
+                buf.putInt(28)
                 FfiConverterString.write(value.`peerId`, buf)
                 FfiConverterString.write(value.`peerName`, buf)
                 FfiConverterOptionalString.write(value.`reason`, buf)
                 Unit
             }
             is FfiSyncEvent.ScreenFrameReceived -> {
-                buf.putInt(28)
+                buf.putInt(29)
                 FfiConverterString.write(value.`peerId`, buf)
                 FfiConverterByteArray.write(value.`frame`, buf)
                 Unit
             }
             is FfiSyncEvent.ScreenLockResult -> {
-                buf.putInt(29)
-                FfiConverterString.write(value.`peerId`, buf)
-                FfiConverterString.write(value.`peerName`, buf)
-                FfiConverterTypeFfiScreenLockAction.write(value.`action`, buf)
-                FfiConverterTypeFfiScreenLockOutcome.write(value.`outcome`, buf)
-                Unit
-            }
-            is FfiSyncEvent.ScreenLockRequested -> {
                 buf.putInt(30)
                 FfiConverterString.write(value.`peerId`, buf)
                 FfiConverterString.write(value.`peerName`, buf)
@@ -4180,8 +4235,16 @@ public object FfiConverterTypeFfiSyncEvent : FfiConverterRustBuffer<FfiSyncEvent
                 FfiConverterTypeFfiScreenLockOutcome.write(value.`outcome`, buf)
                 Unit
             }
-            is FfiSyncEvent.UnlockPermissionChanged -> {
+            is FfiSyncEvent.ScreenLockRequested -> {
                 buf.putInt(31)
+                FfiConverterString.write(value.`peerId`, buf)
+                FfiConverterString.write(value.`peerName`, buf)
+                FfiConverterTypeFfiScreenLockAction.write(value.`action`, buf)
+                FfiConverterTypeFfiScreenLockOutcome.write(value.`outcome`, buf)
+                Unit
+            }
+            is FfiSyncEvent.UnlockPermissionChanged -> {
+                buf.putInt(32)
                 FfiConverterString.write(value.`peerId`, buf)
                 FfiConverterString.write(value.`peerName`, buf)
                 FfiConverterBoolean.write(value.`allowed`, buf)

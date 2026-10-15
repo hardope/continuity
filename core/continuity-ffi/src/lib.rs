@@ -516,6 +516,14 @@ impl ContinuityEngine {
         });
     }
 
+    /// Where files received from now on are saved (the `received_files_dir`
+    /// passed to `start` until then). A transfer already under way finishes
+    /// where it started. The directory is created if missing; if it can't
+    /// be used, `FfiSyncEvent::Error` says why and the previous one stays.
+    pub fn set_received_files_dir(&self, path: String) {
+        let _ = self.commands.send(EngineCommand::SetReceivedFilesDir { path });
+    }
+
     /// Clears every paired device and disconnects all active peers — the
     /// host app should confirm with the user before calling this, there's
     /// no undo.

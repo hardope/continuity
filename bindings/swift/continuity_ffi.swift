@@ -829,6 +829,14 @@ public protocol ContinuityEngineProtocol : AnyObject {
     func requestRemoteControl(peerId: String) 
     
     /**
+     * Asks `peer_id` to lock or unlock its screen; the answer arrives as
+     * `FfiSyncEvent::ScreenLockResult`. Only call this for a peer whose
+     * `FfiDeviceInfo.protocol_version` is 2 or higher — an older peer
+     * doesn't know the message and drops the connection on it.
+     */
+    func requestScreenLock(peerId: String, action: FfiScreenLockAction) 
+    
+    /**
      * Clears every paired device and disconnects all active peers — the
      * host app should confirm with the user before calling this, there's
      * no undo.
@@ -875,11 +883,35 @@ public protocol ContinuityEngineProtocol : AnyObject {
     func sendMediaCommand(peerId: String, command: FfiMediaCommand) 
     
     /**
+     * Puts `text` on one peer's clipboard — for sharing a link or a
+     * snippet of text to a specific device from the system share sheet.
+     * Works with any peer, including older ones (it's an ordinary
+     * clipboard update on the wire).
+     */
+    func sendText(peerId: String, text: String) 
+    
+    /**
      * Temporarily stop syncing (new connections, dialing, clipboard) in
      * either direction, without stopping the engine or foreground
      * service. Call again with `false` to resume.
      */
     func setPaused(paused: Bool) 
+    
+    /**
+     * Where files received from now on are saved (the `received_files_dir`
+     * passed to `start` until then). A transfer already under way finishes
+     * where it started. The directory is created if missing; if it can't
+     * be used, `FfiSyncEvent::Error` says why and the previous one stays.
+     */
+    func setReceivedFilesDir(path: String) 
+    
+    /**
+     * Turns remote unlock of *this* device on/off for one peer. Exposed
+     * for symmetry like `respond_to_remote_control_request` — a phone
+     * wires in `NoopScreenLockController`, so there's nothing to unlock
+     * here today.
+     */
+    func setUnlockAllowed(peerId: String, allowed: Bool) 
     
 }
 
@@ -1040,6 +1072,20 @@ open func requestRemoteControl(peerId: String) {try! rustCall() {
 }
     
     /**
+     * Asks `peer_id` to lock or unlock its screen; the answer arrives as
+     * `FfiSyncEvent::ScreenLockResult`. Only call this for a peer whose
+     * `FfiDeviceInfo.protocol_version` is 2 or higher — an older peer
+     * doesn't know the message and drops the connection on it.
+     */
+open func requestScreenLock(peerId: String, action: FfiScreenLockAction) {try! rustCall() {
+    uniffi_continuity_ffi_fn_method_continuityengine_request_screen_lock(self.uniffiClonePointer(),
+        FfiConverterString.lower(peerId),
+        FfiConverterTypeFfiScreenLockAction.lower(action),$0
+    )
+}
+}
+    
+    /**
      * Clears every paired device and disconnects all active peers — the
      * host app should confirm with the user before calling this, there's
      * no undo.
@@ -1119,6 +1165,20 @@ open func sendMediaCommand(peerId: String, command: FfiMediaCommand) {try! rustC
 }
     
     /**
+     * Puts `text` on one peer's clipboard — for sharing a link or a
+     * snippet of text to a specific device from the system share sheet.
+     * Works with any peer, including older ones (it's an ordinary
+     * clipboard update on the wire).
+     */
+open func sendText(peerId: String, text: String) {try! rustCall() {
+    uniffi_continuity_ffi_fn_method_continuityengine_send_text(self.uniffiClonePointer(),
+        FfiConverterString.lower(peerId),
+        FfiConverterString.lower(text),$0
+    )
+}
+}
+    
+    /**
      * Temporarily stop syncing (new connections, dialing, clipboard) in
      * either direction, without stopping the engine or foreground
      * service. Call again with `false` to resume.
@@ -1126,6 +1186,33 @@ open func sendMediaCommand(peerId: String, command: FfiMediaCommand) {try! rustC
 open func setPaused(paused: Bool) {try! rustCall() {
     uniffi_continuity_ffi_fn_method_continuityengine_set_paused(self.uniffiClonePointer(),
         FfiConverterBool.lower(paused),$0
+    )
+}
+}
+    
+    /**
+     * Where files received from now on are saved (the `received_files_dir`
+     * passed to `start` until then). A transfer already under way finishes
+     * where it started. The directory is created if missing; if it can't
+     * be used, `FfiSyncEvent::Error` says why and the previous one stays.
+     */
+open func setReceivedFilesDir(path: String) {try! rustCall() {
+    uniffi_continuity_ffi_fn_method_continuityengine_set_received_files_dir(self.uniffiClonePointer(),
+        FfiConverterString.lower(path),$0
+    )
+}
+}
+    
+    /**
+     * Turns remote unlock of *this* device on/off for one peer. Exposed
+     * for symmetry like `respond_to_remote_control_request` — a phone
+     * wires in `NoopScreenLockController`, so there's nothing to unlock
+     * here today.
+     */
+open func setUnlockAllowed(peerId: String, allowed: Bool) {try! rustCall() {
+    uniffi_continuity_ffi_fn_method_continuityengine_set_unlock_allowed(self.uniffiClonePointer(),
+        FfiConverterString.lower(peerId),
+        FfiConverterBool.lower(allowed),$0
     )
 }
 }
@@ -1367,11 +1454,21 @@ public struct FfiDeviceInfo {
     public var id: String
     public var name: String
     public var platform: String
+    /**
+     * What the peer announced — gate any feature newer than v1 on this
+     * (see `continuity_proto::PROTOCOL_VERSION`), e.g. only offer
+     * lock/unlock to a peer reporting 2 or higher.
+     */
     public var protocolVersion: UInt32
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(id: String, name: String, platform: String, protocolVersion: UInt32) {
+    public init(id: String, name: String, platform: String, 
+        /**
+         * What the peer announced — gate any feature newer than v1 on this
+         * (see `continuity_proto::PROTOCOL_VERSION`), e.g. only offer
+         * lock/unlock to a peer reporting 2 or higher.
+         */protocolVersion: UInt32) {
         self.id = id
         self.name = name
         self.platform = platform
@@ -1662,6 +1759,70 @@ extension FfiError: Foundation.LocalizedError {
         String(reflecting: self)
     }
 }
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum FfiFileTransferDirection {
+    
+    case sending
+    case receiving
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiFileTransferDirection: FfiConverterRustBuffer {
+    typealias SwiftType = FfiFileTransferDirection
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiFileTransferDirection {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .sending
+        
+        case 2: return .receiving
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiFileTransferDirection, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .sending:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .receiving:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiFileTransferDirection_lift(_ buf: RustBuffer) throws -> FfiFileTransferDirection {
+    return try FfiConverterTypeFfiFileTransferDirection.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiFileTransferDirection_lower(_ value: FfiFileTransferDirection) -> RustBuffer {
+    return FfiConverterTypeFfiFileTransferDirection.lower(value)
+}
+
+
+
+extension FfiFileTransferDirection: Equatable, Hashable {}
+
+
 
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
@@ -2012,6 +2173,161 @@ extension FfiRemoteControlRole: Equatable, Hashable {}
 
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Mirrors `continuity_proto::ScreenLockAction`.
+ */
+
+public enum FfiScreenLockAction {
+    
+    case lock
+    case unlock
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiScreenLockAction: FfiConverterRustBuffer {
+    typealias SwiftType = FfiScreenLockAction
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiScreenLockAction {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .lock
+        
+        case 2: return .unlock
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiScreenLockAction, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .lock:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .unlock:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiScreenLockAction_lift(_ buf: RustBuffer) throws -> FfiScreenLockAction {
+    return try FfiConverterTypeFfiScreenLockAction.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiScreenLockAction_lower(_ value: FfiScreenLockAction) -> RustBuffer {
+    return FfiConverterTypeFfiScreenLockAction.lower(value)
+}
+
+
+
+extension FfiScreenLockAction: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Mirrors `continuity_proto::ScreenLockOutcome`.
+ */
+
+public enum FfiScreenLockOutcome {
+    
+    case done
+    /**
+     * The peer's user hasn't allowed this device to unlock it — tell the
+     * user where to turn that on (the peer's own tray menu).
+     */
+    case notAllowed
+    case unsupported
+    case failed(reason: String
+    )
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiScreenLockOutcome: FfiConverterRustBuffer {
+    typealias SwiftType = FfiScreenLockOutcome
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiScreenLockOutcome {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .done
+        
+        case 2: return .notAllowed
+        
+        case 3: return .unsupported
+        
+        case 4: return .failed(reason: try FfiConverterString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiScreenLockOutcome, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .done:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .notAllowed:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .unsupported:
+            writeInt(&buf, Int32(3))
+        
+        
+        case let .failed(reason):
+            writeInt(&buf, Int32(4))
+            FfiConverterString.write(reason, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiScreenLockOutcome_lift(_ buf: RustBuffer) throws -> FfiScreenLockOutcome {
+    return try FfiConverterTypeFfiScreenLockOutcome.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiScreenLockOutcome_lower(_ value: FfiScreenLockOutcome) -> RustBuffer {
+    return FfiConverterTypeFfiScreenLockOutcome.lower(value)
+}
+
+
+
+extension FfiScreenLockOutcome: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
 public enum FfiSyncEvent {
     
@@ -2033,11 +2349,22 @@ public enum FfiSyncEvent {
     )
     case fileReceiving(transferId: String, fromName: String, fileName: String, sizeBytes: UInt64
     )
+    case fileSending(transferId: String, toName: String, fileName: String, sizeBytes: UInt64
+    )
+    case fileTransferProgress(transferId: String, bytesTransferred: UInt64, totalBytes: UInt64, direction: FfiFileTransferDirection
+    )
     case fileReceived(transferId: String, fileName: String, path: String
     )
     case fileSent(transferId: String, fileName: String, toName: String
     )
     case fileTransferFailed(transferId: String, reason: String
+    )
+    /**
+     * The transfer lost its connection and is waiting to resume — not an
+     * end state. The next `FileTransferProgress` for it means it resumed;
+     * if it can't within 10 minutes, `FileTransferFailed` follows.
+     */
+    case fileTransferStalled(transferId: String, reason: String
     )
     case error(message: String
     )
@@ -2065,6 +2392,12 @@ public enum FfiSyncEvent {
     case remoteControlSessionEnded(peerId: String, peerName: String, reason: String?
     )
     case screenFrameReceived(peerId: String, frame: Data
+    )
+    case screenLockResult(peerId: String, peerName: String, action: FfiScreenLockAction, outcome: FfiScreenLockOutcome
+    )
+    case screenLockRequested(peerId: String, peerName: String, action: FfiScreenLockAction, outcome: FfiScreenLockOutcome
+    )
+    case unlockPermissionChanged(peerId: String, peerName: String, allowed: Bool
     )
 }
 
@@ -2106,54 +2439,72 @@ public struct FfiConverterTypeFfiSyncEvent: FfiConverterRustBuffer {
         case 9: return .fileReceiving(transferId: try FfiConverterString.read(from: &buf), fromName: try FfiConverterString.read(from: &buf), fileName: try FfiConverterString.read(from: &buf), sizeBytes: try FfiConverterUInt64.read(from: &buf)
         )
         
-        case 10: return .fileReceived(transferId: try FfiConverterString.read(from: &buf), fileName: try FfiConverterString.read(from: &buf), path: try FfiConverterString.read(from: &buf)
+        case 10: return .fileSending(transferId: try FfiConverterString.read(from: &buf), toName: try FfiConverterString.read(from: &buf), fileName: try FfiConverterString.read(from: &buf), sizeBytes: try FfiConverterUInt64.read(from: &buf)
         )
         
-        case 11: return .fileSent(transferId: try FfiConverterString.read(from: &buf), fileName: try FfiConverterString.read(from: &buf), toName: try FfiConverterString.read(from: &buf)
+        case 11: return .fileTransferProgress(transferId: try FfiConverterString.read(from: &buf), bytesTransferred: try FfiConverterUInt64.read(from: &buf), totalBytes: try FfiConverterUInt64.read(from: &buf), direction: try FfiConverterTypeFfiFileTransferDirection.read(from: &buf)
         )
         
-        case 12: return .fileTransferFailed(transferId: try FfiConverterString.read(from: &buf), reason: try FfiConverterString.read(from: &buf)
+        case 12: return .fileReceived(transferId: try FfiConverterString.read(from: &buf), fileName: try FfiConverterString.read(from: &buf), path: try FfiConverterString.read(from: &buf)
         )
         
-        case 13: return .error(message: try FfiConverterString.read(from: &buf)
+        case 13: return .fileSent(transferId: try FfiConverterString.read(from: &buf), fileName: try FfiConverterString.read(from: &buf), toName: try FfiConverterString.read(from: &buf)
         )
         
-        case 14: return .wasReset
-        
-        case 15: return .pausedStateChanged(paused: try FfiConverterBool.read(from: &buf)
+        case 14: return .fileTransferFailed(transferId: try FfiConverterString.read(from: &buf), reason: try FfiConverterString.read(from: &buf)
         )
         
-        case 16: return .reconnectFailed(peerId: try FfiConverterString.read(from: &buf)
+        case 15: return .fileTransferStalled(transferId: try FfiConverterString.read(from: &buf), reason: try FfiConverterString.read(from: &buf)
         )
         
-        case 17: return .nowPlayingChanged(peerId: try FfiConverterString.read(from: &buf), peerName: try FfiConverterString.read(from: &buf), info: try FfiConverterTypeFfiNowPlayingInfo.read(from: &buf)
+        case 16: return .error(message: try FfiConverterString.read(from: &buf)
         )
         
-        case 18: return .peerDiscovered(device: try FfiConverterTypeFfiDeviceInfo.read(from: &buf)
+        case 17: return .wasReset
+        
+        case 18: return .pausedStateChanged(paused: try FfiConverterBool.read(from: &buf)
         )
         
-        case 19: return .peerActivity(peerId: try FfiConverterString.read(from: &buf), secondsSinceActivity: try FfiConverterUInt64.read(from: &buf)
+        case 19: return .reconnectFailed(peerId: try FfiConverterString.read(from: &buf)
         )
         
-        case 20: return .wasRevoked(peerId: try FfiConverterString.read(from: &buf), peerName: try FfiConverterString.read(from: &buf)
+        case 20: return .nowPlayingChanged(peerId: try FfiConverterString.read(from: &buf), peerName: try FfiConverterString.read(from: &buf), info: try FfiConverterTypeFfiNowPlayingInfo.read(from: &buf)
         )
         
-        case 21: return .revokedByPeer(peerId: try FfiConverterString.read(from: &buf), peerName: try FfiConverterString.read(from: &buf)
+        case 21: return .peerDiscovered(device: try FfiConverterTypeFfiDeviceInfo.read(from: &buf)
         )
         
-        case 22: return .remoteControlRequested(peerId: try FfiConverterString.read(from: &buf), peerName: try FfiConverterString.read(from: &buf)
+        case 22: return .peerActivity(peerId: try FfiConverterString.read(from: &buf), secondsSinceActivity: try FfiConverterUInt64.read(from: &buf)
         )
         
-        case 23: return .remoteControlDeclined(peerId: try FfiConverterString.read(from: &buf), peerName: try FfiConverterString.read(from: &buf)
+        case 23: return .wasRevoked(peerId: try FfiConverterString.read(from: &buf), peerName: try FfiConverterString.read(from: &buf)
         )
         
-        case 24: return .remoteControlSessionStarted(peerId: try FfiConverterString.read(from: &buf), peerName: try FfiConverterString.read(from: &buf), role: try FfiConverterTypeFfiRemoteControlRole.read(from: &buf)
+        case 24: return .revokedByPeer(peerId: try FfiConverterString.read(from: &buf), peerName: try FfiConverterString.read(from: &buf)
         )
         
-        case 25: return .remoteControlSessionEnded(peerId: try FfiConverterString.read(from: &buf), peerName: try FfiConverterString.read(from: &buf), reason: try FfiConverterOptionString.read(from: &buf)
+        case 25: return .remoteControlRequested(peerId: try FfiConverterString.read(from: &buf), peerName: try FfiConverterString.read(from: &buf)
         )
         
-        case 26: return .screenFrameReceived(peerId: try FfiConverterString.read(from: &buf), frame: try FfiConverterData.read(from: &buf)
+        case 26: return .remoteControlDeclined(peerId: try FfiConverterString.read(from: &buf), peerName: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 27: return .remoteControlSessionStarted(peerId: try FfiConverterString.read(from: &buf), peerName: try FfiConverterString.read(from: &buf), role: try FfiConverterTypeFfiRemoteControlRole.read(from: &buf)
+        )
+        
+        case 28: return .remoteControlSessionEnded(peerId: try FfiConverterString.read(from: &buf), peerName: try FfiConverterString.read(from: &buf), reason: try FfiConverterOptionString.read(from: &buf)
+        )
+        
+        case 29: return .screenFrameReceived(peerId: try FfiConverterString.read(from: &buf), frame: try FfiConverterData.read(from: &buf)
+        )
+        
+        case 30: return .screenLockResult(peerId: try FfiConverterString.read(from: &buf), peerName: try FfiConverterString.read(from: &buf), action: try FfiConverterTypeFfiScreenLockAction.read(from: &buf), outcome: try FfiConverterTypeFfiScreenLockOutcome.read(from: &buf)
+        )
+        
+        case 31: return .screenLockRequested(peerId: try FfiConverterString.read(from: &buf), peerName: try FfiConverterString.read(from: &buf), action: try FfiConverterTypeFfiScreenLockAction.read(from: &buf), outcome: try FfiConverterTypeFfiScreenLockOutcome.read(from: &buf)
+        )
+        
+        case 32: return .unlockPermissionChanged(peerId: try FfiConverterString.read(from: &buf), peerName: try FfiConverterString.read(from: &buf), allowed: try FfiConverterBool.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -2214,105 +2565,150 @@ public struct FfiConverterTypeFfiSyncEvent: FfiConverterRustBuffer {
             FfiConverterUInt64.write(sizeBytes, into: &buf)
             
         
-        case let .fileReceived(transferId,fileName,path):
+        case let .fileSending(transferId,toName,fileName,sizeBytes):
             writeInt(&buf, Int32(10))
+            FfiConverterString.write(transferId, into: &buf)
+            FfiConverterString.write(toName, into: &buf)
+            FfiConverterString.write(fileName, into: &buf)
+            FfiConverterUInt64.write(sizeBytes, into: &buf)
+            
+        
+        case let .fileTransferProgress(transferId,bytesTransferred,totalBytes,direction):
+            writeInt(&buf, Int32(11))
+            FfiConverterString.write(transferId, into: &buf)
+            FfiConverterUInt64.write(bytesTransferred, into: &buf)
+            FfiConverterUInt64.write(totalBytes, into: &buf)
+            FfiConverterTypeFfiFileTransferDirection.write(direction, into: &buf)
+            
+        
+        case let .fileReceived(transferId,fileName,path):
+            writeInt(&buf, Int32(12))
             FfiConverterString.write(transferId, into: &buf)
             FfiConverterString.write(fileName, into: &buf)
             FfiConverterString.write(path, into: &buf)
             
         
         case let .fileSent(transferId,fileName,toName):
-            writeInt(&buf, Int32(11))
+            writeInt(&buf, Int32(13))
             FfiConverterString.write(transferId, into: &buf)
             FfiConverterString.write(fileName, into: &buf)
             FfiConverterString.write(toName, into: &buf)
             
         
         case let .fileTransferFailed(transferId,reason):
-            writeInt(&buf, Int32(12))
+            writeInt(&buf, Int32(14))
+            FfiConverterString.write(transferId, into: &buf)
+            FfiConverterString.write(reason, into: &buf)
+            
+        
+        case let .fileTransferStalled(transferId,reason):
+            writeInt(&buf, Int32(15))
             FfiConverterString.write(transferId, into: &buf)
             FfiConverterString.write(reason, into: &buf)
             
         
         case let .error(message):
-            writeInt(&buf, Int32(13))
+            writeInt(&buf, Int32(16))
             FfiConverterString.write(message, into: &buf)
             
         
         case .wasReset:
-            writeInt(&buf, Int32(14))
+            writeInt(&buf, Int32(17))
         
         
         case let .pausedStateChanged(paused):
-            writeInt(&buf, Int32(15))
+            writeInt(&buf, Int32(18))
             FfiConverterBool.write(paused, into: &buf)
             
         
         case let .reconnectFailed(peerId):
-            writeInt(&buf, Int32(16))
+            writeInt(&buf, Int32(19))
             FfiConverterString.write(peerId, into: &buf)
             
         
         case let .nowPlayingChanged(peerId,peerName,info):
-            writeInt(&buf, Int32(17))
+            writeInt(&buf, Int32(20))
             FfiConverterString.write(peerId, into: &buf)
             FfiConverterString.write(peerName, into: &buf)
             FfiConverterTypeFfiNowPlayingInfo.write(info, into: &buf)
             
         
         case let .peerDiscovered(device):
-            writeInt(&buf, Int32(18))
+            writeInt(&buf, Int32(21))
             FfiConverterTypeFfiDeviceInfo.write(device, into: &buf)
             
         
         case let .peerActivity(peerId,secondsSinceActivity):
-            writeInt(&buf, Int32(19))
+            writeInt(&buf, Int32(22))
             FfiConverterString.write(peerId, into: &buf)
             FfiConverterUInt64.write(secondsSinceActivity, into: &buf)
             
         
         case let .wasRevoked(peerId,peerName):
-            writeInt(&buf, Int32(20))
-            FfiConverterString.write(peerId, into: &buf)
-            FfiConverterString.write(peerName, into: &buf)
-            
-        
-        case let .revokedByPeer(peerId,peerName):
-            writeInt(&buf, Int32(21))
-            FfiConverterString.write(peerId, into: &buf)
-            FfiConverterString.write(peerName, into: &buf)
-            
-        
-        case let .remoteControlRequested(peerId,peerName):
-            writeInt(&buf, Int32(22))
-            FfiConverterString.write(peerId, into: &buf)
-            FfiConverterString.write(peerName, into: &buf)
-            
-        
-        case let .remoteControlDeclined(peerId,peerName):
             writeInt(&buf, Int32(23))
             FfiConverterString.write(peerId, into: &buf)
             FfiConverterString.write(peerName, into: &buf)
             
         
-        case let .remoteControlSessionStarted(peerId,peerName,role):
+        case let .revokedByPeer(peerId,peerName):
             writeInt(&buf, Int32(24))
+            FfiConverterString.write(peerId, into: &buf)
+            FfiConverterString.write(peerName, into: &buf)
+            
+        
+        case let .remoteControlRequested(peerId,peerName):
+            writeInt(&buf, Int32(25))
+            FfiConverterString.write(peerId, into: &buf)
+            FfiConverterString.write(peerName, into: &buf)
+            
+        
+        case let .remoteControlDeclined(peerId,peerName):
+            writeInt(&buf, Int32(26))
+            FfiConverterString.write(peerId, into: &buf)
+            FfiConverterString.write(peerName, into: &buf)
+            
+        
+        case let .remoteControlSessionStarted(peerId,peerName,role):
+            writeInt(&buf, Int32(27))
             FfiConverterString.write(peerId, into: &buf)
             FfiConverterString.write(peerName, into: &buf)
             FfiConverterTypeFfiRemoteControlRole.write(role, into: &buf)
             
         
         case let .remoteControlSessionEnded(peerId,peerName,reason):
-            writeInt(&buf, Int32(25))
+            writeInt(&buf, Int32(28))
             FfiConverterString.write(peerId, into: &buf)
             FfiConverterString.write(peerName, into: &buf)
             FfiConverterOptionString.write(reason, into: &buf)
             
         
         case let .screenFrameReceived(peerId,frame):
-            writeInt(&buf, Int32(26))
+            writeInt(&buf, Int32(29))
             FfiConverterString.write(peerId, into: &buf)
             FfiConverterData.write(frame, into: &buf)
+            
+        
+        case let .screenLockResult(peerId,peerName,action,outcome):
+            writeInt(&buf, Int32(30))
+            FfiConverterString.write(peerId, into: &buf)
+            FfiConverterString.write(peerName, into: &buf)
+            FfiConverterTypeFfiScreenLockAction.write(action, into: &buf)
+            FfiConverterTypeFfiScreenLockOutcome.write(outcome, into: &buf)
+            
+        
+        case let .screenLockRequested(peerId,peerName,action,outcome):
+            writeInt(&buf, Int32(31))
+            FfiConverterString.write(peerId, into: &buf)
+            FfiConverterString.write(peerName, into: &buf)
+            FfiConverterTypeFfiScreenLockAction.write(action, into: &buf)
+            FfiConverterTypeFfiScreenLockOutcome.write(outcome, into: &buf)
+            
+        
+        case let .unlockPermissionChanged(peerId,peerName,allowed):
+            writeInt(&buf, Int32(32))
+            FfiConverterString.write(peerId, into: &buf)
+            FfiConverterString.write(peerName, into: &buf)
+            FfiConverterBool.write(allowed, into: &buf)
             
         }
     }
@@ -2473,6 +2869,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_continuity_ffi_checksum_method_continuityengine_request_remote_control() != 15704) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_continuity_ffi_checksum_method_continuityengine_request_screen_lock() != 48563) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_continuity_ffi_checksum_method_continuityengine_reset() != 40739) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -2491,7 +2890,16 @@ private var initializationResult: InitializationResult = {
     if (uniffi_continuity_ffi_checksum_method_continuityengine_send_media_command() != 1860) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_continuity_ffi_checksum_method_continuityengine_send_text() != 39493) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_continuity_ffi_checksum_method_continuityengine_set_paused() != 20054) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_continuity_ffi_checksum_method_continuityengine_set_received_files_dir() != 55347) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_continuity_ffi_checksum_method_continuityengine_set_unlock_allowed() != 56413) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_continuity_ffi_checksum_method_eventlistener_on_event() != 22386) {
