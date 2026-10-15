@@ -390,13 +390,18 @@ pub(super) fn check_usable_dir(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Creates `<name>.part` for a new incoming file, where `<name>` is the
-/// name it would be saved under right now — `file_name`, or `stem (n).ext`
-/// if that's taken — skipping any name whose `.part` already exists too
-/// (another transfer of the same name, or one left behind by a previous
-/// run). `create_new`, so it can never truncate someone else's file. The
-/// final name is picked again at completion, since the folder can change
-/// in the meantime.
+/// What a receiver's partial file is called: `<name>` + this. Still reads
+/// as a partial file, and can't be mistaken for another app's — a
+/// browser's in-progress `.part` download in the same folder, say — when
+/// `remove_leftover_part_files` sweeps up after a previous run.
+pub(super) const PART_SUFFIX: &str = ".continuity.part";
+
+/// Creates `<name>.continuity.part` for a new incoming file, where `<name>`
+/// is the name it would be saved under right now — `file_name`, or
+/// `stem (n).ext` if that's taken — skipping any name whose partial file
+/// already exists too (another transfer of the same name). `create_new`, so
+/// it can never truncate someone else's file. The final name is picked
+/// again at completion, since the folder can change in the meantime.
 fn create_part_file(dir: &Path, file_name: &str) -> std::io::Result<(PathBuf, std::fs::File)> {
     let stem = Path::new(file_name).file_stem().and_then(|s| s.to_str()).unwrap_or(file_name);
     let ext = Path::new(file_name).extension().and_then(|s| s.to_str());
@@ -409,7 +414,7 @@ fn create_part_file(dir: &Path, file_name: &str) -> std::io::Result<(PathBuf, st
         if dir.join(&name).exists() {
             continue;
         }
-        let part_path = dir.join(format!("{name}.part"));
+        let part_path = dir.join(format!("{name}{PART_SUFFIX}"));
         match std::fs::OpenOptions::new().write(true).create_new(true).open(&part_path) {
             Ok(file) => return Ok((part_path, file)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -417,6 +422,32 @@ fn create_part_file(dir: &Path, file_name: &str) -> std::io::Result<(PathBuf, st
         }
     }
     Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "no free file name left"))
+}
+
+/// Deletes the partial files a previous run left in `dir` — killed or
+/// crashed mid-transfer, it took what it needed to resume them with it, so
+/// they'd only ever take up space. Only Continuity's own (`PART_SUFFIX`),
+/// and only ones untouched for `RESUME_WINDOW`, in case another Continuity
+/// (a second profile) receives into the same folder and is still writing
+/// one. Returns how many went.
+pub(super) fn remove_leftover_part_files(dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let ours = path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with(PART_SUFFIX) && n.len() > PART_SUFFIX.len());
+        let idle = entry
+            .metadata()
+            .ok()
+            .filter(|m| m.is_file())
+            .and_then(|m| m.modified().ok())
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= RESUME_WINDOW);
+        if ours && idle && std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 // ---------------------------------------------------------------------------
@@ -541,8 +572,8 @@ async fn answer_offer(
 
     if resume {
         // Restarted since, or the partial file expired: nothing to resume
-        // from, so it's a new transfer from 0. An old `.part` file from
-        // before a restart is left alone — this run doesn't know it.
+        // from, so it's a new transfer from 0. A partial file from before a
+        // restart was swept up at start (`remove_leftover_part_files`).
         tracing::debug!("resume offer for unknown transfer {transfer_id} from '{}' — starting over", peer.name);
     }
     let too_many = format!("{} is already receiving {INCOMING_PER_PEER} files from this device", state.my_device.name);
@@ -1645,13 +1676,41 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("continuity-part-test-{:08x}", rand::random::<u32>()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("photo.jpg"), b"already here").unwrap();
-        std::fs::write(dir.join("photo (1).jpg.part"), b"left over").unwrap();
+        std::fs::write(dir.join("photo (1).jpg.continuity.part"), b"left over").unwrap();
 
         let (part, _file) = create_part_file(&dir, "photo.jpg").unwrap();
-        assert_eq!(part, dir.join("photo (2).jpg.part"));
+        assert_eq!(part, dir.join("photo (2).jpg.continuity.part"));
         // Nothing that was already there was touched.
-        assert_eq!(std::fs::read(dir.join("photo (1).jpg.part")).unwrap(), b"left over");
+        assert_eq!(std::fs::read(dir.join("photo (1).jpg.continuity.part")).unwrap(), b"left over");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_continuitys_own_idle_partial_files_are_swept_up() {
+        let dir = std::env::temp_dir().join(format!("continuity-sweep-test-{:08x}", rand::random::<u32>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let long_ago = std::time::SystemTime::now() - RESUME_WINDOW - Duration::from_secs(60);
+        let write = |name: &str, old: bool| {
+            let file = std::fs::File::create(dir.join(name)).unwrap();
+            if old {
+                file.set_modified(long_ago).unwrap();
+            }
+        };
+        write("left by a crash.mov.continuity.part", true);
+        write("another profile is writing this.zip.continuity.part", false);
+        write("a browser download.iso.part", true);
+        write("a finished photo.jpg", true);
+        write(".continuity.part", true);
+
+        assert_eq!(remove_leftover_part_files(&dir), 1);
+        let mut left: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [".continuity.part", "a browser download.iso.part", "a finished photo.jpg", "another profile is writing this.zip.continuity.part"]
+        );
+        assert_eq!(remove_leftover_part_files(&dir.join("missing")), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

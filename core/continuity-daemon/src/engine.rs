@@ -984,6 +984,15 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
     };
 
     std::fs::create_dir_all(&config.received_files_dir)?;
+    {
+        let dir = config.received_files_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let removed = transfer::remove_leftover_part_files(&dir);
+            if removed > 0 {
+                tracing::info!("removed {removed} partial file(s) a previous run left in {}", dir.display());
+            }
+        });
+    }
 
     let listener = Listener::bind("0.0.0.0:0".parse()?, &tls_identity).await?;
     let port = listener.local_addr()?.port();
