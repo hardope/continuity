@@ -557,7 +557,8 @@ pub(super) async fn route_inbound(mut conn: Connection, state: Arc<SharedState>,
     match claim_for_stream(&state, &key, offset) {
         Ok(Claim::Stream(claim)) => {
             let epoch = claim.epoch;
-            let join = tokio::spawn(receive_stream(conn, state.clone(), key.clone(), claim));
+            let stream = start_writer(&state, &key, claim);
+            let join = tokio::spawn(receive_stream(conn, state.clone(), key.clone(), stream));
             let mut incoming = state.incoming_transfers.lock().unwrap();
             if let Some(entry) = incoming.get_mut(&key) {
                 if entry.epoch == epoch && matches!(entry.phase, Phase::Streaming) && entry.stream.is_none() {
@@ -615,6 +616,44 @@ fn claim_for_stream(state: &SharedState, key: &(String, String), offset: u64) ->
     }
 }
 
+/// A claimed data connection's partial file, already in its writer
+/// thread's hands, and what the async read side needs to feed it.
+struct ReceivingStream {
+    epoch: u64,
+    /// Bytes already in the file when this connection took it over.
+    offset: u64,
+    part_path: PathBuf,
+    file_name: String,
+    peer_name: String,
+    size_bytes: u64,
+    frames: mpsc::Sender<Vec<u8>>,
+    writer: JoinHandle<()>,
+}
+
+/// Hands a claimed partial file straight to its writer thread
+/// (`write_part`), before the data connection's async half is even
+/// spawned. **Real bug fixed here**: the async half used to start the
+/// writer itself, on its first poll — so a task aborted before it was
+/// ever polled (a resume offer ending it in `answer_offer`, a cancel or
+/// shutdown in `discard_incoming`, both of which can land in that window)
+/// dropped the file without handing it back. The entry was then stuck in
+/// `Streaming` with no file: never expired, its resume refused, its `.part`
+/// file never deleted. With the writer started first, dropping that task
+/// at any point just closes the channel, and the writer hands the file
+/// back as for any other end of the stream.
+fn start_writer(state: &Arc<SharedState>, key: &(String, String), claim: StreamClaim) -> ReceivingStream {
+    let StreamClaim { epoch, part, part_path, file_name, peer_name, size_bytes } = claim;
+    let offset = part.written;
+    let (frames, frames_rx) = mpsc::channel::<Vec<u8>>(PIPELINE_DEPTH);
+    let writer = {
+        let state = state.clone();
+        let key = key.clone();
+        let part_path = part_path.clone();
+        tokio::task::spawn_blocking(move || write_part(&state, &key, epoch, part, &part_path, frames_rx, size_bytes))
+    };
+    ReceivingStream { epoch, offset, part_path, file_name, peer_name, size_bytes, frames, writer }
+}
+
 /// How a data connection's read side ended, short of a `FileComplete`.
 enum ReceiveError {
     /// The connection broke — resumable.
@@ -625,10 +664,9 @@ enum ReceiveError {
     WriterStopped,
 }
 
-async fn receive_stream(mut conn: Connection, state: Arc<SharedState>, key: (String, String), claim: StreamClaim) {
-    let StreamClaim { epoch, part, part_path, file_name, peer_name, size_bytes } = claim;
+async fn receive_stream(mut conn: Connection, state: Arc<SharedState>, key: (String, String), stream: ReceivingStream) {
+    let ReceivingStream { epoch, offset, part_path, file_name, peer_name, size_bytes, frames: frames_tx, writer } = stream;
     let transfer_id = key.1.clone();
-    let offset = part.written;
     if offset > 0 {
         // Picking up after a stall — the next progress event is what tells
         // a shell it resumed (see `SyncEvent::FileTransferStalled`).
@@ -639,14 +677,6 @@ async fn receive_stream(mut conn: Connection, state: Arc<SharedState>, key: (Str
             direction: FileTransferDirection::Receiving,
         });
     }
-
-    let (frames_tx, frames_rx) = mpsc::channel::<Vec<u8>>(PIPELINE_DEPTH);
-    let writer = {
-        let state = state.clone();
-        let key = key.clone();
-        let part_path = part_path.clone();
-        tokio::task::spawn_blocking(move || write_part(&state, &key, epoch, part, &part_path, frames_rx, size_bytes))
-    };
 
     let read = async {
         let mut received = offset;
@@ -755,7 +785,8 @@ async fn receive_stream(mut conn: Connection, state: Arc<SharedState>, key: (Str
 /// each frame as it comes off the channel, then hands the file back to the
 /// transfer's entry (`return_part`) whether the stream finished, broke, or
 /// was aborted — the one place the partial file goes back, so none of
-/// those paths can lose it.
+/// those paths can lose it. Started before the async half (see
+/// `start_writer`), so it owns the file from the moment it's claimed.
 fn write_part(
     state: &SharedState,
     key: &(String, String),
