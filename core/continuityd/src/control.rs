@@ -33,6 +33,11 @@ use tokio::sync::mpsc::UnboundedSender;
 /// System Settings.
 const TRUST_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+/// How often the chosen received-files folder is checked for having gone
+/// away — an unplugged drive, an unmounted share — or come back (see
+/// `ControlState::check_received_dir`).
+const FOLDER_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
 /// A `watch` connection re-sends the current status at least this often
 /// even when nothing changed — which is also how it notices a window that
 /// closed without saying so (the write fails).
@@ -321,6 +326,30 @@ pub fn check_usable_dir(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether `dir` exists and a file can be written in it — `check_usable_dir`
+/// without creating it. A chosen folder that's gone is usually on a drive
+/// that's been unplugged, and on Linux its mount point can be left behind
+/// and writable: creating the folder there would quietly put received
+/// files on the internal disk.
+fn writable_folder(dir: &Path) -> bool {
+    if !dir.is_dir() {
+        return false;
+    }
+    let probe = dir.join(format!(".continuity-write-test-{:016x}", rand::random::<u64>()));
+    let written = std::fs::File::create(&probe).is_ok();
+    let _ = std::fs::remove_file(&probe);
+    written
+}
+
+/// What `ControlState::check_received_dir` did.
+#[derive(Debug, PartialEq)]
+pub enum FolderChange {
+    /// The chosen folder went away; files go to the default one meanwhile.
+    FellBack { chosen: PathBuf, to: PathBuf },
+    /// It's back, and files go there again.
+    Back(PathBuf),
+}
+
 /// What `observe` keeps from engine events.
 #[derive(Default)]
 struct Live {
@@ -603,6 +632,55 @@ impl ControlState {
                 }
             }
         });
+    }
+
+    /// Keeps received files going somewhere that exists for as long as the
+    /// process runs: see `check_received_dir`. `default_dir` is where they
+    /// go when no folder was chosen.
+    pub fn spawn_received_dir_watcher(self: &Arc<Self>, default_dir: PathBuf, commands: UnboundedSender<EngineCommand>) {
+        let state = Arc::clone(self);
+        std::thread::spawn(move || loop {
+            std::thread::sleep(FOLDER_POLL_INTERVAL);
+            match state.check_received_dir(&default_dir, &commands) {
+                Some(FolderChange::FellBack { chosen, to }) => crate::notify(&format!(
+                    "{} isn't available, so received files are saved in {} until it's back.",
+                    chosen.display(),
+                    to.display()
+                )),
+                Some(FolderChange::Back(dir)) => tracing::info!("{} is back — received files go there again", dir.display()),
+                None => {}
+            }
+        });
+    }
+
+    /// One look at the folder chosen for received files, when one was.
+    /// While it's in use, only whether it still exists is checked (no test
+    /// write every few seconds to a drive that may want to sleep); once it
+    /// has gone, the engine is pointed at `default_dir` until it's there and
+    /// writable again — never creating it (see `writable_folder`). **Real
+    /// bug fixed here**: a chosen folder that went away mid-run (a USB
+    /// drive unplugged) made every file sent after it fail, until Continuity
+    /// was restarted — the start was the only place that fell back.
+    fn check_received_dir(&self, default_dir: &Path, commands: &UnboundedSender<EngineCommand>) -> Option<FolderChange> {
+        let chosen = self.settings.lock().unwrap().received_files_dir.clone()?;
+        let current = self.live.lock().unwrap().received_files_dir.clone();
+        let want = if current == chosen {
+            if chosen.is_dir() {
+                return None;
+            }
+            default_dir.to_path_buf()
+        } else if writable_folder(&chosen) {
+            chosen.clone()
+        } else {
+            return None;
+        };
+        if want == current {
+            return None;
+        }
+        commands.send(EngineCommand::SetReceivedFilesDir { path: want.to_str()?.to_string() }).ok()?;
+        self.live.lock().unwrap().received_files_dir = want.clone();
+        self.bump();
+        Some(if want == chosen { FolderChange::Back(want) } else { FolderChange::FellBack { chosen, to: want } })
     }
 
     pub fn status(&self) -> Status {
@@ -1452,6 +1530,38 @@ mod tests {
         assert_eq!(state.status().received_files_dir, chosen.display().to_string());
         let saved = AppSettings::load(&dir.path().join("settings.json"));
         assert_eq!(saved.received_files_dir.as_deref(), Some(chosen.as_path()));
+    }
+
+    #[test]
+    fn a_chosen_folder_that_goes_away_falls_back_to_the_default_until_it_is_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(&dir);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let default_dir = dir.path().join("Downloads/Continuity");
+        let usb = dir.path().join("USB/Incoming");
+
+        // Nothing chosen: nothing to watch.
+        assert_eq!(state.check_received_dir(&default_dir, &tx), None);
+        state.apply(ControlOp::SetReceivedFilesDir { path: usb.clone() }, &tx).unwrap();
+        let _ = rx.try_recv();
+        assert_eq!(state.check_received_dir(&default_dir, &tx), None, "still there");
+
+        // Unplugged.
+        std::fs::remove_dir_all(dir.path().join("USB")).unwrap();
+        assert_eq!(state.check_received_dir(&default_dir, &tx), Some(FolderChange::FellBack { chosen: usb.clone(), to: default_dir.clone() }));
+        assert!(matches!(rx.try_recv(), Ok(EngineCommand::SetReceivedFilesDir { path }) if path == default_dir.display().to_string()));
+        assert_eq!(state.status().received_files_dir, default_dir.display().to_string());
+        assert_eq!(state.check_received_dir(&default_dir, &tx), None, "said once");
+        assert!(!usb.exists(), "never recreated where the drive was");
+        // Still the folder the user chose, for when it's back.
+        assert_eq!(AppSettings::load(&dir.path().join("settings.json")).received_files_dir.as_deref(), Some(usb.as_path()));
+
+        // Plugged back in.
+        std::fs::create_dir_all(&usb).unwrap();
+        assert_eq!(state.check_received_dir(&default_dir, &tx), Some(FolderChange::Back(usb.clone())));
+        assert!(matches!(rx.try_recv(), Ok(EngineCommand::SetReceivedFilesDir { path }) if path == usb.display().to_string()));
+        assert_eq!(state.status().received_files_dir, usb.display().to_string());
+        assert!(std::fs::read_dir(&usb).unwrap().next().is_none(), "the write test left nothing behind");
     }
 
     #[test]

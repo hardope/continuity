@@ -263,6 +263,7 @@ fn main() -> anyhow::Result<()> {
         app_settings,
     );
     control.spawn_trust_watcher();
+    control.spawn_received_dir_watcher(received_files_dir(&profile()), commands.clone());
     // Entries left behind by a previous run that didn't quit cleanly would
     // point at devices that may not be connected now — start from none and
     // let `Connected` events add them back.
