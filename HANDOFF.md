@@ -17,9 +17,13 @@ installers in `installers/`).
   transfer-engine-9 used the owner's choice: the sender sends one device at
   most 4 files at a time, the receiver refuses a 17th unfinished one.
 - desktop-shell-2, -4, -8, -9 are fixed too (all desktop-shell findings).
-- Next up: the remote-control and Android findings at the bottom of this
-  file (remote-control-2 is probably already fixed — check, then tick), then
-  "What is left" items 1 (macOS SwiftUI + contracts review), 2 and 3.
+- remote-control-1 to -6 are fixed (ticked at the bottom of this file;
+  -2 was already fixed by "Control one computer at a time from the window").
+- Next up: the Android findings at the bottom of this file, then "What is
+  left" items 1 (macOS SwiftUI + contracts review), 2 and 3.
+- Windows- and Linux-only code changed since the last CI run (e.g.
+  remote_control_windows.rs) can't be compiled on the owner's Mac; ask the
+  owner before dispatching a CI run.
 - On the owner's Mac the firewall has allowed the file_transfer and
   remote_control test binaries; dial_race, revoke and screen_lock will
   each prompt once. No Android SDK there.
@@ -196,32 +200,32 @@ have it):
 
 ## Findings not yet in REVIEW-NOTES.md
 
-- [ ] **remote-control-1** (high, bug) Forwarded autorepeat KeyDowns leave keys stuck down on a GNOME (Linux) peer  
+- [x] **remote-control-1** (high, bug) Forwarded autorepeat KeyDowns leave keys stuck down on a GNOME (Linux) peer  
   `core/continuityd/src/remote_viewer.rs:945`  
   *Scenario:* KeyboardForwarder::key sends a fresh KeyDown for every local autorepeat of a held non-modifier key, whatever the peer platform. The old viewer dropped repeats (`if !event.repeat`). A Linux peer passes each KeyDown/KeyUp straight to the portal's NotifyKeyboardKeycode (remote_control_linux.rs forward_input). Mutter counts presses per key, in the virtual device and again in the seat (meta_seat_impl_notify_key_in_impl drops 'repeated' presses and any release whose count doesn't reach 0). Example: a Mac, Windows or Linux viewer controls a GNOME machine and holds Backspace for about a second. The peer gets KeyDown(14) about 15 times and then one KeyUp(14). The seat count goes to 15 and back to 14, so the release is dropped. Backspace stays pressed for the focused Wayland client, which keeps auto-repeating and deleting text until the session ends. Later press/release pairs only move the count between N and N-1, so neither the controller nor the local person can release it. release_all on focus loss or close has the same problem: it sends only one KeyUp. Mac and Windows peers are fine: macOS gets the autorepeat field and Windows SendInput repeats are normal.  
   *Fix:* In KeyboardForwarder::key, don't forward repeat presses when translator.peer == Platform::Linux (the Wayland compositor and clients repeat held keys themselves): return None for `Some(_)` in that case. Keep forwarding repeats for macOS and Windows peers. Add a unit test that a Linux peer gets exactly one KeyDown and one KeyUp for a held key.
 
-- [ ] **remote-control-2** (medium, pre-existing) Opening a viewer for a second peer silently orphans the first session, which can then never be ended or restarted from this side  
+- [x] **remote-control-2** (medium, pre-existing) Opening a viewer for a second peer silently orphans the first session, which can then never be ended or restarted from this side  
   `core/continuityd/src/main.rs:907`  
   *Scenario:* This device controls P with a viewer open. The person opens the Continuity window and clicks 'Control Q' (the window shows the button for every connected computer). Q accepts, so RemoteControlSessionStarted(Q, Controlling) runs `*viewer.borrow_mut() = Some(new_viewer)`. That drops P's viewer, whose Drop only sends key/button releases, but never sends EndRemoteControlSession for P. P's session stays active in the engine: P keeps capturing and streaming about 10 JPEGs a second, which the FrameRouter parks and throws away, and P keeps showing that it is being controlled. This device has no window or control to end it. Clicking 'Control P' again only toasts 'Asking P…', because the engine's RequestRemoteControl sees `remote_control_sessions.contains_key(P)` and `continue`s silently. The overwrite pattern was already in the old code.  
   *Fix:* Before replacing an open viewer whose peer_id differs from the new session's, take the old one and send EndRemoteControlSession { peer_crypto_id: old.peer_id() } after dropping it, as check_viewer_watchdog does. Alternatively, refuse the new session and end it instead.
 
-- [ ] **remote-control-3** (medium, pre-existing) RemoteControlSessionEnded closes the viewer by peer id only, even for an unrelated Controlled-role decline from the same peer  
+- [x] **remote-control-3** (medium, pre-existing) RemoteControlSessionEnded closes the viewer by peer id only, even for an unrelated Controlled-role decline from the same peer  
   `core/continuityd/src/main.rs:917`  
   *Scenario:* The engine emits RemoteControlSessionEnded { peer_id: B, session_id: <B's request id> } on the controlled-side decline paths in accept_remote_control_session and start_controlled_session ('already controlling another device', 'couldn't find a network address…', 'couldn't start screen capture'). Those paths never touch this device's own Controlling session with B. Example: A is being controlled by C and is controlling B with a viewer open. B's person clicks 'Control A'. A declines with Ended{peer_id: B}, and handle_remote_control_sync_event drops A's viewer for B because `v.peer_id() == peer_id`. A's Controlling session with B is still active in the engine, so B keeps streaming and stays 'controlled', A has no window, and A's later 'Control B' is silently ignored. The viewer already carries the session id (SessionKey) but the Ended match doesn't use it.  
   *Fix:* Keep the session_id in RemoteViewer (it's already passed in ViewerPeer) and close the viewer only when both peer_id and session_id of the Ended event match.
 
-- [ ] **remote-control-4** (medium, pre-existing) Mac peer gets MouseMoved (not LeftMouseDragged) while a button is held, so drags don't work, and clicks never carry a click count  
+- [x] **remote-control-4** (medium, pre-existing) Mac peer gets MouseMoved (not LeftMouseDragged) while a button is held, so drags don't work, and clicks never carry a click count  
   `core/continuityd/src/remote_control_mac.rs:418`  
   *Scenario:* A desktop viewer (or Android) presses the left button on a Mac peer and moves: inject_event posts kCGEventMouseMoved for every move while the button is down. macOS apps only treat kCGEventLeftMouseDragged/RightMouseDragged/OtherMouseDragged as a drag. Selecting text, moving a window by its title bar, resizing, or dragging a file in Finder therefore does nothing on the controlled Mac. Separately, button events never set kCGMouseEventClickState, so a quick double-click from the viewer arrives as two single clicks: files don't open in Finder and words don't get selected. Behaviour was the same before this change. The new viewer forwards real desktop drags and double-clicks, which makes it obvious.  
   *Fix:* Track the buttons held in MacRemoteControlHost (alongside HeldKeys) and post LeftMouseDragged, RightMouseDragged or OtherMouseDragged instead of MouseMoved while one is down. Count clicks by time and distance and set CGEventField::MouseEventClickState on the down and up events.
 
-- [ ] **remote-control-5** (low, bug) Controlled side releases held keys on session end but not held mouse buttons  
+- [x] **remote-control-5** (low, bug) Controlled side releases held keys on session end but not held mouse buttons  
   `core/continuityd/src/remote_control_windows.rs:126`  
   *Scenario:* The Windows host's stop_capture (and the Mac one at remote_control_mac.rs:262) now lets go of injected keys when a session ends without key-ups, for example on a network drop or when the controller sleeps. Injected mouse buttons are not tracked. If the controller is mid-drag when the mesh connection drops, the engine ends the session (engine.rs:1604) and the viewer's MouseButton-up is discarded because the session is gone. Windows then keeps VK_LBUTTON logically down: the local person's mouse movements keep dragging or selecting, or move the captured window, until they physically click.  
   *Fix:* Record button downs and ups in inject() the way held_keys does, and send the matching MOUSEEVENTF_*UP (or the CGEvent *MouseUp at the current location on macOS) for each still-held button in stop_capture and start_capture.
 
-- [ ] **remote-control-6** (low, spec-deviation) Caps Lock is never forwarded from a Mac controller despite being in KEY_CODES  
+- [x] **remote-control-6** (low, spec-deviation) Caps Lock is never forwarded from a Mac controller despite being in KEY_CODES  
   `core/continuityd/src/remote_viewer.rs:1068`  
   *Scenario:* tao's macOS view reports modifier keys only through flags_changed, and that handler checks only the Shift, Control, Option and Command masks. Caps Lock (kVK_CapsLock, which also arrives as flagsChanged) never produces a KeyboardInput event. On a Mac controlling Windows or Linux, pressing Caps Lock therefore does nothing on the peer, although the table and the 'whole keyboard' doc comment and tests say Caps Lock is covered.  
   *Fix:* Handle WindowEvent::ModifiersChanged or a flagsChanged for Caps Lock on macOS. For example, track the CapsLock lock state from ModifiersChanged and send a KeyDown/KeyUp pair for the peer's Caps Lock code when it toggles. Otherwise, document that Caps Lock is unsupported from a Mac.
