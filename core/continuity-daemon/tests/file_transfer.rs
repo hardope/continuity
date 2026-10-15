@@ -528,6 +528,11 @@ async fn a_misbehaving_v3_sender_is_held_to_the_limits() {
 #[tokio::test]
 async fn a_stalled_transfer_resumes_after_the_mesh_connection_comes_back() {
     let (mut a, mut b, a_id, b_id, a_dir, b_dir) = connected_pair("MeshDropA", "MeshDropB").await;
+    // Only the test brings the mesh back (below): left to themselves, the
+    // engines can redial before the sender's retry notices it's down — on
+    // a busy runner other tests' mDNS traffic prompts one any moment.
+    a.test_hooks().auto_dial_off.store(true, Ordering::Relaxed);
+    b.test_hooks().auto_dial_off.store(true, Ordering::Relaxed);
 
     let source_dir = temp_dir("mesh-drop-source");
     let source = source_dir.join("photos.zip");

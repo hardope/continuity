@@ -186,6 +186,10 @@ pub struct TestHooks {
     pub data_channel_files_received: AtomicU64,
     /// Receiver: files received over the in-band path.
     pub in_band_files_received: AtomicU64,
+    /// Both: don't dial anyone on an mDNS resolution or a redial —
+    /// `ReconnectPeer` still does — so a test can keep a dropped mesh
+    /// connection down while it looks at what happens meanwhile.
+    pub auto_dial_off: AtomicBool,
     /// Receiver: data connections a resume offer ended because this side
     /// hadn't seen them end yet (see `transfer::answer_offer`).
     pub stale_data_connections_ended: AtomicU64,
@@ -1107,6 +1111,9 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                 // devices would see each other over mDNS at roughly the
                 // same time and race to open duplicate connections.
                 if peer.device.id >= state.my_device.id {
+                    continue;
+                }
+                if state.test_hooks.auto_dial_off.load(Ordering::Relaxed) {
                     continue;
                 }
                 if state.paused.load(Ordering::Relaxed) {
@@ -2857,6 +2864,9 @@ fn spawn_now_playing_watcher(state: Arc<SharedState>) -> JoinHandle<()> {
 /// external is needed for that half — this only needs to redial peers
 /// whose address is already cached in `known_addresses`.
 fn redial_disconnected_trusted_peers(state: &Arc<SharedState>) {
+    if state.test_hooks.auto_dial_off.load(Ordering::Relaxed) {
+        return;
+    }
     let targets: Vec<(String, SocketAddr)> = {
         let trust_store = state.trust_store.lock().unwrap();
         let connected = state.connected.lock().unwrap();
