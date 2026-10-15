@@ -87,6 +87,8 @@ pub struct RemoteViewer {
     session: SessionKey,
     commands: UnboundedSender<EngineCommand>,
     keyboard: KeyboardForwarder,
+    #[cfg(target_os = "macos")]
+    caps_lock: CapsLockWatch,
     /// Mouse buttons pressed on the peer and not yet released — released
     /// on focus loss and close, like `keyboard`'s held keys, so a drag
     /// interrupted by Cmd-Tab/Alt-Tab doesn't stay "held" over there.
@@ -203,6 +205,9 @@ impl RemoteViewer {
             session: SessionKey::new(peer.id, peer.session_id),
             commands,
             keyboard: KeyboardForwarder::new(KeyTranslator::new(cfg!(target_os = "macos"), peer.platform)),
+            // The window was just given focus above.
+            #[cfg(target_os = "macos")]
+            caps_lock: CapsLockWatch::focused(caps_lock_on()),
             held_buttons: Vec::new(),
             frame: None,
             placement: None,
@@ -315,6 +320,17 @@ impl RemoteViewer {
     /// should drop this viewer (the window is gone either way once tao
     /// processes the close).
     pub fn handle_window_event(&mut self, event: &WindowEvent<'_>) -> ViewerAction {
+        #[cfg(target_os = "macos")]
+        match event {
+            WindowEvent::Focused(focused) => self.caps_lock.focus(*focused, caps_lock_on()),
+            _ => {
+                if self.caps_lock.flipped(caps_lock_on()) {
+                    for event in self.keyboard.tap(KeyCode::CapsLock) {
+                        self.send(event);
+                    }
+                }
+            }
+        }
         match event {
             WindowEvent::CloseRequested => {
                 // Before the session ends, while the peer still accepts
@@ -968,11 +984,60 @@ impl KeyboardForwarder {
         }
     }
 
+    /// A press and release of `key`, not tracked as held — for Caps Lock
+    /// from a Mac (see `CapsLockWatch`).
+    #[cfg(any(target_os = "macos", test))]
+    fn tap(&self, key: KeyCode) -> Vec<InputEventKind> {
+        self.translator.code(key).map_or_else(Vec::new, |code| vec![InputEventKind::KeyDown { code }, InputEventKind::KeyUp { code }])
+    }
+
     /// `KeyUp`s for everything still held, last pressed first — so a
     /// shortcut lets go of its letter before its modifier, as hands do.
     fn release_all(&mut self) -> Vec<InputEventKind> {
         self.held.drain(..).rev().map(|code| InputEventKind::KeyUp { code }).collect()
     }
+}
+
+/// Caps Lock from a Mac. tao's macOS view turns only the Shift, Control,
+/// Option and Command flag changes into key events, so a Caps Lock press
+/// never reaches the viewer as one — **real bug fixed here**: pressing it
+/// did nothing on the peer, although `KEY_CODES` has it. So the viewer
+/// watches the lock's state instead, on every window event it gets, and
+/// taps the peer's Caps Lock when it flips while the window has focus. A
+/// change made while another window had focus was for that one, so focus
+/// coming back only takes the state as it is.
+#[cfg(any(target_os = "macos", test))]
+struct CapsLockWatch {
+    /// The state last seen while focused; `None` while not.
+    last: Option<bool>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl CapsLockWatch {
+    fn focused(on: bool) -> Self {
+        Self { last: Some(on) }
+    }
+
+    fn focus(&mut self, focused: bool, on: bool) {
+        self.last = focused.then_some(on);
+    }
+
+    /// Whether the lock changed since last seen with the window focused.
+    fn flipped(&mut self, on: bool) -> bool {
+        match self.last {
+            Some(was) if was != on => {
+                self.last = Some(on);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn caps_lock_on() -> bool {
+    use objc2_core_graphics::{CGEventFlags, CGEventSource, CGEventSourceStateID};
+    CGEventSource::flags_state(CGEventSourceStateID::CombinedSessionState).contains(CGEventFlags::MaskAlphaShift)
 }
 
 /// A physical key's native code on `platform`: macOS `kVK_*` virtual key
@@ -1289,6 +1354,25 @@ mod tests {
         }
         assert_eq!(keyboard.key(KeyCode::Backspace, false), Some(InputEventKind::KeyUp { code: 14 }));
         assert!(keyboard.held.is_empty());
+    }
+
+    #[test]
+    fn caps_lock_from_a_mac_is_tapped_on_the_peer_only_when_it_flips_with_focus() {
+        let keyboard = KeyboardForwarder::new(KeyTranslator::new(true, Platform::Windows));
+        assert_eq!(keyboard.tap(KeyCode::CapsLock), vec![InputEventKind::KeyDown { code: 0x14 }, InputEventKind::KeyUp { code: 0x14 }]);
+        assert!(keyboard.held.is_empty(), "a tap isn't left held");
+
+        let mut watch = CapsLockWatch::focused(false);
+        assert!(!watch.flipped(false));
+        assert!(watch.flipped(true), "pressed while focused");
+        assert!(!watch.flipped(true), "once per change");
+        assert!(watch.flipped(false));
+        // Toggled while another window had focus: not this window's.
+        watch.focus(false, false);
+        assert!(!watch.flipped(true));
+        watch.focus(true, true);
+        assert!(!watch.flipped(true));
+        assert!(watch.flipped(false));
     }
 
     #[test]
