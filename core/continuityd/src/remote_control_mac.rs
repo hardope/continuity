@@ -35,7 +35,7 @@
 use continuity_daemon::RemoteControlHost;
 use continuity_proto::{InputEventKind, MouseButton as ProtoMouseButton};
 use objc2::AnyThread;
-use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep};
+use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep, NSEvent};
 use objc2_core_foundation::{CFRetained, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
     CGBitmapContextCreate, CGBitmapContextCreateImage, CGColorSpace, CGContext, CGDisplayBounds, CGDisplayPixelsHigh, CGDisplayPixelsWide,
@@ -45,7 +45,7 @@ use objc2_core_graphics::{
 use objc2_foundation::NSDictionary;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Once};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 // Raw IOKit power-management calls — not bound by any `objc2-*` crate
@@ -150,9 +150,9 @@ pub struct MacRemoteControlHost {
     /// `MouseMove` of a session arrives, so nothing's drawn before there's
     /// a real position to draw.
     last_cursor: Arc<Mutex<Option<(f64, f64)>>>,
-    /// The keys and modifiers the controlling device currently holds down
-    /// here — see `HeldKeys`.
-    held: Mutex<HeldKeys>,
+    /// The keys, modifiers and mouse buttons the controlling device
+    /// currently holds down here — see `HeldKeys` and `MouseState`.
+    held: Mutex<HeldInput>,
 }
 
 impl MacRemoteControlHost {
@@ -161,17 +161,27 @@ impl MacRemoteControlHost {
             capturing: Arc::new(AtomicBool::new(false)),
             display_sleep_assertion: Mutex::new(None),
             last_cursor: Arc::new(Mutex::new(None)),
-            held: Mutex::new(HeldKeys::default()),
+            held: Mutex::new(HeldInput::default()),
         }
     }
 
     /// Lets go of everything the controlling device left held down. A
     /// session can end without its key-ups ever arriving (the other
     /// computer slept, the network dropped), and an injected modifier left
-    /// down here would go on modifying the local person's own typing.
-    fn release_held_keys(&self) {
-        let releases = self.held.lock().unwrap().release_all();
-        for release in &releases {
+    /// down here would go on modifying the local person's own typing — a
+    /// button left down, dragging whatever they then move the mouse over.
+    /// Buttons first, so a Shift-drag ends as one.
+    fn release_held_input(&self) {
+        let mut held = self.held.lock().unwrap();
+        let buttons = held.mouse.release_all();
+        if !buttons.is_empty() {
+            let point = current_mouse_location();
+            for button in buttons {
+                let (event_type, cg_button) = button_event(button, false);
+                post(CGEvent::new_mouse_event(None, event_type, point, cg_button), held.keys.flags());
+            }
+        }
+        for release in &held.keys.release_all() {
             post_key(release);
         }
     }
@@ -195,7 +205,7 @@ impl RemoteControlHost for MacRemoteControlHost {
         // Nothing should be held at the start of a session; if a previous
         // one somehow left something, let go of it before it can combine
         // with this session's first keys.
-        self.release_held_keys();
+        self.release_held_input();
         ensure_screen_recording_trust();
         let display_id = CGMainDisplayID();
         // Fresh session, no move injected yet — otherwise a marker from
@@ -261,7 +271,7 @@ impl RemoteControlHost for MacRemoteControlHost {
 
     fn stop_capture(&self) {
         self.capturing.store(false, Ordering::Relaxed);
-        self.release_held_keys();
+        self.release_held_input();
         if let Some(id) = self.display_sleep_assertion.lock().unwrap().take() {
             unsafe {
                 IOPMAssertionRelease(id);
@@ -393,13 +403,15 @@ fn composite_cursor_marker(image: &CGImage, nx: f64, ny: f64) -> Option<CFRetain
 /// `verify_mouse_move_reaches_real_cursor_position` below.
 ///
 /// Every event carries the modifiers `held` says are down — see `HeldKeys`
-/// for why that has to be done by hand.
-fn inject_event(event: InputEventKind, held: &mut HeldKeys) {
+/// for why that has to be done by hand — and mouse events the button
+/// state `MouseState` keeps.
+fn inject_event(event: InputEventKind, held: &mut HeldInput) {
     crate::media_mac::ensure_accessibility_trust();
     let display_id = CGMainDisplayID();
     let bounds = CGDisplayBounds(display_id);
     let width = CGDisplayPixelsWide(display_id) as f64;
     let height = CGDisplayPixelsHigh(display_id) as f64;
+    let HeldInput { keys: held, mouse } = held;
     let flags = held.flags();
 
     match event {
@@ -415,19 +427,18 @@ fn inject_event(event: InputEventKind, held: &mut HeldKeys) {
         },
         InputEventKind::MouseMove { x, y } => {
             let point = CGPoint { x: bounds.origin.x + x * width, y: bounds.origin.y + y * height };
-            post(CGEvent::new_mouse_event(None, CGEventType::MouseMoved, point, CGMouseButton::Left), flags);
+            let (event_type, cg_button) = mouse.move_event();
+            post(CGEvent::new_mouse_event(None, event_type, point, cg_button), flags);
         }
         InputEventKind::MouseButton { button, down } => {
             let point = current_mouse_location();
-            let (event_type, cg_button) = match (button, down) {
-                (ProtoMouseButton::Left, true) => (CGEventType::LeftMouseDown, CGMouseButton::Left),
-                (ProtoMouseButton::Left, false) => (CGEventType::LeftMouseUp, CGMouseButton::Left),
-                (ProtoMouseButton::Right, true) => (CGEventType::RightMouseDown, CGMouseButton::Right),
-                (ProtoMouseButton::Right, false) => (CGEventType::RightMouseUp, CGMouseButton::Right),
-                (ProtoMouseButton::Middle, true) => (CGEventType::OtherMouseDown, CGMouseButton::Center),
-                (ProtoMouseButton::Middle, false) => (CGEventType::OtherMouseUp, CGMouseButton::Center),
-            };
-            post(CGEvent::new_mouse_event(None, event_type, point, cg_button), flags);
+            let (event_type, cg_button) = button_event(button, down);
+            let clicks = mouse.button(button, down, (point.x, point.y), Instant::now(), double_click_interval());
+            let event = CGEvent::new_mouse_event(None, event_type, point, cg_button);
+            if let Some(event) = &event {
+                CGEvent::set_integer_value_field(Some(event), CGEventField::MouseEventClickState, clicks);
+            }
+            post(event, flags);
         }
         InputEventKind::MouseScroll { delta_x, delta_y } => {
             // Pixel units, not "line" units — the controller's delta is
@@ -602,6 +613,107 @@ impl HeldKeys {
     }
 }
 
+/// What the controlling device holds down on this Mac, keyboard and mouse.
+#[derive(Default)]
+struct HeldInput {
+    keys: HeldKeys,
+    mouse: MouseState,
+}
+
+fn button_event(button: ProtoMouseButton, down: bool) -> (CGEventType, CGMouseButton) {
+    match (button, down) {
+        (ProtoMouseButton::Left, true) => (CGEventType::LeftMouseDown, CGMouseButton::Left),
+        (ProtoMouseButton::Left, false) => (CGEventType::LeftMouseUp, CGMouseButton::Left),
+        (ProtoMouseButton::Right, true) => (CGEventType::RightMouseDown, CGMouseButton::Right),
+        (ProtoMouseButton::Right, false) => (CGEventType::RightMouseUp, CGMouseButton::Right),
+        (ProtoMouseButton::Middle, true) => (CGEventType::OtherMouseDown, CGMouseButton::Center),
+        (ProtoMouseButton::Middle, false) => (CGEventType::OtherMouseUp, CGMouseButton::Center),
+    }
+}
+
+/// The double-click speed set in System Settings.
+fn double_click_interval() -> Duration {
+    Duration::from_secs_f64(NSEvent::doubleClickInterval().clamp(0.1, 5.0))
+}
+
+/// How far apart, in points, two presses can land and still be one
+/// double-click — a hand's slight shake.
+const CLICK_SLOP: f64 = 4.0;
+
+/// What the controlling device is doing with the mouse on this Mac.
+///
+/// **Real bugs fixed here**: every move was posted as a plain `MouseMoved`,
+/// even with a button held, and macOS only takes the `*MouseDragged` types
+/// as a drag — so selecting text, moving a window by its title bar,
+/// resizing one or dragging a file did nothing here. And no click carried a
+/// click count, so a double-click arrived as two single clicks: files
+/// didn't open, words didn't get selected. Buttons still held when a
+/// session ends without their releases (the connection dropping mid-drag)
+/// are let go too, like `HeldKeys`.
+#[derive(Default)]
+struct MouseState {
+    /// Buttons held, in press order.
+    held: Vec<ProtoMouseButton>,
+    last_press: Option<LastPress>,
+}
+
+struct LastPress {
+    button: ProtoMouseButton,
+    at: (f64, f64),
+    when: Instant,
+    clicks: i64,
+}
+
+impl MouseState {
+    /// What a move is posted as: a drag while a button is held (the left
+    /// one's, if it's among them, as a real mouse reports it), a plain
+    /// move otherwise.
+    fn move_event(&self) -> (CGEventType, CGMouseButton) {
+        if self.held.contains(&ProtoMouseButton::Left) {
+            (CGEventType::LeftMouseDragged, CGMouseButton::Left)
+        } else if self.held.contains(&ProtoMouseButton::Right) {
+            (CGEventType::RightMouseDragged, CGMouseButton::Right)
+        } else if self.held.contains(&ProtoMouseButton::Middle) {
+            (CGEventType::OtherMouseDragged, CGMouseButton::Center)
+        } else {
+            (CGEventType::MouseMoved, CGMouseButton::Left)
+        }
+    }
+
+    /// Records a press or release at `at`, and returns the click count to
+    /// post it with: a press of the same button within `interval` of the
+    /// last one, and close to it, counts one more (a double-click, then a
+    /// triple); a release carries its press's count.
+    fn button(&mut self, button: ProtoMouseButton, down: bool, at: (f64, f64), now: Instant, interval: Duration) -> i64 {
+        if !down {
+            self.held.retain(|&held| held != button);
+            return self.last_press.as_ref().filter(|press| press.button == button).map_or(1, |press| press.clicks);
+        }
+        if !self.held.contains(&button) {
+            self.held.push(button);
+        }
+        let clicks = match &self.last_press {
+            Some(press)
+                if press.button == button
+                    && now.duration_since(press.when) <= interval
+                    && (press.at.0 - at.0).abs() <= CLICK_SLOP
+                    && (press.at.1 - at.1).abs() <= CLICK_SLOP =>
+            {
+                press.clicks + 1
+            }
+            _ => 1,
+        };
+        self.last_press = Some(LastPress { button, at, when: now, clicks });
+        clicks
+    }
+
+    /// The buttons still held, last pressed first — to let go of.
+    fn release_all(&mut self) -> Vec<ProtoMouseButton> {
+        self.last_press = None;
+        self.held.drain(..).rev().collect()
+    }
+}
+
 /// `CGEventCreateMouseEvent` needs a position even for a button-only
 /// (not move) event — reads the cursor's actual current location so a
 /// click lands wherever the most recent `MouseMove` already put it,
@@ -664,7 +776,7 @@ mod manual_verification {
     fn send_test_keystroke() {
         // 'A' key, per-platform virtual keycode (kVK_ANSI_A = 0x00) —
         // types into whatever's focused when this runs.
-        let mut held = HeldKeys::default();
+        let mut held = HeldInput::default();
         inject_event(InputEventKind::KeyDown { code: 0x00 }, &mut held);
         std::thread::sleep(Duration::from_millis(50));
         inject_event(InputEventKind::KeyUp { code: 0x00 }, &mut held);
@@ -675,7 +787,7 @@ mod manual_verification {
     #[test]
     #[ignore]
     fn send_test_shortcuts() {
-        let mut held = HeldKeys::default();
+        let mut held = HeldInput::default();
         for modifier in [KVK_SHIFT, KVK_COMMAND] {
             for event in [
                 InputEventKind::KeyDown { code: modifier.into() },
@@ -692,7 +804,7 @@ mod manual_verification {
     #[test]
     #[ignore]
     fn send_test_click() {
-        let mut held = HeldKeys::default();
+        let mut held = HeldInput::default();
         inject_event(InputEventKind::MouseMove { x: 0.5, y: 0.5 }, &mut held);
         std::thread::sleep(Duration::from_millis(50));
         inject_event(InputEventKind::MouseButton { button: ProtoMouseButton::Left, down: true }, &mut held);
@@ -716,7 +828,7 @@ mod manual_verification {
         let height = CGDisplayPixelsHigh(display_id) as f64;
 
         for (x, y) in [(0.25, 0.25), (0.75, 0.6)] {
-            inject_event(InputEventKind::MouseMove { x, y }, &mut HeldKeys::default());
+            inject_event(InputEventKind::MouseMove { x, y }, &mut HeldInput::default());
             std::thread::sleep(Duration::from_millis(100));
             let expected = CGPoint { x: bounds.origin.x + x * width, y: bounds.origin.y + y * height };
             let actual = current_mouse_location();
@@ -741,6 +853,55 @@ mod tests {
 
     fn modifier(code: u16, down: bool, flags: u64) -> Option<KeyPost> {
         Some(KeyPost { code, down, kind: KeyPostKind::FlagsChanged, flags })
+    }
+
+    #[test]
+    fn a_move_with_a_button_held_is_a_drag_of_that_button() {
+        let mut mouse = MouseState::default();
+        let (now, interval) = (Instant::now(), Duration::from_millis(500));
+        assert_eq!(mouse.move_event(), (CGEventType::MouseMoved, CGMouseButton::Left));
+        mouse.button(ProtoMouseButton::Right, true, (0.0, 0.0), now, interval);
+        assert_eq!(mouse.move_event(), (CGEventType::RightMouseDragged, CGMouseButton::Right));
+        // The left button's drag wins while both are held.
+        mouse.button(ProtoMouseButton::Left, true, (0.0, 0.0), now, interval);
+        assert_eq!(mouse.move_event(), (CGEventType::LeftMouseDragged, CGMouseButton::Left));
+        mouse.button(ProtoMouseButton::Left, false, (0.0, 0.0), now, interval);
+        mouse.button(ProtoMouseButton::Right, false, (0.0, 0.0), now, interval);
+        mouse.button(ProtoMouseButton::Middle, true, (0.0, 0.0), now, interval);
+        assert_eq!(mouse.move_event(), (CGEventType::OtherMouseDragged, CGMouseButton::Center));
+        mouse.button(ProtoMouseButton::Middle, false, (0.0, 0.0), now, interval);
+        assert_eq!(mouse.move_event(), (CGEventType::MouseMoved, CGMouseButton::Left));
+    }
+
+    #[test]
+    fn quick_clicks_in_one_place_count_up_and_others_start_again() {
+        let mut mouse = MouseState::default();
+        let interval = Duration::from_millis(500);
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut click = |button, place, ms| {
+            let down = mouse.button(button, true, place, at(ms), interval);
+            let up = mouse.button(button, false, place, at(ms + 50), interval);
+            assert_eq!(down, up, "a release carries its press's count");
+            down
+        };
+        assert_eq!(click(ProtoMouseButton::Left, (100.0, 100.0), 0), 1);
+        assert_eq!(click(ProtoMouseButton::Left, (102.0, 99.0), 200), 2, "a double-click, despite a little shake");
+        assert_eq!(click(ProtoMouseButton::Left, (101.0, 100.0), 400), 3, "a triple-click");
+        assert_eq!(click(ProtoMouseButton::Left, (101.0, 100.0), 1400), 1, "too slow");
+        assert_eq!(click(ProtoMouseButton::Left, (140.0, 100.0), 1500), 1, "too far");
+        assert_eq!(click(ProtoMouseButton::Right, (140.0, 100.0), 1600), 1, "another button");
+    }
+
+    #[test]
+    fn buttons_held_at_the_end_are_let_go_last_pressed_first() {
+        let mut mouse = MouseState::default();
+        let (now, interval) = (Instant::now(), Duration::from_millis(500));
+        mouse.button(ProtoMouseButton::Left, true, (0.0, 0.0), now, interval);
+        mouse.button(ProtoMouseButton::Right, true, (0.0, 0.0), now, interval);
+        assert_eq!(mouse.release_all(), vec![ProtoMouseButton::Right, ProtoMouseButton::Left]);
+        assert!(mouse.release_all().is_empty());
+        assert_eq!(mouse.move_event(), (CGEventType::MouseMoved, CGMouseButton::Left));
     }
 
     #[test]
