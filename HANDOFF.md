@@ -16,8 +16,13 @@ installers in `installers/`).
   transfer-engine finding (-1 to -9); desktop-shell-1, -3, -5, -6, -7, -10.
   transfer-engine-9 used the owner's choice: the sender sends one device at
   most 4 files at a time, the receiver refuses a 17th unfinished one.
-- Next up, in this order: desktop-shell-2, -8, -4 + -9 together; then the
-  remote-control and Android findings at the bottom of this file.
+- desktop-shell-2, -4, -8, -9 are fixed too (all desktop-shell findings).
+- Next up: the remote-control and Android findings at the bottom of this
+  file (remote-control-2 is probably already fixed — check, then tick), then
+  "What is left" items 1 (macOS SwiftUI + contracts review), 2 and 3.
+- On the owner's Mac the firewall has allowed the file_transfer and
+  remote_control test binaries; dial_race, revoke and screen_lock will
+  each prompt once. No Android SDK there.
 - Open question for the owner: `a_cut_data_connection_resumes_where_it_left_off`
   fails on macOS (also on the code before these fixes; CI runs it on Linux
   only). On macOS loopback a TLS connection dropped without close_notify
