@@ -678,7 +678,20 @@ impl ControlState {
                 EngineCommand::RevokeDevice { peer_crypto_id: device }
             }
             ControlOp::Reset => EngineCommand::Reset,
-            ControlOp::RefreshNearby => EngineCommand::RefreshDiscovery,
+            // `RefreshDiscovery` on its own only redials paired devices whose
+            // address is already known — it never asks the network again
+            // (a second mDNS browse on the same daemon would orphan the
+            // first; see `redial_disconnected_trusted_peers` in the engine),
+            // so a nearby device whose announcement was missed stayed
+            // missing from the very list this button sits on.
+            // `NetworkChanged` is what makes the engine start discovery over
+            // with a fresh daemon and browse, which asks every device on the
+            // network to answer again. Both are sent, so a refresh still
+            // redials paired devices whatever `NetworkChanged` does besides.
+            ControlOp::RefreshNearby => {
+                commands.send(EngineCommand::RefreshDiscovery).map_err(|_| "Continuity is shutting down.".to_string())?;
+                EngineCommand::NetworkChanged
+            }
             ControlOp::RequestRemoteControl { device } => {
                 if !cfg!(feature = "remote-control") {
                     return Err("This build of Continuity can't control other computers.".to_string());
@@ -1273,7 +1286,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         state(&dir).apply(ControlOp::RefreshNearby, &tx).unwrap();
-        assert!(matches!(rx.try_recv(), Ok(EngineCommand::RefreshDiscovery)));
+        assert!(matches!(rx.try_recv(), Ok(EngineCommand::RefreshDiscovery)), "paired devices are redialed");
+        assert!(matches!(rx.try_recv(), Ok(EngineCommand::NetworkChanged)), "and the network is asked again, with a fresh mDNS browse");
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

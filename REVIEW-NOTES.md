@@ -101,7 +101,7 @@ was written — expect more items and some of these to be dropped.
   *Scenario:* The info sheet's footer is `<div class="bar">` (line 749). `.sheet .bar` overrides display, padding, border and background, but not the new `.bar` rule's height:4px, overflow:hidden, margin-top:8px and border-radius:2px. With box-sizing:border-box, the footer shrinks to its padding (about 25 px) with zero content height, and overflow:hidden cuts off the vertically centred 32–34 px Done button above and below. There is also an 8 px gap above the footer. The About panel's footer looks broken on Linux and Windows.  
   *Fix:* Rename the progress bar class (for example .progress), or scope it as `.row .bar`.
 
-- [ ] **desktop-shell-7** (low, bug) The new Nearby refresh button doesn't look for nearby devices  
+- [x] **desktop-shell-7** (low, bug) The new Nearby refresh button doesn't look for nearby devices  
   `core/continuityd/src/control.rs:681`  
   *Scenario:* The page's refresh icon in the Nearby header (tooltip 'Look for nearby devices again', toast 'Looking for nearby devices…') sends refresh_nearby. That maps to EngineCommand::RefreshDiscovery, which in the engine only calls redial_disconnected_trusted_peers: it redials paired devices with cached addresses and never re-queries mDNS. events.rs documents it as re-issuing an mDNS query. An unpaired device whose announcement was missed stays missing from Nearby, so the button does nothing for the list it sits on.  
   *Fix:* Have RefreshNearby (or RefreshDiscovery) also trigger a new mDNS browse, for example state.discovery_recreate.notify_one() as NetworkChanged does.
