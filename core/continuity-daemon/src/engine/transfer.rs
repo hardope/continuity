@@ -41,7 +41,9 @@ use super::{
 };
 use crate::events::{FileTransferDirection, SyncEvent};
 use continuity_crypto::IncrementalHash;
-use continuity_net::{connect, read_frame, read_message, write_frame_unflushed, write_message, Connection, FramingError};
+use continuity_net::{
+    connect, read_frame, read_frame_up_to, read_message, write_frame_unflushed, write_message, Connection, FramingError,
+};
 use continuity_proto::{DeviceInfo, Message};
 use std::io::{Read, Write};
 use std::net::SocketAddr;
@@ -116,6 +118,20 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 /// How long a resume offer waits for the transfer's previous data
 /// connection to let go of the partial file (see `answer_offer`).
 const RELEASE_WAIT: Duration = Duration::from_secs(30);
+
+/// Files this side sends one peer at once over data connections; any more
+/// wait their turn (see `send_over_data_channel`). They share one link, so
+/// more at once wouldn't finish any sooner — it would only hold more files
+/// open on both sides, and a share of a hundred photos used to open them
+/// all at the same moment.
+pub(super) const SENDS_PER_PEER: usize = 4;
+
+/// Unfinished incoming transfers one peer may have here at once — four
+/// times what this engine sends at a time, so only a misbehaving sender
+/// meets it. Each holds a `.part` file open for up to `RESUME_WINDOW`, so
+/// without a limit a peer could use up this process's file descriptors
+/// (macOS gives an app launched from the Finder 256).
+const INCOMING_PER_PEER: usize = 16;
 
 /// Serializes picking a final file name and renaming onto it, so two
 /// transfers of the same name finishing at the same moment can't both pick
@@ -438,6 +454,11 @@ async fn answer_offer(
         // before a restart is left alone — this run doesn't know it.
         tracing::debug!("resume offer for unknown transfer {transfer_id} from '{}' — starting over", peer.name);
     }
+    let too_many = format!("{} is already receiving {INCOMING_PER_PEER} files from this device", state.my_device.name);
+    if unfinished_from(&state.incoming_transfers.lock().unwrap(), &peer.id) >= INCOMING_PER_PEER {
+        tracing::warn!("refusing '{file_name}' from '{}': {too_many}", peer.name);
+        return refuse(too_many);
+    }
     let dir = state.received_files_dir.lock().unwrap().clone();
     let device_name = state.my_device.name.clone();
     let name = file_name.clone();
@@ -466,6 +487,13 @@ async fn answer_offer(
             let _ = std::fs::remove_file(&part_path);
             return refuse("a transfer with this id is already under way".to_string());
         }
+        if unfinished_from(&incoming, &peer.id) >= INCOMING_PER_PEER {
+            // Others from the same peer were set up while this one created
+            // its file.
+            drop(incoming);
+            let _ = std::fs::remove_file(&part_path);
+            return refuse(too_many);
+        }
         incoming.insert(
             key,
             IncomingTransfer {
@@ -488,6 +516,15 @@ async fn answer_offer(
         size_bytes,
     });
     accept(0)
+}
+
+/// Transfers from `peer_id` still holding a partial file here — not the
+/// `Completed` and `Failed` records kept for a late resume offer.
+fn unfinished_from(incoming: &std::collections::HashMap<(String, String), IncomingTransfer>, peer_id: &str) -> usize {
+    incoming
+        .iter()
+        .filter(|((peer, _), e)| peer == peer_id && !matches!(e.phase, Phase::Completed { .. } | Phase::Failed { .. }))
+        .count()
 }
 
 /// Removes an incoming transfer and its `.part` file. With `reason`,
@@ -689,7 +726,16 @@ async fn receive_stream(mut conn: Connection, state: Arc<SharedState>, key: (Str
     let read = async {
         let mut received = offset;
         loop {
-            let frame = read_frame(&mut conn).await.map_err(|e| ReceiveError::Interrupted(e.to_string()))?;
+            // Nothing a sender writes here is over `FRAME_SIZE`, so a
+            // longer frame isn't buffered at all (it could be 16 MiB, the
+            // screen stream's limit, times every frame in the pipeline).
+            let frame = match read_frame_up_to(&mut conn, FRAME_SIZE as u32).await {
+                Ok(frame) => frame,
+                Err(FramingError::TooLarge(len)) => {
+                    return Err(ReceiveError::Fatal(format!("the sender sent a {len}-byte frame, over the {FRAME_SIZE}-byte limit")));
+                }
+                Err(e) => return Err(ReceiveError::Interrupted(e.to_string())),
+            };
             if frame.is_empty() {
                 break;
             }
@@ -1007,11 +1053,23 @@ pub(super) async fn send_over_data_channel(state: &Arc<SharedState>, outgoing: O
         .lock()
         .unwrap()
         .insert(outgoing.transfer_id.clone(), OutgoingTransfer { peer_id: outgoing.peer_id.clone(), cancel: cancel.clone() });
+    let slots = state
+        .outgoing_slots
+        .lock()
+        .unwrap()
+        .entry(outgoing.peer_id.clone())
+        .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(SENDS_PER_PEER)))
+        .clone();
     let ended = tokio::select! {
         // `notify_one` stores a permit, so a cancel that lands before this
-        // is first polled isn't missed.
+        // is first polled isn't missed — waiting for its turn included.
         _ = cancel.notified() => None,
-        ended = run_outgoing(state, &outgoing) => Some(ended),
+        ended = async {
+            // Its turn: nothing is offered until one of this peer's other
+            // sends ends, and the turn is held through any resume.
+            let _turn = slots.acquire().await;
+            run_outgoing(state, &outgoing).await
+        } => Some(ended),
     };
     // Whoever cancelled it removed the entry and already reported it.
     let cancelled = state.outgoing_transfers.lock().unwrap().remove(&outgoing.transfer_id).is_none();
@@ -1077,7 +1135,8 @@ async fn run_outgoing(state: &Arc<SharedState>, o: &Outgoing) -> Ended {
         }
 
         // Every (re-)offer goes over the mesh connection. Only missing
-        // after a first attempt — `send_file` checked it before starting.
+        // after a first attempt, or after waiting for its turn —
+        // `send_file` checked it before starting.
         let tx = match peer_sender(state, &o.peer_id) {
             Some(tx) => tx,
             None => {

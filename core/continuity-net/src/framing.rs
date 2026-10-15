@@ -87,6 +87,13 @@ pub async fn write_frame_unflushed<W: AsyncWrite + Unpin>(writer: &mut W, data: 
 }
 
 pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>, FramingError> {
+    read_frame_up_to(reader, MAX_FRAME_BYTES).await
+}
+
+/// `read_frame` for a stream whose frames have a smaller known bound (a
+/// file's data connection: 1 MiB) — a longer one is refused before
+/// anything is allocated for it.
+pub async fn read_frame_up_to<R: AsyncRead + Unpin>(reader: &mut R, max_bytes: u32) -> Result<Vec<u8>, FramingError> {
     let mut len_buf = [0u8; 4];
     match reader.read_exact(&mut len_buf).await {
         Ok(_) => {}
@@ -94,7 +101,7 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>,
         Err(e) => return Err(e.into()),
     }
     let len = u32::from_be_bytes(len_buf);
-    if len > MAX_FRAME_BYTES {
+    if len > max_bytes.min(MAX_FRAME_BYTES) {
         return Err(FramingError::TooLarge(len));
     }
     let mut data = vec![0u8; len as usize];
@@ -177,5 +184,19 @@ mod tests {
         write_frame(&mut a, &sent).await.unwrap();
         let received = read_frame(&mut b).await.unwrap();
         assert_eq!(received, sent);
+    }
+
+    /// A frame over the caller's bound is refused from its length prefix
+    /// alone, before the reader allocates or reads any of it.
+    #[tokio::test]
+    async fn a_frame_over_the_bound_is_refused_from_its_length() {
+        let (mut a, mut b) = tokio::io::duplex(4096);
+        write_frame(&mut a, &[1u8; 10]).await.unwrap();
+        assert_eq!(read_frame_up_to(&mut b, 10).await.unwrap(), vec![1u8; 10]);
+
+        // Only the prefix is ever written: a reader that tried to read the
+        // 11 bytes it announces would wait forever instead of failing.
+        a.write_all(&11u32.to_be_bytes()).await.unwrap();
+        assert!(matches!(read_frame_up_to(&mut b, 10).await.unwrap_err(), FramingError::TooLarge(11)));
     }
 }

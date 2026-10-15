@@ -349,6 +349,10 @@ struct SharedState {
     /// transfer id is only unique per sender; outgoing by transfer id.
     incoming_transfers: Mutex<HashMap<(String, String), transfer::IncomingTransfer>>,
     outgoing_transfers: Mutex<HashMap<String, transfer::OutgoingTransfer>>,
+    /// Per peer, the turns for sending it files over data connections —
+    /// `transfer::SENDS_PER_PEER` at a time, the rest waiting (see
+    /// `transfer::send_over_data_channel`).
+    outgoing_slots: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
     /// Notified (`notify_waiters`) whenever an incoming transfer changes
     /// phase — a resume offer that found its transfer still attached to a
     /// dying data connection waits on this for it to let go.
@@ -851,6 +855,7 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
         file_transfers_in_flight: Mutex::new(HashMap::new()),
         incoming_transfers: Mutex::new(HashMap::new()),
         outgoing_transfers: Mutex::new(HashMap::new()),
+        outgoing_slots: Mutex::new(HashMap::new()),
         incoming_transfers_changed: Notify::new(),
         next_transfer_epoch: AtomicU64::new(1),
         test_hooks: TestHooks::default(),

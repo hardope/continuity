@@ -369,6 +369,138 @@ async fn a_disk_error_on_the_receiver_fails_the_transfer_once() {
     finish(vec![a, b], &[&a_dir, &b_dir], &[&source_dir]);
 }
 
+/// Sharing many files with one device sends four of them at a time over
+/// data connections (`SENDS_PER_PEER`), the rest waiting their turn — and
+/// every one still arrives whole, under its own name.
+#[tokio::test]
+async fn many_files_to_one_device_go_a_few_at_a_time() {
+    let (mut a, mut b, _a_id, b_id, a_dir, b_dir) = connected_pair("QueueA", "QueueB").await;
+
+    let source_dir = temp_dir("queue-source");
+    let sources: Vec<PathBuf> = (0..7)
+        .map(|i| {
+            let path = source_dir.join(format!("photo {i}.jpg"));
+            write_test_file(&path, 3 * MIB + i, 100 + i as u64);
+            path
+        })
+        .collect();
+    for path in &sources {
+        a.send_command(EngineCommand::SendFile { peer_crypto_id: b_id.clone(), path: path.display().to_string() });
+    }
+    let log = collect_until(&mut a, &mut b, Duration::from_secs(120), |log| {
+        count(log, Side::A, |e| matches!(e, SyncEvent::FileSent { .. })) == sources.len()
+            && count(log, Side::B, |e| matches!(e, SyncEvent::FileReceived { .. })) == sources.len()
+            || log.iter().any(|(_, e)| matches!(e, SyncEvent::FileTransferFailed { .. }))
+    })
+    .await;
+
+    assert!(failures(&log).is_empty(), "transfer failed: {:?}", failures(&log));
+    // On the sender, a file is in flight from its `FileSending` (accepted,
+    // so it had its turn) until it ends.
+    let (mut in_flight, mut most) = (0usize, 0usize);
+    for (side, event) in &log {
+        match event {
+            SyncEvent::FileSending { .. } if *side == Side::A => {
+                in_flight += 1;
+                most = most.max(in_flight);
+            }
+            SyncEvent::FileSent { .. } if *side == Side::A => in_flight -= 1,
+            _ => {}
+        }
+    }
+    assert!(most <= 4, "{most} files were being sent to one device at once");
+    for path in &sources {
+        let received = b_dir.join(path.file_name().unwrap());
+        assert_eq!(file_hash(&received), file_hash(path), "{} differs", received.display());
+    }
+    assert!(part_files_in(&b_dir).is_empty(), "a .part file was left behind: {:?}", part_files_in(&b_dir));
+
+    finish(vec![a, b], &[&a_dir, &b_dir], &[&source_dir]);
+}
+
+/// What a misbehaving v3 sender, driven by hand, runs into: a 17th
+/// unfinished transfer from one device is refused with the reason (offered
+/// all at once, so the limit has to hold while the offers are answered
+/// concurrently), and a data frame longer than the 1 MiB frame size ends
+/// that transfer rather than being read into memory.
+#[tokio::test]
+async fn a_misbehaving_v3_sender_is_held_to_the_limits() {
+    use tokio::io::AsyncWriteExt;
+
+    let sender_identity = Identity::generate();
+    let sender_id = sender_identity.device_id();
+    let engine_identity = Identity::generate();
+    let (mut engine, received_dir) = make_engine("LimitReceiver", engine_identity, &sender_id, "Flooder").await;
+    let port = loop {
+        match tokio::time::timeout(Duration::from_secs(5), engine.events.recv()).await {
+            Ok(Some(SyncEvent::Listening { port })) => break port,
+            Ok(Some(_)) => continue,
+            other => panic!("no Listening event: {other:?}"),
+        }
+    };
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let tls = continuity_crypto::generate_self_signed(&sender_identity).unwrap();
+    let mut conn = continuity_net::connect(addr, &tls).await.unwrap();
+    let device = DeviceInfo { id: sender_id.clone(), name: "Flooder".into(), platform: Platform::Linux, protocol_version: 3 };
+    continuity_net::announce_and_identify(&mut conn, &device).await.unwrap();
+
+    for i in 0..17 {
+        let offer = Message::FileOffer {
+            transfer_id: format!("{i:016x}"),
+            origin_device: sender_id.clone(),
+            file_name: format!("flood {i}.bin"),
+            size_bytes: 4 * MIB as u64,
+            mime: None,
+            data_channel: true,
+            resume: false,
+        };
+        continuity_net::write_message(&mut conn, &offer).await.unwrap();
+    }
+    let (mut accepted, mut refused) = (Vec::new(), Vec::new());
+    while accepted.len() + refused.len() < 17 {
+        let message = tokio::time::timeout(Duration::from_secs(10), continuity_net::read_message(&mut conn))
+            .await
+            .unwrap_or_else(|_| panic!("only {} of 17 offers were answered", accepted.len() + refused.len()))
+            .unwrap();
+        match message {
+            Message::FileAccept { transfer_id, accepted: true, data_channel: true, offset: 0, .. } => accepted.push(transfer_id),
+            Message::FileAccept { accepted: false, reason, .. } => refused.push(reason),
+            Message::Ping | Message::NowPlayingUpdate { .. } | Message::ClipboardUpdate { .. } => continue,
+            other => panic!("unexpected message instead of FileAccept: {other:?}"),
+        }
+    }
+    assert_eq!(accepted.len(), 16, "refused: {refused:?}");
+    assert_eq!(refused, vec![Some("LimitReceiver is already receiving 16 files from this device".to_string())]);
+
+    // A data connection for one of them whose first frame claims 2 MiB.
+    let mut data = continuity_net::connect(addr, &tls).await.unwrap();
+    let handshake = Message::FileStreamHandshake { transfer_id: accepted[0].clone(), offset: 0 };
+    continuity_net::write_message(&mut data, &handshake).await.unwrap();
+    data.write_all(&(2 * MIB as u32).to_be_bytes()).await.unwrap();
+    data.flush().await.unwrap();
+    let verdict = tokio::time::timeout(Duration::from_secs(10), continuity_net::read_message(&mut data))
+        .await
+        .expect("no verdict on the data connection")
+        .unwrap();
+    match verdict {
+        Message::FileVerified { ok: false, reason: Some(reason), .. } => {
+            assert!(reason.contains("over the 1048576-byte limit"), "{reason}")
+        }
+        other => panic!("expected a refusing FileVerified, got {other:?}"),
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(left, engine.events.recv()).await {
+            Ok(Some(SyncEvent::FileTransferFailed { transfer_id, .. })) if transfer_id == accepted[0] => break,
+            Ok(Some(_)) => continue,
+            other => panic!("the receiver never reported the transfer failed: {other:?}"),
+        }
+    }
+
+    finish(vec![engine], &[&received_dir], &[]);
+}
+
 /// The mesh connection going down too while a transfer is stalled: the
 /// sender waits for the peer to come back, re-offers on the new mesh
 /// connection — whose arrival the receiver has to tell apart from a data
