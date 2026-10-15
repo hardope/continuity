@@ -28,7 +28,8 @@ use windows::Win32::Graphics::Gdi::{
     BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HGDIOBJ, SRCCOPY,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
+    MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY,
+    KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC,
     MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
     MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT, VIRTUAL_KEY,
 };
@@ -391,6 +392,17 @@ fn inject_event(event: InputEventKind) {
     }
 }
 
+/// The scan code a real keyboard sends with `vk`, on the current layout —
+/// `KEYEVENTF_EXTENDEDKEY` supplies the E0 prefix for the keys that have
+/// one. **Real bug fixed here**: injected keys carried 0, and programs that
+/// read the scan code rather than the virtual key (games, remote-desktop
+/// and VM clients, anything that goes by a key's position) saw a key that
+/// doesn't exist.
+fn scan_code(vk: u16) -> u16 {
+    // SAFETY: a plain lookup, no pointers involved.
+    unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC) as u16 }
+}
+
 fn send_key_event(vk: u16, key_up: bool) {
     let mut flags = KEYBD_EVENT_FLAGS::default();
     if key_up {
@@ -401,7 +413,7 @@ fn send_key_event(vk: u16, key_up: bool) {
     }
     let input = INPUT {
         r#type: INPUT_KEYBOARD,
-        Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: VIRTUAL_KEY(vk), wScan: 0, dwFlags: flags, time: 0, dwExtraInfo: 0 } },
+        Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: VIRTUAL_KEY(vk), wScan: scan_code(vk), dwFlags: flags, time: 0, dwExtraInfo: 0 } },
     };
     // SAFETY: `input` is a single, correctly-sized, stack-local `INPUT`
     // matching what `SendInput` expects — same justification as
@@ -449,6 +461,15 @@ fn send_mouse_input(mi: MOUSEINPUT) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Set-1 scan codes, the same on every layout for these keys.
+    #[test]
+    fn injected_keys_carry_their_scan_codes() {
+        assert_eq!(scan_code(0x41), 0x1E, "A");
+        assert_eq!(scan_code(0x0D), 0x1C, "Return");
+        assert_eq!(scan_code(0x20), 0x39, "Space");
+        assert_eq!(scan_code(0x25), 0x4B, "Left arrow (E0 4B with the extended flag)");
+    }
 
     #[test]
     fn extended_keys_are_the_documented_ones() {
