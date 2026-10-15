@@ -153,7 +153,9 @@ async fn connected_pair(a_name: &str, b_name: &str) -> (EngineHandle, EngineHand
     let (mut b, b_dir) = make_engine(b_name, b_identity, &a_id, a_name).await;
     let mut a_connected = false;
     let mut b_connected = false;
-    let log = collect_until(&mut a, &mut b, Duration::from_secs(15), |log| {
+    // Generous: this file's tests run side by side, each pair of engines
+    // finding each other over the same loopback mDNS.
+    let log = collect_until(&mut a, &mut b, Duration::from_secs(30), |log| {
         for (side, ev) in log {
             if let SyncEvent::Connected { .. } = ev {
                 match side {
@@ -166,6 +168,17 @@ async fn connected_pair(a_name: &str, b_name: &str) -> (EngineHandle, EngineHand
     })
     .await;
     assert!(a_connected && b_connected, "the engines never connected: {log:?}");
+    // A v3 send needs the receiver's mDNS-resolved address, and goes
+    // in-band if it hasn't one within 5 s. Connected doesn't mean resolved
+    // (the other side may have dialed), and on a runner busy with other
+    // tests' engines resolving can take longer — so a test meant for the
+    // data connection could quietly take the other path (CI saw exactly
+    // that: a cut hook that never fired).
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !(a.knows_address_for_test(&b_id) && b.knows_address_for_test(&a_id)) {
+        assert!(Instant::now() < deadline, "the engines never resolved each other's addresses");
+        collect_until(&mut a, &mut b, Duration::from_millis(100), |_| false).await;
+    }
     (a, b, a_id, b_id, a_dir, b_dir)
 }
 
@@ -314,9 +327,15 @@ async fn a_cut_data_connection_resumes_where_it_left_off() {
         count(&log, Side::A, |e| matches!(e, SyncEvent::FileTransferStalled { .. })) >= 1,
         "the sender should report the stall"
     );
+    // The receiver reports the stall once it reaches the end of what came
+    // in before the cut — unless the sender's resume, a second later, gets
+    // there first while it's still working through that (a debug build on
+    // a busy machine), and ends that connection for it. Either way, it's
+    // resumed, not failed.
     assert!(
-        count(&log, Side::B, |e| matches!(e, SyncEvent::FileTransferStalled { .. })) >= 1,
-        "the receiver should report the stall"
+        count(&log, Side::B, |e| matches!(e, SyncEvent::FileTransferStalled { .. })) >= 1
+            || b.test_hooks().stale_data_connections_ended.load(Ordering::Relaxed) >= 1,
+        "the receiver should report the stall, or have its old connection ended by the resume"
     );
     // Resumed from what B had, not from scratch.
     let resumed_at = b.test_hooks().last_resume_offset.load(Ordering::Relaxed);

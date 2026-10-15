@@ -507,6 +507,7 @@ async fn answer_offer(
                     Phase::Streaming => {
                         if let Some(stream) = entry.stream.take() {
                             stream.abort();
+                            state.test_hooks.stale_data_connections_ended.fetch_add(1, Ordering::Relaxed);
                         }
                         Found::Busy
                     }

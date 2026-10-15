@@ -140,6 +140,15 @@ impl EngineHandle {
         &self.state.test_hooks
     }
 
+    /// Whether this engine has an mDNS-resolved address for
+    /// `peer_crypto_id` — what a v3 transfer needs to dial its data
+    /// connection, falling back to in-band without it — for this crate's
+    /// own integration tests.
+    #[doc(hidden)]
+    pub fn knows_address_for_test(&self, peer_crypto_id: &str) -> bool {
+        self.state.known_addresses.lock().unwrap().contains_key(peer_crypto_id)
+    }
+
     /// Drops the mesh connection to `peer_crypto_id` the way a network
     /// failure would — no manual-disconnect flag, transfers left to stall
     /// and resume — for this crate's own integration tests.
@@ -177,6 +186,9 @@ pub struct TestHooks {
     pub data_channel_files_received: AtomicU64,
     /// Receiver: files received over the in-band path.
     pub in_band_files_received: AtomicU64,
+    /// Receiver: data connections a resume offer ended because this side
+    /// hadn't seen them end yet (see `transfer::answer_offer`).
+    pub stale_data_connections_ended: AtomicU64,
     /// Receiver: the last non-zero offset it answered a resume offer with.
     pub last_resume_offset: AtomicU64,
     /// Inbound mesh connections that had to be read before they could be
