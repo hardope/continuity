@@ -19,8 +19,10 @@ installers in `installers/`).
 - desktop-shell-2, -4, -8, -9 are fixed too (all desktop-shell findings).
 - remote-control-1 to -6 are fixed (ticked at the bottom of this file;
   -2 was already fixed by "Control one computer at a time from the window").
-- Next up: the Android findings at the bottom of this file, then "What is
-  left" items 1 (macOS SwiftUI + contracts review), 2 and 3.
+- android-1 to -4 are fixed too (not compiled: no Android SDK on the
+  owner's Mac — CI's Android build is the first compile).
+- Next up: "What is left" items 1 (macOS SwiftUI + contracts review), 2
+  and 3.
 - Windows- and Linux-only code changed since the last CI run (e.g.
   remote_control_windows.rs) can't be compiled on the owner's Mac; ask the
   owner before dispatching a CI run.
@@ -230,22 +232,22 @@ have it):
   *Scenario:* tao's macOS view reports modifier keys only through flags_changed, and that handler checks only the Shift, Control, Option and Command masks. Caps Lock (kVK_CapsLock, which also arrives as flagsChanged) never produces a KeyboardInput event. On a Mac controlling Windows or Linux, pressing Caps Lock therefore does nothing on the peer, although the table and the 'whole keyboard' doc comment and tests say Caps Lock is covered.  
   *Fix:* Handle WindowEvent::ModifiersChanged or a flagsChanged for Caps Lock on macOS. For example, track the CapsLock lock state from ModifiersChanged and send a KeyDown/KeyUp pair for the peer's Caps Lock code when it toggles. Otherwise, document that Caps Lock is unsupported from a Mac.
 
-- [ ] **android-1** (medium, bug) Picking Download/Continuity as the folder is refused even when the engine is actually saving to the app-private fallback folder  
+- [x] **android-1** (medium, bug) Picking Download/Continuity as the folder is refused even when the engine is actually saving to the app-private fallback folder  
   `apps/android/app/src/main/java/app/continuity/android/ReceivedFiles.kt:334`  
   *Scenario:* Android 8 to 10 (API 26-29), and the user denied WRITE_EXTERNAL_STORAGE. chooseLocked() falls back to Android/data/<pkg>/files/Continuity, and the home screen shows "Download/Continuity can't be used (storage permission is off)...". The user taps Change and picks Download/Continuity in the SAF picker, which is the one way to get files there without the permission. chooseTreeNow() sees isDownloadsFolder(tree) == true, calls clearTree() and shows the notice "Received files already go to Download/Continuity". That notice is false: no tree is stored, and every later file still lands in the hidden app-private folder. The same thing happens on API 30+ whenever usable(downloads) fails.  
   *Fix:* Only take the "already there" shortcut when the engine really is writing to Download/Continuity. For example, check `_folder.value.fallbackNote == null` (or compare appliedDir with downloadsDir().path under the lock). Otherwise treat the pick like any other tree: take the persistable grant and move files there.
 
-- [ ] **android-2** (low, bug) isDownloadsFolder only recognises the externalstorage authority, so Download/Continuity picked from the Downloads root renames every received file to "name (1).ext"  
+- [x] **android-2** (low, bug) isDownloadsFolder only recognises the externalstorage authority, so Download/Continuity picked from the Downloads root renames every received file to "name (1).ext"  
   `apps/android/app/src/main/java/app/continuity/android/ReceivedFiles.kt:377`  
   *Scenario:* On Android 10+ the picker's sidebar "Downloads" root belongs to com.android.providers.downloads.documents. Opening Continuity there and tapping "Use this folder" returns a tree like content://com.android.providers.downloads.documents/tree/raw%3A%2Fstorage%2Femulated%2F0%2FDownload%2FContinuity. isDownloadsFolder() returns false because the authority differs, so the tree is persisted. Each finished file is then createDocument()'d into the folder it already sits in. The provider names the new copy "photo (1).jpg", the full file is copied, and the original "photo.jpg" is deleted. The result is that every received file carries a " (1)" suffix and takes twice the I/O. This is exactly the case the comment at line 335 says it prevents.  
   *Fix:* Also recognise the downloads provider. For a document id of the form `raw:<path>`, compare the path with downloadsDir().canonicalPath. Or, more generally, resolve the tree to a filesystem path where possible and compare it with the engine's current dir.
 
-- [ ] **android-3** (low, bug) One lingering notification per finished file hits Android's 50-notifications-per-app cap, so later "Received" notifications silently never appear  
+- [x] **android-3** (low, bug) One lingering notification per finished file hits Android's 50-notifications-per-app cap, so later "Received" notifications silently never appear  
   `apps/android/app/src/main/java/app/continuity/android/TransferNotifications.kt:135`  
   *Scenario:* A desktop sends 60 photos to the phone. Each transfer leaves a "Received 'x'" notification under its own tag (doneTag(transferId)). These are autoCancel, so they only go away when tapped, and none are grouped or summarised. NotificationManagerService refuses new keys once a package has 50 posted or enqueued notifications ("Package has already posted 50 notifications. Not showing more"), and that count includes the foreground status notification and any active progress ones. From roughly the 48th file on, neither the progress notification nor the "Received" notification is posted, which breaks decision 1 for bulk sends.  
   *Fix:* Put transfer notifications in a group with a summary notification. Alternatively, cap the number of lingering done notifications: track the posted done tags and cancel the oldest beyond about 20, or fold completed files into one summary such as "Received 12 files from X".
 
-- [ ] **android-4** (low, bug) The SAF move writes directly under the final file name, so a process death mid-copy leaves a truncated file that looks complete in the chosen folder  
+- [x] **android-4** (low, bug) The SAF move writes directly under the final file name, so a process death mid-copy leaves a truncated file that looks complete in the chosen folder  
   `apps/android/app/src/main/java/app/continuity/android/ReceivedFiles.kt:243`  
   *Scenario:* A custom folder is set and a 2 GB video has just been received. finishReceived() is streaming it into createDocument(..., file.name). The user taps Quit, which calls Process.killProcess immediately (or the system kills the process). The catch/deleteDocument cleanup never runs. The chosen folder now holds "video.mp4" with only part of its bytes, and the full original stays in Download/Continuity. Nothing retries or cleans up on the next start, and no notification or activity entry says the move failed. A user who deletes the "duplicate" in Downloads keeps only the truncated copy.  
   *Fix:* Copy into a temporary name (for example "<name>.part" or a hidden name) and call DocumentsContract.renameDocument to the real name only after the size check passes. Fall back to the current behaviour for providers that don't support rename. Optionally, on startup, sweep leftover temporary documents in the tree.
