@@ -50,6 +50,12 @@ const PROGRESS_PUSH_INTERVAL: Duration = Duration::from_millis(250);
 /// history in memory. Transfers under way are always all listed.
 const FINISHED_TRANSFERS_KEPT: usize = 20;
 
+/// What a transfer that failed before the engine ever named it is listed
+/// as (see `observe`'s `FileTransferFailed`): the windows show these where
+/// a file's and a device's names go.
+const UNANNOUNCED_FILE: &str = "A file";
+const UNANNOUNCED_DEVICE: &str = "a device";
+
 /// One request, tagged by `op`. The connection's token is checked before
 /// this is even parsed.
 #[derive(Debug, Deserialize, PartialEq)]
@@ -492,10 +498,23 @@ impl ControlState {
                 live.activity.bytes_received += size.unwrap_or_default();
             }
             SyncEvent::FileTransferFailed { transfer_id, reason } => {
-                live.finish_transfer(transfer_id, |t| {
+                let fail = |t: &mut Transfer| {
                     t.state = TransferState::Failed;
                     t.reason = Some(reason.clone());
-                });
+                };
+                if live.finish_transfer(transfer_id, fail).is_none() {
+                    // Never announced: the engine only says `FileSending`
+                    // once the receiver has accepted, so a file it refused
+                    // (not enough free space, say), or one that couldn't
+                    // even be offered (unreadable, the device gone), fails
+                    // under an id nothing here has seen — and wasn't listed
+                    // at all, leaving the reason in a passing notification
+                    // only. It's listed as a send that failed; which file
+                    // and which device the engine doesn't say, so those are
+                    // left generic, and the reason says the rest.
+                    live.start_transfer(transfer_id, TransferDirection::Sending, UNANNOUNCED_FILE, UNANNOUNCED_DEVICE, 0);
+                    live.finish_transfer(transfer_id, fail);
+                }
             }
             SyncEvent::RemoteControlSessionStarted { .. } => live.activity.remote_control_sessions += 1,
             SyncEvent::ScreenLockRequested { outcome: ScreenLockOutcome::Done, .. } => live.activity.screen_locks += 1,
@@ -1114,6 +1133,28 @@ mod tests {
 
         let ids: Vec<String> = state.status().transfers.into_iter().map(|t| t.id).collect();
         assert_eq!(ids, ["big", "in"], "newest first");
+    }
+
+    #[test]
+    fn a_send_that_fails_before_it_was_announced_is_still_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(&dir);
+        let reason = "Not enough free space on Pixel 8 (needs 5.1 GB, 300 MB free)";
+        state.observe(&SyncEvent::FileTransferFailed { transfer_id: "refused".into(), reason: reason.into() });
+        let t = state.transfer("refused").expect("listed");
+        assert_eq!((t.direction, t.state, t.reason.as_deref()), (TransferDirection::Sending, TransferState::Failed, Some(reason)));
+        assert_eq!((t.file_name.as_str(), t.peer_name.as_str()), (UNANNOUNCED_FILE, UNANNOUNCED_DEVICE));
+        assert_eq!((t.size_bytes, t.bytes_done, t.path), (0, 0, None));
+        assert!(t.finished_at_unix.is_some());
+        assert_eq!(state.status().transfers.len(), 1);
+        assert_eq!(state.status().activity, Activity::default(), "nothing counted");
+
+        // One the window already lists keeps its own names.
+        state.observe(&sending("known", "Pixel 8", "talk.mov", 10));
+        state.observe(&SyncEvent::FileTransferFailed { transfer_id: "known".into(), reason: "the connection dropped".into() });
+        let t = state.transfer("known").unwrap();
+        assert_eq!((t.file_name.as_str(), t.peer_name.as_str(), t.state), ("talk.mov", "Pixel 8", TransferState::Failed));
+        assert_eq!(state.status().transfers.len(), 2);
     }
 
     #[test]
