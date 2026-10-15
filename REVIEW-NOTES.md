@@ -96,7 +96,7 @@ was written — expect more items and some of these to be dropped.
   *Scenario:* The engine emits FileSending only after the receiver accepts, on both the v3 and legacy paths. If the receiver refuses for lack of free space (decision 3), the sender gets FileTransferFailed for an id the list has never seen. finish_transfer then returns None, and nothing is listed. The user clicks Send files…, sees the toast 'Sending 1 file(s)', and the Transfers page stays empty. The 'Not enough free space on …' reason appears only in a passing notification.  
   *Fix:* In observe, when FileTransferFailed arrives for an unknown id, add a failed entry (direction sending, the reason, file and peer name if known). Alternatively, have the engine emit FileSending when it makes the offer.
 
-- [ ] **desktop-shell-6** (low, bug) The new .bar progress-bar CSS also hits the About sheet's bottom bar and clips it  
+- [x] **desktop-shell-6** (low, bug) The new .bar progress-bar CSS also hits the About sheet's bottom bar and clips it  
   `core/continuityd/src/settings_window/page.html:199`  
   *Scenario:* The info sheet's footer is `<div class="bar">` (line 749). `.sheet .bar` overrides display, padding, border and background, but not the new `.bar` rule's height:4px, overflow:hidden, margin-top:8px and border-radius:2px. With box-sizing:border-box, the footer shrinks to its padding (about 25 px) with zero content height, and overflow:hidden cuts off the vertically centred 32–34 px Done button above and below. There is also an 8 px gap above the footer. The About panel's footer looks broken on Linux and Windows.  
   *Fix:* Rename the progress bar class (for example .progress), or scope it as `.row .bar`.
