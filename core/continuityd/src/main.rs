@@ -74,7 +74,7 @@ enum AppEvent {
     PrepareSettings,
     /// Show the Continuity window: the very first launch, or Continuity
     /// launched again while it's already running (see share.rs's
-    /// `hand_off_to_running_instance`).
+    /// `hand_off_while_starting`).
     OpenWindow,
     /// The remote-control viewer's decoder thread has a frame ready to
     /// show — at most one of these is ever in flight (see remote_viewer.rs).
@@ -130,14 +130,26 @@ fn main() -> anyhow::Result<()> {
     if args.get(1).map(String::as_str) == Some(share::SHARE_TO_FLAG) {
         std::process::exit(share::run_share_client(&profile(), &args[2..]));
     }
-    // Launched again while already running — from the app menu or the
-    // Start menu, say: the running one shows its window instead, and this
-    // one goes away. Only a plain launch, with nothing on the command line.
-    // (macOS reactivates a running app by itself; see `Event::Reopen`.)
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
-    if args.len() == 1 && share::hand_off_to_running_instance(&profile()) {
-        std::process::exit(0);
-    }
+    // One Continuity per profile, settled before anything that takes time
+    // (see `share::claim_instance`). Launched again while already running —
+    // from the app menu or the Start menu, say — the running one shows its
+    // window instead, once it's far enough along to, and this one goes
+    // away. (macOS reactivates a running app by itself, see
+    // `Event::Reopen`; this only comes up there for a terminal launch.)
+    let instance = loop {
+        match share::claim_instance(&profile()) {
+            share::InstanceClaim::First(lock) => break lock,
+            share::InstanceClaim::Running => match share::hand_off_while_starting(&profile()) {
+                share::HandOff::Done => std::process::exit(0),
+                share::HandOff::NotAnswering => {
+                    eprintln!("Continuity is already running, but didn't answer — try again in a moment");
+                    std::process::exit(1);
+                }
+                // It quit meanwhile: this launch takes over.
+                share::HandOff::Gone => continue,
+            },
+        }
+    };
 
     init_logging();
     init_notifications();
@@ -287,8 +299,10 @@ fn main() -> anyhow::Result<()> {
 
     event_loop.run(move |event, target, control_flow| {
         // Keep the tray icon (and its menu) alive for the app's lifetime —
-        // dropping it removes the icon from the menu bar.
+        // dropping it removes the icon from the menu bar — and the instance
+        // lock, which a second launch looks for.
         let _tray_icon = &tray_icon;
+        let _instance = &instance;
         let _target = target;
         *control_flow = ControlFlow::Wait;
         // Set by anything this tick that should bring the Continuity window

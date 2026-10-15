@@ -36,7 +36,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 
 pub const SHARE_TO_FLAG: &str = "--share-to";
@@ -126,6 +126,87 @@ pub(crate) fn dispatch(target: &str, paths: &[PathBuf], commands: &UnboundedSend
 fn endpoint_path(profile: &str) -> Option<PathBuf> {
     let dirs = directories::ProjectDirs::from("app", "continuity", "continuity")?;
     Some(dirs.config_dir().join(format!("share-endpoint.{profile}.json")))
+}
+
+fn lock_path(profile: &str) -> Option<PathBuf> {
+    let dirs = directories::ProjectDirs::from("app", "continuity", "continuity")?;
+    Some(dirs.config_dir().join(format!("instance.{profile}.lock")))
+}
+
+/// Held for as long as this profile's Continuity runs — see
+/// `claim_instance`.
+pub struct InstanceLock {
+    _file: Option<std::fs::File>,
+}
+
+pub enum InstanceClaim {
+    /// No other Continuity of this profile is running: this one is it.
+    First(InstanceLock),
+    /// Another one is already running, or still starting.
+    Running,
+}
+
+/// Makes this the one Continuity running for `profile`, or finds that
+/// another one already is. The first thing a launch does, before anything
+/// that can take time: an exclusive lock on a file next to the endpoint
+/// file, which the OS lets go of however the process ends (Quit, a crash,
+/// being killed at logoff), so a dead instance never keeps it.
+///
+/// **Real bug fixed here**: a launch used to find out whether Continuity
+/// was running only by reaching it through the endpoint file, which the
+/// running one writes once its engine has started — and that can wait on a
+/// keyring unlock prompt. Clicking the icon again in that gap started a
+/// second tray app and engine on the same identity. And an instance that
+/// didn't quit through the menu left its endpoint file behind, so the next
+/// launch first dialed that port: seconds lost if something else had it,
+/// and if another local user's program answered there, every launch handed
+/// off to it and exited, so Continuity never started.
+///
+/// Holding the lock also means any endpoint file is a previous run's, so
+/// it's deleted here; and `--share-to` and a second launch only trust the
+/// endpoint file while some instance holds the lock (`instance_running`).
+/// A lock that can't be taken at all (no config directory, a filesystem
+/// without locks) doesn't stop Continuity starting, as before.
+pub fn claim_instance(profile: &str) -> InstanceClaim {
+    let Some(file) = open_lock(profile) else {
+        return InstanceClaim::First(InstanceLock { _file: None });
+    };
+    match file.try_lock() {
+        Ok(()) => {
+            if let Some(endpoint) = endpoint_path(profile) {
+                let _ = std::fs::remove_file(endpoint);
+            }
+            InstanceClaim::First(InstanceLock { _file: Some(file) })
+        }
+        Err(std::fs::TryLockError::WouldBlock) => InstanceClaim::Running,
+        Err(std::fs::TryLockError::Error(e)) => {
+            tracing::warn!("couldn't lock the instance file, not checking for another Continuity: {e}");
+            InstanceClaim::First(InstanceLock { _file: None })
+        }
+    }
+}
+
+fn open_lock(profile: &str) -> Option<std::fs::File> {
+    let path = lock_path(profile)?;
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path) {
+        Ok(file) => Some(file),
+        Err(e) => {
+            tracing::warn!("couldn't open {}: {e}", path.display());
+            None
+        }
+    }
+}
+
+/// Whether some Continuity holds `profile`'s instance lock right now —
+/// what makes its endpoint file worth trusting. When that can't be told,
+/// the endpoint file is trusted, as it always was.
+fn instance_running(profile: &str) -> bool {
+    let Some(file) = open_lock(profile) else { return true };
+    // Taking it means nobody had it; it goes again with `file`.
+    !matches!(file.try_lock(), Ok(()))
 }
 
 /// The running instance's side of `--share-to`. Removes its endpoint file
@@ -304,13 +385,17 @@ fn request_share(profile: &str, target: &str, paths: Vec<PathBuf>) -> std::io::R
 }
 
 /// One request to the running instance, if there is one: the endpoint file
-/// names its port and token. `Err` when nothing answers — no endpoint file,
-/// or one left behind by an instance that's gone.
+/// names its port and token. `Err` when nothing answers — no instance, no
+/// endpoint file yet, or one whose instance is gone, which is never even
+/// dialed (see `claim_instance`).
 fn request_running_instance(
     profile: &str,
     read_timeout: Duration,
     request: impl FnOnce(String) -> std::io::Result<serde_json::Value>,
 ) -> std::io::Result<ShareResponse> {
+    if !instance_running(profile) {
+        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "Continuity isn't running"));
+    }
     let path = endpoint_path(profile).ok_or_else(|| std::io::Error::other("no config directory"))?;
     let endpoint: Endpoint = serde_json::from_slice(&std::fs::read(path)?)?;
     let stream = TcpStream::connect_timeout(&([127, 0, 0, 1], endpoint.port).into(), Duration::from_secs(2))?;
@@ -323,19 +408,17 @@ fn request_running_instance(
     Ok(serde_json::from_str(&line)?)
 }
 
-/// A plain second launch of Continuity on Linux or Windows — from the app
-/// menu, the Start menu, or the installer's "Launch Continuity now" while
-/// it's already running: asks the running instance to show its window, so
-/// the launch does what someone clicking the icon expects instead of
-/// starting a second tray app on the same identity. True when an instance
-/// answered (even to say no, as a version without this would), and this
-/// one should exit; false when none is running and this one should start.
-/// An answer refusing the token isn't this profile's instance: the endpoint
-/// file was left behind, and its port has since gone to another one.
-/// (macOS doesn't need this: launching an app that's already running just
-/// reactivates it — see `Event::Reopen` in main.rs.)
-#[cfg(any(target_os = "linux", target_os = "windows", test))]
-pub fn hand_off_to_running_instance(profile: &str) -> bool {
+/// A second launch of Continuity — from the app menu, the Start menu, or
+/// the installer's "Launch Continuity now" while it's already running:
+/// asks the running instance to show its window, so the launch does what
+/// someone clicking the icon expects instead of starting a second tray app
+/// on the same identity. True when an instance answered (even to say no,
+/// as a version without this would); false when none answered. An answer
+/// refusing the token isn't this profile's instance. (On macOS, launching
+/// an app that's already running normally just reactivates it — see
+/// `Event::Reopen` in main.rs — so this only comes up there for a launch
+/// from a terminal.)
+fn hand_off_to_running_instance(profile: &str) -> bool {
     let response = request_running_instance(profile, Duration::from_secs(3), |token| {
         Ok(serde_json::json!({ "op": "open_window", "token": token }))
     });
@@ -347,6 +430,41 @@ pub fn hand_off_to_running_instance(profile: &str) -> bool {
             true
         }
         Err(_) => false,
+    }
+}
+
+/// How long a launch that found Continuity already running keeps asking it
+/// to show its window: one that's still starting answers only once its
+/// engine is up, which can take a keyring unlock prompt.
+const HAND_OFF_WAIT: Duration = Duration::from_secs(10);
+
+pub enum HandOff {
+    /// The running instance is showing its window: this launch is done.
+    Done,
+    /// It's still running but never answered.
+    NotAnswering,
+    /// It quit meanwhile: this launch can take over.
+    Gone,
+}
+
+/// For a launch that `claim_instance` found isn't the first: hands off to
+/// the instance holding the lock, waiting for it to finish starting if it
+/// has to.
+pub fn hand_off_while_starting(profile: &str) -> HandOff {
+    let deadline = Instant::now() + HAND_OFF_WAIT;
+    let mut delay = Duration::from_millis(100);
+    loop {
+        if hand_off_to_running_instance(profile) {
+            return HandOff::Done;
+        }
+        if !instance_running(profile) {
+            return HandOff::Gone;
+        }
+        if Instant::now() + delay > deadline {
+            return HandOff::NotAnswering;
+        }
+        std::thread::sleep(delay);
+        delay = (delay * 2).min(Duration::from_secs(1));
     }
 }
 
@@ -711,6 +829,90 @@ mod tests {
         Arc::new(|| {})
     }
 
+    fn first_instance(profile: &str) -> InstanceLock {
+        match claim_instance(profile) {
+            InstanceClaim::First(lock) => lock,
+            InstanceClaim::Running => panic!("{profile} is already claimed"),
+        }
+    }
+
+    fn cleanup(profile: &str) {
+        let _ = std::fs::remove_file(lock_path(profile).unwrap());
+        let _ = std::fs::remove_file(endpoint_path(profile).unwrap());
+    }
+
+    #[test]
+    fn one_instance_holds_a_profile_and_clears_a_dead_ones_endpoint() {
+        let profile = format!("lock-test-{}", rand::random::<u32>());
+        let stale = Endpoint { port: 9, token: "from-a-run-that-was-killed".into() };
+        write_private_file(&endpoint_path(&profile).unwrap(), &serde_json::to_vec(&stale).unwrap()).unwrap();
+
+        let first = first_instance(&profile);
+        assert!(!endpoint_path(&profile).unwrap().exists(), "the dead instance's endpoint file is gone");
+        assert!(instance_running(&profile));
+        assert!(matches!(claim_instance(&profile), InstanceClaim::Running), "a second launch isn't the first");
+        assert!(matches!(claim_instance(&format!("{profile}-b")), InstanceClaim::First(_)), "another profile is separate");
+
+        // However it ends, the OS lets go of the lock.
+        drop(first);
+        assert!(!instance_running(&profile));
+        assert!(matches!(claim_instance(&profile), InstanceClaim::First(_)));
+        cleanup(&profile);
+        cleanup(&format!("{profile}-b"));
+    }
+
+    #[test]
+    fn a_client_never_dials_an_endpoint_no_instance_holds() {
+        let profile = format!("stale-test-{}", rand::random::<u32>());
+        // Whatever has the dead instance's port now — another user's
+        // program, say, ready to answer "ok".
+        let squatter = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        squatter.set_nonblocking(true).unwrap();
+        let port = squatter.local_addr().unwrap().port();
+        let stale = Endpoint { port, token: "from-a-run-that-was-killed".into() };
+        write_private_file(&endpoint_path(&profile).unwrap(), &serde_json::to_vec(&stale).unwrap()).unwrap();
+
+        assert!(request_share(&profile, "peer1", vec![PathBuf::from("/tmp/x")]).is_err());
+        assert!(!hand_off_to_running_instance(&profile));
+        assert!(
+            matches!(squatter.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "nothing was sent to the old port, token and file paths included"
+        );
+        cleanup(&profile);
+    }
+
+    #[test]
+    fn a_second_launch_waits_for_an_instance_still_starting() {
+        let profile = format!("starting-test-{}", rand::random::<u32>());
+        let instance = first_instance(&profile);
+        let (commands, _sent) = tokio::sync::mpsc::unbounded_channel();
+        let dir = tempfile::tempdir().unwrap();
+        let opened = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = opened.clone();
+        let open_window: OpenWindow = Arc::new(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        // The running one's socket comes up a moment after the second
+        // launch looks — its engine was still starting.
+        let starting = {
+            let profile = profile.clone();
+            let control = control_state(&dir);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(700));
+                start_server(&profile, commands, Arc::new(Mutex::new(HashMap::new())), control, open_window).expect("server starts")
+            })
+        };
+        assert!(matches!(claim_instance(&profile), InstanceClaim::Running));
+        assert!(matches!(hand_off_while_starting(&profile), HandOff::Done));
+        assert_eq!(opened.load(std::sync::atomic::Ordering::SeqCst), 1);
+        starting.join().unwrap().shutdown();
+
+        // It quits while a launch is waiting for it: that launch takes over.
+        drop(instance);
+        assert!(matches!(hand_off_while_starting(&profile), HandOff::Gone));
+        cleanup(&profile);
+    }
+
     /// Sends one request line to the running server and returns its first
     /// response line, plus the connection (for reading further lines).
     fn request(profile: &str, request: serde_json::Value) -> (serde_json::Value, BufReader<TcpStream>) {
@@ -735,6 +937,7 @@ mod tests {
         let (commands, mut sent) = tokio::sync::mpsc::unbounded_channel();
         let connected: ConnectedPeers = Arc::new(Mutex::new(peers(&[("peer1", "Pixel")])));
         let profile = format!("share-test-{}", rand::random::<u32>());
+        let _instance = first_instance(&profile);
         let dir = tempfile::tempdir().unwrap();
         let server = start_server(&profile, commands, connected, control_state(&dir), no_window()).expect("server starts");
 
@@ -777,6 +980,7 @@ mod tests {
         let (commands, mut sent) = tokio::sync::mpsc::unbounded_channel();
         let connected: ConnectedPeers = Arc::new(Mutex::new(HashMap::new()));
         let profile = format!("control-test-{}", rand::random::<u32>());
+        let _instance = first_instance(&profile);
         let dir = tempfile::tempdir().unwrap();
         let control = control_state(&dir);
         let server = start_server(&profile, commands, connected, control.clone(), no_window()).expect("server starts");
@@ -826,6 +1030,7 @@ mod tests {
     fn a_second_launch_hands_off_to_the_running_instance() {
         let profile = format!("handoff-test-{}", rand::random::<u32>());
         assert!(!hand_off_to_running_instance(&profile), "nothing running: start normally");
+        let _instance = first_instance(&profile);
 
         let (commands, _sent) = tokio::sync::mpsc::unbounded_channel();
         let dir = tempfile::tempdir().unwrap();
@@ -844,7 +1049,8 @@ mod tests {
         assert_eq!(opened.load(std::sync::atomic::Ordering::SeqCst), 1, "not without the token");
 
         // Another profile's endpoint file, left behind, naming the port
-        // this instance now has: not that profile's instance.
+        // this instance now has: no instance of that profile holds its
+        // lock, so it's never even dialed.
         let other = format!("{profile}-other");
         let port = serde_json::from_slice::<Endpoint>(&std::fs::read(endpoint_path(&profile).unwrap()).unwrap()).unwrap().port;
         let stale = Endpoint { port, token: "from-a-run-long-gone".into() };
