@@ -932,16 +932,22 @@ impl KeyboardForwarder {
     }
 
     /// The event to send for one local key press or release, if any. A
-    /// held key's auto-repeat goes out as another `KeyDown`, which is how
-    /// the peer repeats it too (injected keys don't auto-repeat on macOS
-    /// or Windows). Only keys this viewer pressed get released, so a key
-    /// already down when the window got focus doesn't send a stray `KeyUp`.
+    /// held key's auto-repeat goes out as another `KeyDown` to a Mac or a
+    /// Windows PC, which is how the peer repeats it too (injected keys
+    /// don't auto-repeat there). Not to Linux: a Wayland compositor repeats
+    /// a held key for its clients by itself, and counts presses — **real
+    /// bug fixed here**: GNOME took each repeat as one more press, so the
+    /// single release at the end left the key down there, Backspace
+    /// deleting text until the session ended, and nothing on either side
+    /// could let go of it. Only keys this viewer pressed get released, so a
+    /// key already down when the window got focus doesn't send a stray
+    /// `KeyUp`.
     fn key(&mut self, key: KeyCode, pressed: bool) -> Option<InputEventKind> {
         let code = self.translator.code(key)?;
         let held = self.held.iter().position(|&c| c == code);
         if pressed {
             match held {
-                Some(_) if is_modifier(key) => None,
+                Some(_) if is_modifier(key) || self.translator.peer == Platform::Linux => None,
                 Some(_) => Some(InputEventKind::KeyDown { code }),
                 None => {
                     self.held.push(code);
@@ -1263,6 +1269,18 @@ mod tests {
         // Unmapped keys send nothing and aren't tracked.
         assert_eq!(keyboard.key(KeyCode::PrintScreen, true), None);
         assert_eq!(keyboard.held, vec![0xA0]);
+    }
+
+    #[test]
+    fn a_linux_peer_gets_one_press_and_one_release_for_a_held_key() {
+        let mut keyboard = KeyboardForwarder::new(KeyTranslator::new(true, Platform::Linux));
+        assert_eq!(keyboard.key(KeyCode::Backspace, true), Some(InputEventKind::KeyDown { code: 14 }));
+        // A second of auto-repeat: the compositor over there repeats it.
+        for _ in 0..15 {
+            assert_eq!(keyboard.key(KeyCode::Backspace, true), None);
+        }
+        assert_eq!(keyboard.key(KeyCode::Backspace, false), Some(InputEventKind::KeyUp { code: 14 }));
+        assert!(keyboard.held.is_empty());
     }
 
     #[test]
