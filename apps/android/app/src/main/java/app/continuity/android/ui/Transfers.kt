@@ -19,7 +19,9 @@ import uniffi.continuity_ffi.FfiFileTransferDirection
 /** One row per file transfer in progress (sending or receiving), each with
  * a determinate progress bar — keyed by transfer id upstream, so
  * simultaneous transfers to/from different devices each get their own row
- * rather than being conflated into one. */
+ * rather than being conflated into one. A stalled transfer (its connection
+ * dropped; the engine resumes it from where it stopped once the other
+ * device is back) keeps its bar where it got to and says it's waiting. */
 @Composable
 internal fun TransfersCard(transfers: List<TransferProgress>, modifier: Modifier = Modifier) {
     Card(
@@ -45,19 +47,29 @@ internal fun TransfersCard(transfers: List<TransferProgress>, modifier: Modifier
                             progress = { fraction },
                             modifier = Modifier.fillMaxWidth(),
                         )
-                        Text(
-                            "${formatBytes(transfer.bytesTransferred)} / ${formatBytes(transfer.totalBytes)} " +
-                                "(${(fraction * 100).toInt()}%)",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
+                        val amount = "${formatBytes(transfer.bytesTransferred)} / ${formatBytes(transfer.totalBytes)}"
+                        if (transfer.stalled) {
+                            StalledText("Waiting to reconnect… ($amount)")
+                        } else {
+                            Text(
+                                "$amount (${(fraction * 100).toInt()}%)",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
                     } else {
                         LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                        if (transfer.stalled) StalledText("Waiting to reconnect…")
                     }
                 }
             }
         }
     }
+}
+
+@Composable
+private fun StalledText(text: String) {
+    Text(text, style = MaterialTheme.typography.labelSmall, color = warningColor())
 }
 
 private fun transferLabel(transfer: TransferProgress): String {

@@ -1,9 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Covers both possible received-files locations from
-     ContinuityForegroundService.startEngine(): getExternalFilesDir("Continuity")
-     normally, falling back to the raw internal filesDir root if external
-     storage isn't available. -->
+<!-- Covers every folder ReceivedFiles can give the engine: the public
+     Download/Continuity normally, getExternalFilesDir("Continuity") if that
+     can't be used (and where older versions saved files), and the raw
+     internal filesDir root if external storage isn't available either. -->
 <paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <external-path name="downloads" path="Download/Continuity/" />
     <external-files-path name="received" path="Continuity/" />
     <files-path name="received_fallback" path="." />
 </paths>

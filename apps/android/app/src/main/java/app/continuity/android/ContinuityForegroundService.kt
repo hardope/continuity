@@ -3,15 +3,12 @@ package app.continuity.android
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
-import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.net.wifi.WifiManager
 import android.os.IBinder
-import android.webkit.MimeTypeMap
 import androidx.core.app.NotificationCompat
-import androidx.core.content.FileProvider
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -19,8 +16,8 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import uniffi.continuity_ffi.ContinuityEngine
 import uniffi.continuity_ffi.EventListener
+import uniffi.continuity_ffi.FfiFileTransferDirection
 import uniffi.continuity_ffi.FfiSyncEvent
-import java.io.File
 
 /**
  * Foreground service hosting the engine for as long as the app should be
@@ -36,12 +33,17 @@ class ContinuityForegroundService : Service() {
 
     private var multicastLock: WifiManager.MulticastLock? = null
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private lateinit var transferNotifications: TransferNotifications
 
     override fun onCreate() {
         super.onCreate()
         uniffi.continuity_ffi.initAndroidLogging()
         createNotificationChannels()
+        transferNotifications = TransferNotifications(this)
         startForeground(NOTIFICATION_ID_STATUS, statusNotification())
+        // Left over from a previous process that died mid-transfer — that
+        // transfer's engine state died with it.
+        TransferNotifications.cancelAllActive(this)
         acquireMulticastLock()
         // `ContinuityEngine.start` is a blocking FFI call (it waits for the
         // Rust side's tokio runtime and mDNS/TLS listener to come up) — on
@@ -85,6 +87,7 @@ class ContinuityForegroundService : Service() {
         serviceScope.cancel()
         EngineHolder.engine?.close()
         EngineHolder.engine = null
+        TransferNotifications.cancelAllActive(this)
         multicastLock?.let { if (it.isHeld) it.release() }
         super.onDestroy()
     }
@@ -92,7 +95,9 @@ class ContinuityForegroundService : Service() {
     private fun startEngine() {
         val identityDer = SecureIdentity.loadOrCreateIdentityDer(this)
         val deviceName = SecureIdentity.deviceName(this)
-        val receivedDir = (getExternalFilesDir("Continuity") ?: filesDir).also { it.mkdirs() }
+        // Download/Continuity, or the app's own folder if that can't be
+        // used — see ReceivedFiles.
+        val receivedDir = ReceivedFiles.dirForEngineStart(this)
 
         ContinuityStore.setDeviceId(uniffi.continuity_ffi.deviceIdFor(identityDer))
 
@@ -114,6 +119,15 @@ class ContinuityForegroundService : Service() {
         )
 
         EngineHolder.engine = engine
+        // The storage permission may have been granted while the engine
+        // was starting (MainActivity asks for it at the same time this
+        // runs), too late for `receivedDir` above but before there was an
+        // engine to tell — so check once more now that there is.
+        try {
+            ReceivedFiles.refresh(this)
+        } catch (e: Exception) {
+            android.util.Log.w("ContinuityService", "couldn't re-check the received-files folder", e)
+        }
     }
 
     private fun acquireMulticastLock() {
@@ -140,6 +154,15 @@ class ContinuityForegroundService : Service() {
                 NotificationManager.IMPORTANCE_DEFAULT,
             ),
         )
+        // High importance, so a transfer starting or finishing pops up as a
+        // heads-up notification — see TransferNotifications.
+        manager.createNotificationChannel(
+            NotificationChannel(
+                TransferNotifications.CHANNEL_ID,
+                getString(R.string.notification_channel_transfers),
+                NotificationManager.IMPORTANCE_HIGH,
+            ).apply { description = getString(R.string.notification_channel_transfers_description) },
+        )
     }
 
     private fun statusNotification(): Notification =
@@ -161,14 +184,19 @@ class ContinuityForegroundService : Service() {
             is FfiSyncEvent.PairingRequested ->
                 "Pairing request from '${event.peer.name}' — open Continuity to confirm"
             is FfiSyncEvent.PairingDeclined -> "Pairing with '${event.peerName}' was declined"
-            is FfiSyncEvent.FileReceiving -> "Receiving '${event.fileName}' from '${event.fromName}'..."
-            is FfiSyncEvent.FileSending -> "Sending '${event.fileName}' to '${event.toName}'..."
-            is FfiSyncEvent.FileReceived -> {
-                notifyFileReceived(event.fileName, event.path)
+            // Each transfer has its own notification on its own channel,
+            // start to finish — see TransferNotifications.
+            is FfiSyncEvent.FileReceiving,
+            is FfiSyncEvent.FileSending,
+            is FfiSyncEvent.FileTransferProgress,
+            is FfiSyncEvent.FileTransferStalled,
+            is FfiSyncEvent.FileReceived,
+            is FfiSyncEvent.FileSent,
+            is FfiSyncEvent.FileTransferFailed,
+            -> {
+                onTransferEvent(event)
                 return
             }
-            is FfiSyncEvent.FileSent -> "Sent '${event.fileName}' to '${event.toName}'"
-            is FfiSyncEvent.FileTransferFailed -> "File transfer failed: ${event.reason}"
             is FfiSyncEvent.Error -> "Error: ${event.message}"
             // A peer forgetting *this* device is worth surfacing even when
             // the app isn't in the foreground — it explains why sync just
@@ -196,12 +224,6 @@ class ContinuityForegroundService : Service() {
             is FfiSyncEvent.NowPlayingChanged,
             is FfiSyncEvent.PeerDiscovered,
             is FfiSyncEvent.PeerActivity,
-            // Fires roughly once per MB, far too often for a system
-            // notification per tick — the in-app `TransfersCard` (see
-            // MainActivity) is the live view for this; FileReceiving/
-            // FileReceived/FileSent/FileTransferFailed above already
-            // cover the start/end notifications.
-            is FfiSyncEvent.FileTransferProgress,
             // Android is a remote-control *controller* only (see
             // EngineHolder's `NoopRemoteControlHost` wiring) — an
             // inbound `RemoteControlRequested` against this device is
@@ -235,39 +257,44 @@ class ContinuityForegroundService : Service() {
             .notify(NOTIFICATION_ID_EVENT_BASE + text.hashCode(), notification)
     }
 
-    /// A received file is worth acting on immediately, so it gets an
-    /// "Open" action instead of just announcing itself — routes through
-    /// FileProvider since handing another app a raw file:// Uri throws
-    /// FileUriExposedException on API 24+.
-    private fun notifyFileReceived(fileName: String, path: String) {
-        val file = File(path)
-        val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
-        val extension = fileName.substringAfterLast('.', "")
-        val mimeType = MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension) ?: "*/*"
-
-        val viewIntent = Intent(Intent.ACTION_VIEW).apply {
-            setDataAndType(uri, mimeType)
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    private fun onTransferEvent(event: FfiSyncEvent) {
+        when (event) {
+            is FfiSyncEvent.FileReceiving -> transferNotifications.started(
+                event.transferId, FfiFileTransferDirection.RECEIVING, event.fileName, event.fromName, event.sizeBytes.toLong(),
+            )
+            is FfiSyncEvent.FileSending -> transferNotifications.started(
+                event.transferId, FfiFileTransferDirection.SENDING, event.fileName, event.toName, event.sizeBytes.toLong(),
+            )
+            is FfiSyncEvent.FileTransferProgress ->
+                transferNotifications.progress(event.transferId, event.bytesTransferred.toLong(), event.totalBytes.toLong())
+            is FfiSyncEvent.FileTransferStalled -> transferNotifications.stalled(event.transferId)
+            // Off the engine's callback thread: moving the file into a
+            // folder chosen with "Change folder" is a full copy, as slow as
+            // the file is big.
+            is FfiSyncEvent.FileReceived -> serviceScope.launch { finishReceived(event) }
+            is FfiSyncEvent.FileSent -> transferNotifications.sent(event.transferId, event.fileName, event.toName)
+            is FfiSyncEvent.FileTransferFailed -> transferNotifications.failed(event.transferId, event.reason)
+            else -> {}
         }
-        val pendingIntent = PendingIntent.getActivity(
-            this,
-            path.hashCode(),
-            viewIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
+    }
 
-        val notification = NotificationCompat.Builder(this, CHANNEL_EVENTS)
-            .setContentTitle(getString(R.string.app_name))
-            .setContentText("Received '$fileName'")
-            .setSmallIcon(R.drawable.ic_notification)
-            .setAutoCancel(true)
-            .setContentIntent(pendingIntent)
-            .addAction(0, "Open", pendingIntent)
-            .build()
-
-        getSystemService(NotificationManager::class.java)
-            .notify(NOTIFICATION_ID_EVENT_BASE + fileName.hashCode(), notification)
+    /** Makes the received file visible to other apps (or moves it into the
+     * chosen folder) — regardless of whether notifications are allowed —
+     * then replaces its progress notification with one that opens it. */
+    private fun finishReceived(event: FfiSyncEvent.FileReceived) {
+        // Caught here: this runs on serviceScope, where an uncaught
+        // exception would take the whole process down (see onCreate).
+        try {
+            ReceivedFiles.folder.value.customTreeLabel?.let { transferNotifications.saving(event.transferId, it) }
+            val saved = ReceivedFiles.finishReceived(this, event.path)
+            saved.couldNotMoveTo?.let { folder ->
+                // In the activity feed too, for when notifications are off.
+                ContinuityStore.logWarning("Couldn't move '${event.fileName}' to $folder — it's in ${saved.location}")
+            }
+            transferNotifications.received(event.transferId, event.fileName, saved)
+        } catch (e: Exception) {
+            android.util.Log.e("ContinuityService", "couldn't finish receiving ${event.path}", e)
+        }
     }
 
     companion object {

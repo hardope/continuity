@@ -69,7 +69,9 @@ data class NowPlayingSnapshot(
  * once per MB) and removed the moment the transfer ends, successfully or
  * not. [fileName]/[peerName] come from the `FileSending`/`FileReceiving`
  * event that always precedes the first progress event; they're only null
- * if a progress event somehow won that race. */
+ * if a progress event somehow won that race. [stalled] is set by
+ * `FileTransferStalled` (the connection dropped and the engine is waiting
+ * to resume) and cleared by the next progress event, which means it did. */
 data class TransferProgress(
     val id: String,
     val direction: FfiFileTransferDirection,
@@ -77,6 +79,7 @@ data class TransferProgress(
     val peerName: String?,
     val bytesTransferred: Long,
     val totalBytes: Long,
+    val stalled: Boolean = false,
 )
 
 enum class ActivityKind { PAIRED, CONNECTED, DISCONNECTED, CLIPBOARD, FILE_INCOMING, FILE_RECEIVED, FILE_SENT, ERROR, RESET, FORGOTTEN, REMOTE_CONTROL, SCREEN_LOCK }
@@ -165,6 +168,13 @@ object ContinuityStore {
         _activity.update { (listOf(ActivityEntry(kind, text, tone)) + it).take(MAX_ACTIVITY) }
     }
 
+    /** For problems the engine doesn't know about — a received file that
+     * couldn't be moved into the chosen folder (see ReceivedFiles) — so
+     * they're in the activity feed even with notifications turned off. */
+    fun logWarning(text: String) {
+        log(ActivityKind.ERROR, text, Tone.WARNING)
+    }
+
     fun onEvent(event: FfiSyncEvent) {
         when (event) {
             is FfiSyncEvent.PairingRequested -> _pendingPairing.value = PendingPairing(event.peer, event.code)
@@ -212,9 +222,14 @@ object ContinuityStore {
             is FfiSyncEvent.FileTransferProgress -> {
                 _transfers.update {
                     val existing = it[event.transferId]
-                    val updated = existing?.copy(bytesTransferred = event.bytesTransferred.toLong(), totalBytes = event.totalBytes.toLong())
+                    val updated = existing?.copy(bytesTransferred = event.bytesTransferred.toLong(), totalBytes = event.totalBytes.toLong(), stalled = false)
                         ?: TransferProgress(event.transferId, event.direction, null, null, event.bytesTransferred.toLong(), event.totalBytes.toLong())
                     it + (event.transferId to updated)
+                }
+            }
+            is FfiSyncEvent.FileTransferStalled -> {
+                _transfers.update { transfers ->
+                    transfers[event.transferId]?.let { transfers + (event.transferId to it.copy(stalled = true)) } ?: transfers
                 }
             }
             is FfiSyncEvent.FileReceived -> {

@@ -30,6 +30,7 @@ import androidx.compose.material.icons.filled.Error
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.FileUpload
+import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Inbox
 import androidx.compose.material.icons.filled.Link
@@ -85,6 +86,8 @@ import app.continuity.android.ActivityKind
 import app.continuity.android.DeviceStatus
 import app.continuity.android.EngineHolder
 import app.continuity.android.NowPlayingSnapshot
+import app.continuity.android.ReceivedFiles
+import app.continuity.android.ReceivedFolder
 import app.continuity.android.TransferProgress
 import uniffi.continuity_ffi.FfiMediaCommand
 
@@ -98,9 +101,12 @@ internal fun HomeScreen(
     activity: List<ActivityEntry>,
     isPaused: Boolean,
     deviceId: String?,
+    receivedFolder: ReceivedFolder,
     snackbarHostState: SnackbarHostState,
     onOpenDevice: (String) -> Unit,
     onSendFiles: () -> Unit,
+    onChangeReceivedFolder: () -> Unit,
+    onUseDownloads: () -> Unit,
     onReset: () -> Unit,
     onQuit: () -> Unit,
 ) {
@@ -208,6 +214,8 @@ internal fun HomeScreen(
                 Spacer(Modifier.width(8.dp))
                 Text(if (connectedCount > 0) "Send files to..." else "Send files...")
             }
+
+            ReceivedFilesRow(folder = receivedFolder, onChange = onChangeReceivedFolder, onUseDownloads = onUseDownloads)
 
             DeviceIdRow(deviceId = deviceId, onCopy = {
                 val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
@@ -411,6 +419,58 @@ private fun NearbyDevicesCard(nearby: Map<String, String>, onConnect: (String) -
                     TextButton(onClick = { onConnect(peerId) }) { Text("Connect") }
                 }
             }
+        }
+    }
+}
+
+/** Where received files go, and the one setting for it. "Change" picks
+ * another folder with the system folder picker; files still arrive in
+ * Download/Continuity first and are moved there once complete (see
+ * ReceivedFiles), as the line under it says — next to "Use Downloads",
+ * which goes back to leaving them in Download/Continuity. Also says so
+ * when Download/Continuity couldn't be used and files go to the app's own
+ * folder instead. */
+@Composable
+private fun ReceivedFilesRow(folder: ReceivedFolder, onChange: () -> Unit, onUseDownloads: () -> Unit) {
+    val custom = folder.customTreeLabel
+    val engineDir = folder.engineDirLabel ?: ReceivedFiles.DOWNLOADS_LABEL
+    // Lined up with the first line's text, past its icon.
+    val indent = Modifier.padding(start = 24.dp)
+    Column {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Icon(Icons.Default.Folder, contentDescription = null, modifier = Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(
+                "Received files: ${custom ?: engineDir}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.weight(1f),
+            )
+            TextButton(onClick = onChange) { Text("Change") }
+        }
+        if (custom != null) {
+            Row(modifier = indent, verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "Files arrive in $engineDir first and are moved there once complete.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.weight(1f),
+                )
+                TextButton(onClick = onUseDownloads) { Text("Use Downloads") }
+            }
+        }
+        folder.fallbackNote?.let { note ->
+            Text(note, style = MaterialTheme.typography.bodySmall, color = warningColor(), modifier = indent)
+        }
+        folder.oldFilesLabel?.let { old ->
+            Text(
+                "Files received before are still in $old.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = indent,
+            )
         }
     }
 }

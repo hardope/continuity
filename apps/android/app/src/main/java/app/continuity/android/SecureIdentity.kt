@@ -10,13 +10,23 @@ import uniffi.continuity_ffi.generateIdentityDer
  * Persists this device's identity (PKCS8 DER bytes) and a chosen display
  * name via Android Keystore-backed encrypted storage. `continuity-crypto`
  * has no Android backend of its own — see the FFI layer's doc comment on
- * `ContinuityEngine.start` for why storage lives here instead.
+ * `ContinuityEngine.start` for why storage lives here instead. The app's
+ * one other setting, the folder received files are moved to (see
+ * [ReceivedFiles]), is kept here too rather than in a second preferences
+ * file.
  */
 object SecureIdentity {
     private const val PREFS_FILE = "continuity_identity"
     private const val KEY_IDENTITY_DER = "identity_der"
     private const val KEY_DEVICE_NAME = "device_name"
+    private const val KEY_RECEIVED_FILES_TREE = "received_files_tree_uri"
 
+    // Synchronized: the service (starting the engine) and the activity
+    // (showing the received-files folder) can both open this at once on a
+    // first run, and two EncryptedSharedPreferences created concurrently
+    // can each generate and write their own keyset — the loser's values
+    // then can't be decrypted.
+    @Synchronized
     private fun prefs(context: Context) = EncryptedSharedPreferences.create(
         context,
         PREFS_FILE,
@@ -48,5 +58,13 @@ object SecureIdentity {
 
     fun setDeviceName(context: Context, name: String) {
         prefs(context).edit().putString(KEY_DEVICE_NAME, name).apply()
+    }
+
+    /** The SAF tree Uri chosen with "Change folder", or null for the default (Download/Continuity). */
+    fun receivedFilesTreeUri(context: Context): String? =
+        prefs(context).getString(KEY_RECEIVED_FILES_TREE, null)
+
+    fun setReceivedFilesTreeUri(context: Context, uri: String?) {
+        prefs(context).edit().apply { if (uri == null) remove(KEY_RECEIVED_FILES_TREE) else putString(KEY_RECEIVED_FILES_TREE, uri) }.apply()
     }
 }

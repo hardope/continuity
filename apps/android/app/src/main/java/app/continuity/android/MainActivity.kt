@@ -157,13 +157,25 @@ class MainActivity : ComponentActivity() {
 
         maybeRequestNotificationPermission()
         maybeRequestNearbyWifiDevicesPermission()
+        maybeRequestStoragePermission()
         ContextCompat.startForegroundService(this, Intent(this, ContinuityForegroundService::class.java))
 
         setContent {
             ContinuityTheme {
-                ContinuityApp(onPickFiles = { launchFilePicker(it) })
+                ContinuityApp(
+                    onPickFiles = { launchFilePicker(it) },
+                    onPickReceivedFolder = { launchFolderPicker() },
+                )
             }
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Besides the permission dialog's own answer (see requestStorage),
+        // the storage permission can be granted from system Settings while
+        // the app is in the background.
+        ReceivedFiles.refreshAsync(this)
     }
 
     private val pickFiles = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
@@ -173,6 +185,23 @@ class MainActivity : ComponentActivity() {
     private fun launchFilePicker(onPicked: (List<Uri>) -> Unit) {
         pickFilesCallback = onPicked
         pickFiles.launch(arrayOf("*/*"))
+    }
+
+    // OpenDocumentTree, not a path: the Storage Access Framework is the
+    // only way to write to an arbitrary folder (another one on the phone,
+    // an SD card, a cloud drive) — ReceivedFiles takes the persistable
+    // grant and moves each finished file there.
+    private val pickReceivedFolder = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        if (uri != null) ReceivedFiles.chooseTree(this, uri)
+    }
+
+    private fun launchFolderPicker() {
+        try {
+            pickReceivedFolder.launch(null)
+        } catch (e: android.content.ActivityNotFoundException) {
+            // Some stripped-down builds (TV, Go editions) have no picker.
+            ContinuityStore.notice("This device has no folder picker")
+        }
     }
 
     private val requestNotifications =
@@ -203,6 +232,23 @@ class MainActivity : ComponentActivity() {
             requestNearbyWifiDevices.launch(Manifest.permission.NEARBY_WIFI_DEVICES)
         }
     }
+
+    private val requestStorage =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { ReceivedFiles.refreshAsync(this) }
+
+    // Received files go to the public Download/Continuity folder, which
+    // Android 10 and older only let an app write to by path with this
+    // permission (Android 10 via requestLegacyExternalStorage — see the
+    // manifest and ReceivedFiles). Declined, files go to the app's own
+    // folder instead and the home screen says so; 11+ never needs it.
+    private fun maybeRequestStoragePermission() {
+        if (Build.VERSION.SDK_INT > Build.VERSION_CODES.Q) return
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            requestStorage.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+        }
+    }
 }
 
 /** The app's two screens — the device list, and one device's own page —
@@ -211,7 +257,7 @@ class MainActivity : ComponentActivity() {
  * from [ContinuityStore], so it's the same no matter how long the app was
  * away from the foreground. */
 @Composable
-private fun ContinuityApp(onPickFiles: ((List<Uri>) -> Unit) -> Unit) {
+private fun ContinuityApp(onPickFiles: ((List<Uri>) -> Unit) -> Unit, onPickReceivedFolder: () -> Unit) {
     val context = LocalContext.current
     val devices by ContinuityStore.devices.collectAsStateWithLifecycle()
     val nearby by ContinuityStore.nearby.collectAsStateWithLifecycle()
@@ -223,6 +269,7 @@ private fun ContinuityApp(onPickFiles: ((List<Uri>) -> Unit) -> Unit) {
     val pendingPairing by ContinuityStore.pendingPairing.collectAsStateWithLifecycle()
     val remoteSession by ContinuityStore.remoteSession.collectAsStateWithLifecycle()
     val remoteFrame by ContinuityStore.remoteFrame.collectAsStateWithLifecycle()
+    val receivedFolder by ReceivedFiles.folder.collectAsStateWithLifecycle()
 
     var selectedPeerId by rememberSaveable { mutableStateOf<String?>(null) }
     var showResetConfirm by remember { mutableStateOf(false) }
@@ -266,6 +313,7 @@ private fun ContinuityApp(onPickFiles: ((List<Uri>) -> Unit) -> Unit) {
             activity = activity,
             isPaused = isPaused,
             deviceId = deviceId,
+            receivedFolder = receivedFolder,
             snackbarHostState = snackbarHostState,
             onOpenDevice = { selectedPeerId = it },
             onSendFiles = {
@@ -274,9 +322,16 @@ private fun ContinuityApp(onPickFiles: ((List<Uri>) -> Unit) -> Unit) {
                 showSendPicker = only == null
                 if (only != null) sendFiles(listOf(only.id))
             },
+            onChangeReceivedFolder = onPickReceivedFolder,
+            onUseDownloads = { ReceivedFiles.useDownloads(context) },
             onReset = { showResetConfirm = true },
             onQuit = {
                 context.stopService(Intent(context, ContinuityForegroundService::class.java))
+                // The process is killed below, likely before the service's
+                // onDestroy runs — and an in-progress transfer's
+                // notification is ongoing (can't be swiped away), so it
+                // would otherwise stay up with nothing left to end it.
+                TransferNotifications.cancelAllActive(context)
                 (context as? Activity)?.finishAndRemoveTask()
                 // stopService()/finishAndRemoveTask() don't
                 // guarantee the process actually dies — Android
