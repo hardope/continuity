@@ -520,6 +520,110 @@ async fn a_misbehaving_v3_sender_is_held_to_the_limits() {
     finish(vec![engine], &[&received_dir], &[]);
 }
 
+/// Sends `source` from A to B and has `canceller` cancel it at its first
+/// progress event. Returns everything seen until both sides have reported
+/// it failed (or something finished, which the caller then fails on).
+async fn cancel_midway(a: &mut EngineHandle, b: &mut EngineHandle, b_id: &str, source: &Path, canceller: Side) -> Vec<(Side, SyncEvent)> {
+    a.send_command(EngineCommand::SendFile { peer_crypto_id: b_id.to_string(), path: source.display().to_string() });
+    let mut log: Vec<(Side, SyncEvent)> = Vec::new();
+    // This transfer, as the sender announces it — a cancelled one before
+    // it can still be finishing off its last few frames' progress.
+    let mut this: Option<String> = None;
+    let mut cancelled = false;
+    let deadline = tokio::time::sleep(Duration::from_secs(60));
+    tokio::pin!(deadline);
+    loop {
+        let failed = |side| log.iter().any(|(s, e)| *s == side && matches!(e, SyncEvent::FileTransferFailed { transfer_id, .. } if Some(transfer_id) == this.as_ref()));
+        let finished = log.iter().any(|(_, e)| matches!(e, SyncEvent::FileSent { .. } | SyncEvent::FileReceived { .. }));
+        if failed(Side::A) && failed(Side::B) || finished {
+            return log;
+        }
+        let (side, event) = tokio::select! {
+            _ = &mut deadline => return log,
+            Some(event) = a.events.recv() => (Side::A, event),
+            Some(event) = b.events.recv() => (Side::B, event),
+        };
+        match &event {
+            SyncEvent::FileReceiving { transfer_id, .. } | SyncEvent::FileSending { transfer_id, .. } if this.is_none() => {
+                this = Some(transfer_id.clone());
+            }
+            SyncEvent::FileTransferProgress { transfer_id, .. }
+                if !cancelled && side == canceller && Some(transfer_id) == this.as_ref() =>
+            {
+                let engine = if side == Side::A { &*a } else { &*b };
+                engine.send_command(EngineCommand::CancelTransfer { transfer_id: transfer_id.clone() });
+                cancelled = true;
+            }
+            _ => {}
+        }
+        log.push((side, event));
+    }
+}
+
+/// What a cancelled transfer has to look like: the canceller reports
+/// "Cancelled", the other side that the canceller cancelled it, nothing was
+/// sent or received, and nothing is left in the receiver's folder.
+async fn assert_cancelled(log: &[(Side, SyncEvent)], canceller: (Side, &str), b_dir: &Path) {
+    let reasons = |side| {
+        log.iter()
+            .filter_map(|(s, e)| match e {
+                SyncEvent::FileTransferFailed { reason, .. } if *s == side => Some(reason.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let (by, by_name) = canceller;
+    let other = if by == Side::A { Side::B } else { Side::A };
+    assert_eq!(reasons(by), vec!["Cancelled".to_string()], "{log:?}");
+    assert_eq!(reasons(other), vec![format!("Cancelled on '{by_name}'")], "{log:?}");
+    assert_eq!(count(log, Side::A, |e| matches!(e, SyncEvent::FileSent { .. })), 0);
+    assert_eq!(count(log, Side::B, |e| matches!(e, SyncEvent::FileReceived { .. })), 0);
+    // The receiver's partial file goes once its writer lets go of it.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while std::fs::read_dir(b_dir).map(|mut d| d.next().is_some()).unwrap_or(false) && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let left: Vec<_> = std::fs::read_dir(b_dir).map(|d| d.filter_map(|e| e.ok()).map(|e| e.file_name()).collect()).unwrap_or_default();
+    assert!(left.is_empty(), "left in the received folder: {left:?}");
+}
+
+/// Cancelling a transfer over the data connection, from either end, stops
+/// it on both, and the other device says who cancelled it.
+#[tokio::test]
+async fn a_transfer_can_be_cancelled_from_either_end() {
+    let (mut a, mut b, _a_id, b_id, a_dir, b_dir) = connected_pair("CancelA", "CancelB").await;
+    let source_dir = temp_dir("cancel-source");
+    let source = source_dir.join("big.mov");
+    write_test_file(&source, 48 * MIB, 21);
+
+    let log = cancel_midway(&mut a, &mut b, &b_id, &source, Side::A).await;
+    assert_cancelled(&log, (Side::A, "CancelA"), &b_dir).await;
+    let log = cancel_midway(&mut a, &mut b, &b_id, &source, Side::B).await;
+    assert_cancelled(&log, (Side::B, "CancelB"), &b_dir).await;
+    assert_eq!(b.test_hooks().in_band_files_received.load(Ordering::Relaxed), 0);
+
+    finish(vec![a, b], &[&a_dir, &b_dir], &[&source_dir]);
+}
+
+/// The same for a transfer that went in-band (as with a peer on an older
+/// version), which this device can't reach in its own task: the
+/// cancellation still reaches both ends.
+#[tokio::test]
+async fn an_in_band_transfer_can_be_cancelled_from_either_end() {
+    let (mut a, mut b, _a_id, b_id, a_dir, b_dir) = connected_pair("InBandCancelA", "InBandCancelB").await;
+    a.test_hooks().force_in_band.store(true, Ordering::Relaxed);
+    let source_dir = temp_dir("in-band-cancel-source");
+    let source = source_dir.join("big.mov");
+    write_test_file(&source, 48 * MIB, 22);
+
+    let log = cancel_midway(&mut a, &mut b, &b_id, &source, Side::A).await;
+    assert_cancelled(&log, (Side::A, "InBandCancelA"), &b_dir).await;
+    let log = cancel_midway(&mut a, &mut b, &b_id, &source, Side::B).await;
+    assert_cancelled(&log, (Side::B, "InBandCancelB"), &b_dir).await;
+
+    finish(vec![a, b], &[&a_dir, &b_dir], &[&source_dir]);
+}
+
 /// The mesh connection going down too while a transfer is stalled: the
 /// sender waits for the peer to come back, re-offers on the new mesh
 /// connection — whose arrival the receiver has to tell apart from a data

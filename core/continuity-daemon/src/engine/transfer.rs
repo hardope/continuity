@@ -1521,6 +1521,99 @@ fn read_for_stream(path: &Path, offset: u64, size: u64, chunks: mpsc::Sender<Vec
 // Cancelling and expiry
 // ---------------------------------------------------------------------------
 
+/// Why a transfer cancelled on this device is reported failed.
+const CANCELLED: &str = crate::events::TRANSFER_CANCELLED;
+
+/// An in-band transfer cancelled before its own task has noticed (see
+/// `cancel_in_band`): why, and whether the peer still has to be told — not
+/// when it's the one that cancelled.
+pub(super) struct InBandCancel {
+    pub reason: String,
+    pub tell_peer: bool,
+}
+
+/// `EngineCommand::CancelTransfer`: ends one transfer under way, sending or
+/// receiving, and tells the other device when it understands `FileCancel`.
+/// A finished or unknown id does nothing (beyond an in-band note nothing
+/// will ever look at).
+pub(super) fn cancel_transfer(state: &Arc<SharedState>, transfer_id: &str) {
+    if let Some(peer_id) = take_outgoing(state, transfer_id, None) {
+        tell_peer(state, &peer_id, transfer_id);
+        state.emit(SyncEvent::FileTransferFailed { transfer_id: transfer_id.to_string(), reason: CANCELLED.to_string() });
+        return;
+    }
+    if let Some(key) = unfinished_incoming(state, transfer_id, None) {
+        if discard_incoming(state, &key, Some(CANCELLED)) {
+            tell_peer(state, &key.0, transfer_id);
+        }
+        return;
+    }
+    cancel_in_band(state, transfer_id, CANCELLED.to_string(), true);
+}
+
+/// A `FileCancel` from `peer`: ends that transfer the same way, reported as
+/// the peer's doing, with nothing sent back.
+pub(super) fn cancelled_by_peer(state: &Arc<SharedState>, peer: &DeviceInfo, transfer_id: &str) {
+    let reason = format!("Cancelled on '{}'", peer.name);
+    if take_outgoing(state, transfer_id, Some(&peer.id)).is_some() {
+        state.emit(SyncEvent::FileTransferFailed { transfer_id: transfer_id.to_string(), reason });
+        return;
+    }
+    if let Some(key) = unfinished_incoming(state, transfer_id, Some(&peer.id)) {
+        discard_incoming(state, &key, Some(&reason));
+        return;
+    }
+    cancel_in_band(state, transfer_id, reason, false);
+}
+
+/// Takes an outgoing v3 transfer out of `outgoing_transfers` (with `peer_id`
+/// only if it's with that peer) and stops its task — whose own end then
+/// reports nothing, finding its entry gone. Returns the peer it was with.
+fn take_outgoing(state: &SharedState, transfer_id: &str, peer_id: Option<&str>) -> Option<String> {
+    let mut outgoing = state.outgoing_transfers.lock().unwrap();
+    if peer_id.is_some_and(|p| outgoing.get(transfer_id).is_none_or(|o| o.peer_id != p)) {
+        return None;
+    }
+    let transfer = outgoing.remove(transfer_id)?;
+    transfer.cancel.notify_one();
+    Some(transfer.peer_id)
+}
+
+/// The key of an incoming v3 transfer with this id that's still going (from
+/// `peer_id` only, if given) — not one already saved or failed.
+fn unfinished_incoming(state: &SharedState, transfer_id: &str, peer_id: Option<&str>) -> Option<(String, String)> {
+    state
+        .incoming_transfers
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|((peer, id), e)| {
+            id == transfer_id && peer_id.is_none_or(|p| p == peer) && !matches!(e.phase, Phase::Completed { .. } | Phase::Failed { .. })
+        })
+        .map(|(key, _)| key.clone())
+}
+
+/// Tells `peer_id` a transfer with it was cancelled here — if it's connected
+/// and understands `FileCancel` (v3; a v2 peer would only skip it).
+pub(super) fn tell_peer(state: &SharedState, peer_id: &str, transfer_id: &str) {
+    let understands = state.peer_protocol_versions.lock().unwrap().get(peer_id).is_some_and(|&v| v >= 3);
+    if let (true, Some(tx)) = (understands, peer_sender(state, peer_id)) {
+        let _ = tx.send(Message::FileCancel { transfer_id: transfer_id.to_string() });
+    }
+}
+
+/// An in-band transfer isn't anywhere this can reach: its sending loop and
+/// its receiving entry belong to their own tasks. So the cancellation is
+/// left where they look, on their next chunk either way (`send_in_band`,
+/// `handle_file_chunk`), and a sending loop waiting for room in its window
+/// is woken by closing the window.
+fn cancel_in_band(state: &SharedState, transfer_id: &str, reason: String, tell_peer: bool) {
+    state.cancelled_in_band.lock().unwrap().insert(transfer_id.to_string(), InBandCancel { reason, tell_peer });
+    if let Some(window) = state.file_send_windows.lock().unwrap().get(transfer_id) {
+        window.close();
+    }
+}
+
 /// Ends every v3 transfer with `peer_id` (or with everyone, for `None`),
 /// both directions, reporting each with `reason` and deleting partial
 /// files. For `DisconnectPeer`, `RevokeDevice` and `Reset` — v3 transfers

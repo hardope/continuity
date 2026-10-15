@@ -812,6 +812,8 @@ internal open class UniffiVTableCallbackInterfaceEventListener(
 
 
 
+
+
 // A JNA Library to expose the extern-C FFI definitions.
 // This is an implementation detail which will be called internally by the public API.
 
@@ -849,6 +851,8 @@ internal interface UniffiLib : Library {
     ): Unit
     fun uniffi_continuity_ffi_fn_constructor_continuityengine_start(`identityDer`: RustBuffer.ByValue,`profile`: RustBuffer.ByValue,`deviceName`: RustBuffer.ByValue,`dataDir`: RustBuffer.ByValue,`receivedFilesDir`: RustBuffer.ByValue,`clipboard`: Pointer,`listener`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Pointer
+    fun uniffi_continuity_ffi_fn_method_continuityengine_cancel_transfer(`ptr`: Pointer,`transferId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     fun uniffi_continuity_ffi_fn_method_continuityengine_confirm_pairing(`ptr`: Pointer,`peerId`: RustBuffer.ByValue,`accept`: Byte,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_continuity_ffi_fn_method_continuityengine_disconnect_peer(`ptr`: Pointer,`peerId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -1019,6 +1023,8 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_continuity_ffi_checksum_method_clipboardprovider_set_text(
     ): Short
+    fun uniffi_continuity_ffi_checksum_method_continuityengine_cancel_transfer(
+    ): Short
     fun uniffi_continuity_ffi_checksum_method_continuityengine_confirm_pairing(
     ): Short
     fun uniffi_continuity_ffi_checksum_method_continuityengine_disconnect_peer(
@@ -1087,6 +1093,9 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_continuity_ffi_checksum_method_clipboardprovider_set_text() != 26707.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_continuity_ffi_checksum_method_continuityengine_cancel_transfer() != 50079.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_continuity_ffi_checksum_method_continuityengine_confirm_pairing() != 25048.toShort()) {
@@ -1911,6 +1920,14 @@ public object FfiConverterTypeClipboardProvider: FfiConverter<ClipboardProvider,
  */
 public interface ContinuityEngineInterface {
     
+    /**
+     * Stops a file transfer under way, sending or receiving — the
+     * `transfer_id` from its `FileSending`/`FileReceiving`. The other
+     * device stops too when it can, and both report it with
+     * `FfiSyncEvent::FileTransferFailed`.
+     */
+    fun `cancelTransfer`(`transferId`: kotlin.String)
+    
     fun `confirmPairing`(`peerId`: kotlin.String, `accept`: kotlin.Boolean)
     
     /**
@@ -2130,6 +2147,23 @@ open class ContinuityEngine: Disposable, AutoCloseable, ContinuityEngineInterfac
             UniffiLib.INSTANCE.uniffi_continuity_ffi_fn_clone_continuityengine(pointer!!, status)
         }
     }
+
+    
+    /**
+     * Stops a file transfer under way, sending or receiving — the
+     * `transfer_id` from its `FileSending`/`FileReceiving`. The other
+     * device stops too when it can, and both report it with
+     * `FfiSyncEvent::FileTransferFailed`.
+     */override fun `cancelTransfer`(`transferId`: kotlin.String)
+        = 
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_continuity_ffi_fn_method_continuityengine_cancel_transfer(
+        it, FfiConverterString.lower(`transferId`),_status)
+}
+    }
+    
+    
 
     override fun `confirmPairing`(`peerId`: kotlin.String, `accept`: kotlin.Boolean)
         = 

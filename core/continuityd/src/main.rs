@@ -648,6 +648,9 @@ fn handle_sync_event(
         SyncEvent::FileSent { file_name, to_name, .. } => {
             notify(&format!("Sent '{file_name}' to '{to_name}'"));
         }
+        // A transfer cancelled here was the user's own doing: the window
+        // shows it ended, without a notification about it.
+        SyncEvent::FileTransferFailed { reason, .. } if reason == continuity_daemon::TRANSFER_CANCELLED => {}
         SyncEvent::FileTransferFailed { reason, .. } => {
             notify(&format!("File transfer failed: {reason}"));
         }

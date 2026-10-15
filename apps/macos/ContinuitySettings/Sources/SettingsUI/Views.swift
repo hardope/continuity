@@ -491,6 +491,10 @@ struct TransferRow: View {
                 Button("Open") { model.openTransfer(transfer, reveal: false) }
                 Button("Show in Finder") { model.openTransfer(transfer, reveal: true) }
             }
+            if transfer.canBeCancelled {
+                Button("Cancel") { model.cancelTransfer(transfer) }
+                    .help("Stop sending or receiving \(transfer.fileName)")
+            }
         }
     }
 

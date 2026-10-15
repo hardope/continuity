@@ -783,6 +783,14 @@ public func FfiConverterTypeClipboardProvider_lower(_ value: ClipboardProvider) 
  */
 public protocol ContinuityEngineProtocol : AnyObject {
     
+    /**
+     * Stops a file transfer under way, sending or receiving — the
+     * `transfer_id` from its `FileSending`/`FileReceiving`. The other
+     * device stops too when it can, and both report it with
+     * `FfiSyncEvent::FileTransferFailed`.
+     */
+    func cancelTransfer(transferId: String) 
+    
     func confirmPairing(peerId: String, accept: Bool) 
     
     /**
@@ -995,6 +1003,19 @@ public static func start(identityDer: Data, profile: String, deviceName: String,
 }
     
 
+    
+    /**
+     * Stops a file transfer under way, sending or receiving — the
+     * `transfer_id` from its `FileSending`/`FileReceiving`. The other
+     * device stops too when it can, and both report it with
+     * `FfiSyncEvent::FileTransferFailed`.
+     */
+open func cancelTransfer(transferId: String) {try! rustCall() {
+    uniffi_continuity_ffi_fn_method_continuityengine_cancel_transfer(self.uniffiClonePointer(),
+        FfiConverterString.lower(transferId),$0
+    )
+}
+}
     
 open func confirmPairing(peerId: String, accept: Bool) {try! rustCall() {
     uniffi_continuity_ffi_fn_method_continuityengine_confirm_pairing(self.uniffiClonePointer(),
@@ -2849,6 +2870,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_continuity_ffi_checksum_method_clipboardprovider_set_text() != 26707) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_continuity_ffi_checksum_method_continuityengine_cancel_transfer() != 50079) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_continuity_ffi_checksum_method_continuityengine_confirm_pairing() != 25048) {

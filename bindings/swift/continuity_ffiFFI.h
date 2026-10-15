@@ -329,6 +329,11 @@ void uniffi_continuity_ffi_fn_free_continuityengine(void*_Nonnull ptr, RustCallS
 void*_Nonnull uniffi_continuity_ffi_fn_constructor_continuityengine_start(RustBuffer identity_der, RustBuffer profile, RustBuffer device_name, RustBuffer data_dir, RustBuffer received_files_dir, void*_Nonnull clipboard, void*_Nonnull listener, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CONTINUITY_FFI_FN_METHOD_CONTINUITYENGINE_CANCEL_TRANSFER
+#define UNIFFI_FFIDEF_UNIFFI_CONTINUITY_FFI_FN_METHOD_CONTINUITYENGINE_CANCEL_TRANSFER
+void uniffi_continuity_ffi_fn_method_continuityengine_cancel_transfer(void*_Nonnull ptr, RustBuffer transfer_id, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CONTINUITY_FFI_FN_METHOD_CONTINUITYENGINE_CONFIRM_PAIRING
 #define UNIFFI_FFIDEF_UNIFFI_CONTINUITY_FFI_FN_METHOD_CONTINUITYENGINE_CONFIRM_PAIRING
 void uniffi_continuity_ffi_fn_method_continuityengine_confirm_pairing(void*_Nonnull ptr, RustBuffer peer_id, int8_t accept, RustCallStatus *_Nonnull out_status
@@ -758,6 +763,12 @@ uint16_t uniffi_continuity_ffi_checksum_method_clipboardprovider_get_text(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CONTINUITY_FFI_CHECKSUM_METHOD_CLIPBOARDPROVIDER_SET_TEXT
 #define UNIFFI_FFIDEF_UNIFFI_CONTINUITY_FFI_CHECKSUM_METHOD_CLIPBOARDPROVIDER_SET_TEXT
 uint16_t uniffi_continuity_ffi_checksum_method_clipboardprovider_set_text(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CONTINUITY_FFI_CHECKSUM_METHOD_CONTINUITYENGINE_CANCEL_TRANSFER
+#define UNIFFI_FFIDEF_UNIFFI_CONTINUITY_FFI_CHECKSUM_METHOD_CONTINUITYENGINE_CANCEL_TRANSFER
+uint16_t uniffi_continuity_ffi_checksum_method_continuityengine_cancel_transfer(void
     
 );
 #endif

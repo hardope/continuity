@@ -2,6 +2,7 @@ package app.continuity.android.ui
 
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Card
@@ -10,9 +11,12 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import app.continuity.android.EngineHolder
 import app.continuity.android.TransferProgress
 import uniffi.continuity_ffi.FfiFileTransferDirection
 
@@ -21,7 +25,9 @@ import uniffi.continuity_ffi.FfiFileTransferDirection
  * simultaneous transfers to/from different devices each get their own row
  * rather than being conflated into one. A stalled transfer (its connection
  * dropped; the engine resumes it from where it stopped once the other
- * device is back) keeps its bar where it got to and says it's waiting. */
+ * device is back) keeps its bar where it got to and says it's waiting.
+ * Cancel stops it on both devices; the row goes once the engine reports it
+ * (as a failed transfer, "Cancelled"). */
 @Composable
 internal fun TransfersCard(transfers: List<TransferProgress>, modifier: Modifier = Modifier) {
     Card(
@@ -35,7 +41,10 @@ internal fun TransfersCard(transfers: List<TransferProgress>, modifier: Modifier
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
                     verticalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
-                    Text(transferLabel(transfer), style = MaterialTheme.typography.titleMedium)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(transferLabel(transfer), style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+                        TextButton(onClick = { EngineHolder.engine?.cancelTransfer(transfer.id) }) { Text("Cancel") }
+                    }
                     // `totalBytes` is only ever 0 in the brief instant before
                     // `FileSending`/`FileReceiving` (which always carries the
                     // real size) has been processed for a brand new transfer

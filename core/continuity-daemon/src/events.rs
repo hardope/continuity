@@ -166,6 +166,12 @@ pub enum SyncEvent {
     UnlockPermissionChanged { peer_id: String, peer_name: String, allowed: bool },
 }
 
+/// The `SyncEvent::FileTransferFailed` reason for a transfer cancelled on
+/// this device (`EngineCommand::CancelTransfer`) — what a shell can check
+/// to not announce, as a failure, something the user just did. (The other
+/// device gets "Cancelled on '<this device>'", which is news to it.)
+pub const TRANSFER_CANCELLED: &str = "Cancelled";
+
 /// Requests a shell makes of the engine. Sent over the channel returned by
 /// `EngineHandle::commands`.
 #[derive(Debug, Clone)]
@@ -178,6 +184,13 @@ pub enum EngineCommand {
     /// If it can't be created or written to, emits `SyncEvent::Error` and
     /// keeps the previous directory.
     SetReceivedFilesDir { path: String },
+    /// Stops a file transfer under way, sending or receiving (`transfer_id`
+    /// from its `FileSending`/`FileReceiving`). The other device is told
+    /// when it understands that (v3) and stops too; the receiving side
+    /// deletes what it has of the file. Both report it with
+    /// `SyncEvent::FileTransferFailed`. An id that's finished or unknown
+    /// does nothing.
+    CancelTransfer { transfer_id: String },
     /// Clears the trust store and disconnects every active peer, as if
     /// freshly installed. Every previously paired device will need to be
     /// paired again.

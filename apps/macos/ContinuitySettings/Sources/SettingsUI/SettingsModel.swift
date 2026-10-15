@@ -162,6 +162,13 @@ public final class SettingsModel: ObservableObject {
         perform(["op": "open_transfer", "id": transfer.id, "reveal": reveal])
     }
 
+    /// Stops a transfer that's still moving, either way. The other device
+    /// stops too when it can; the next status shows it failed, as
+    /// cancelled.
+    public func cancelTransfer(_ transfer: Transfer) {
+        perform(["op": "cancel_transfer", "id": transfer.id])
+    }
+
     /// Selects the log in Finder — what to attach to a bug report.
     public func showLogFile() {
         guard let log = status?.about?.logFile else { return }

@@ -524,6 +524,14 @@ impl ContinuityEngine {
         let _ = self.commands.send(EngineCommand::SetReceivedFilesDir { path });
     }
 
+    /// Stops a file transfer under way, sending or receiving — the
+    /// `transfer_id` from its `FileSending`/`FileReceiving`. The other
+    /// device stops too when it can, and both report it with
+    /// `FfiSyncEvent::FileTransferFailed`.
+    pub fn cancel_transfer(&self, transfer_id: String) {
+        let _ = self.commands.send(EngineCommand::CancelTransfer { transfer_id });
+    }
+
     /// Clears every paired device and disconnects all active peers — the
     /// host app should confirm with the user before calling this, there's
     /// no undo.

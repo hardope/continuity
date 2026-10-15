@@ -66,6 +66,7 @@ final class ControlClientTests: XCTestCase {
         XCTAssertEqual(transfers[3].sizeBytes, 5_000_000_000, "bigger than 32 bits")
         XCTAssertEqual(transfers[3].reason, "Not enough free space on Pixel 8 (needs 5 GB, 300 MB free)")
         XCTAssertEqual(transfers.map(\.canBeOpened), [false, false, true, false], "only a received file that's done")
+        XCTAssertEqual(transfers.map(\.canBeCancelled), [true, true, false, false], "only one still moving")
     }
 
     func testAContinuitydWithoutTransfersStillDecodes() throws {
@@ -165,8 +166,8 @@ final class ControlClientTests: XCTestCase {
     /// (`requests_parse_by_op` in core/continuityd/src/control.rs).
     @MainActor
     func testTransfersFoldersAndRemoteControlRequests() async throws {
-        let arrived = expectation(description: "five requests")
-        arrived.expectedFulfillmentCount = 5
+        let arrived = expectation(description: "six requests")
+        arrived.expectedFulfillmentCount = 6
         var requests: [String: [String: Any]] = [:]
         let server = try FakeContinuityd(token: "secret") { request in
             XCTAssertEqual(request["token"] as? String, "secret")
@@ -190,6 +191,7 @@ final class ControlClientTests: XCTestCase {
         model.openReceivedFilesDir()
         model.openTransfer(photo, reveal: true)
         model.refreshNearby()
+        model.cancelTransfer(photo)
         await fulfillment(of: [arrived], timeout: 5)
         server.stop()
 
@@ -199,6 +201,7 @@ final class ControlClientTests: XCTestCase {
         XCTAssertEqual(requests["open_transfer"]?["id"] as? String, "t2")
         XCTAssertEqual(requests["open_transfer"]?["reveal"] as? Bool, true)
         XCTAssertEqual(requests["refresh_nearby"]?.keys.sorted(), ["op", "token"])
+        XCTAssertEqual(requests["cancel_transfer"]?["id"] as? String, "t2")
     }
 
     func testNotRunningWhenThereIsNoEndpoint() async {

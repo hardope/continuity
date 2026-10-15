@@ -102,6 +102,9 @@ pub enum ControlOp {
         #[serde(default)]
         reveal: bool,
     },
+    /// Stops a transfer in the list that's still moving (or waiting to
+    /// resume), either direction. The other device stops too when it can.
+    CancelTransfer { id: String },
     /// A second launch of Continuity asking the running one to show its
     /// window (see `share.rs`'s `hand_off_to_running_instance`). Handled by
     /// the socket server, which is the only thing that can reach the window.
@@ -844,6 +847,13 @@ impl ControlState {
                 return crate::open_path(&dir).map_err(|e| format!("Couldn't open {dir}: {e}"));
             }
             ControlOp::OpenTransfer { id, reveal } => return self.open_transfer(&id, reveal),
+            ControlOp::CancelTransfer { id } => {
+                let moving = self.transfer(&id).is_some_and(|t| matches!(t.state, TransferState::Active | TransferState::Stalled));
+                if !moving {
+                    return Err("That transfer has already finished.".to_string());
+                }
+                EngineCommand::CancelTransfer { transfer_id: id }
+            }
             ControlOp::RequestPermission { permission } => {
                 #[cfg(target_os = "macos")]
                 {
@@ -1354,6 +1364,10 @@ mod tests {
             ControlOp::OpenTransfer { id: "t1".into(), reveal: false },
             "reveal defaults to opening the file itself"
         );
+        assert_eq!(
+            serde_json::from_str::<ControlOp>(r#"{"op":"cancel_transfer","id":"t1"}"#).unwrap(),
+            ControlOp::CancelTransfer { id: "t1".into() }
+        );
         assert_eq!(serde_json::from_str::<ControlOp>(r#"{"op":"refresh_nearby"}"#).unwrap(), ControlOp::RefreshNearby);
         assert_eq!(serde_json::from_str::<ControlOp>(r#"{"op":"open_window"}"#).unwrap(), ControlOp::OpenWindow);
         assert!(serde_json::from_str::<ControlOp>(r#"{"op":"set_received_files_dir"}"#).is_err(), "a path is required");
@@ -1562,6 +1576,22 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(EngineCommand::SetReceivedFilesDir { path }) if path == usb.display().to_string()));
         assert_eq!(state.status().received_files_dir, usb.display().to_string());
         assert!(std::fs::read_dir(&usb).unwrap().next().is_none(), "the write test left nothing behind");
+    }
+
+    #[test]
+    fn only_a_transfer_still_moving_can_be_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(&dir);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        state.observe(&SyncEvent::FileSending { transfer_id: "t1".into(), to_name: "Pixel".into(), file_name: "a.mov".into(), size_bytes: 10 });
+
+        state.apply(ControlOp::CancelTransfer { id: "t1".into() }, &tx).unwrap();
+        assert!(matches!(rx.try_recv(), Ok(EngineCommand::CancelTransfer { transfer_id }) if transfer_id == "t1"));
+
+        state.observe(&SyncEvent::FileTransferFailed { transfer_id: "t1".into(), reason: "Cancelled".into() });
+        assert!(state.apply(ControlOp::CancelTransfer { id: "t1".into() }, &tx).is_err(), "already over");
+        assert!(state.apply(ControlOp::CancelTransfer { id: "nope".into() }, &tx).is_err(), "not in the list");
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

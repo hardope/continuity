@@ -668,6 +668,9 @@ function transferRow(t) {
     detail = `${who} · Waiting to reconnect…`;
     tone = "warn";
     bar = `<span class="progress stalled"><span style="width:${percent(t)}%"></span></span>`;
+  }
+  if (t.state === "active" || t.state === "stalled") {
+    buttons = `<span class="buttons"><button class="btn" data-action="cancel-transfer" data-id="${esc(t.id)}">Cancel</button></span>`;
   } else if (t.state === "done") {
     const when = t.finished_at_unix ? ` ${ago(t.finished_at_unix)}` : "";
     detail = `${who} · ${bytes(t.size_bytes)} · ${sending ? "Sent" : "Received"}${when}`;
@@ -920,6 +923,9 @@ document.addEventListener("click", (event) => {
       break;
     case "reveal-transfer":
       send("open_transfer", { id, reveal: true });
+      break;
+    case "cancel-transfer":
+      send("cancel_transfer", { id });
       break;
     case "refresh-nearby":
       send("refresh_nearby");

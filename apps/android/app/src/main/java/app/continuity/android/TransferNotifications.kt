@@ -156,6 +156,11 @@ class TransferNotifications(private val context: Context) {
      * replace, so there's no file name to go on. */
     fun failed(transferId: String, reason: String) {
         val transfer = finish(transferId)
+        // Cancelled on this phone: the user's own doing, so its progress
+        // notification just goes. ("Cancelled" is the engine's
+        // TRANSFER_CANCELLED; the other device's cancel says which device
+        // and is announced.)
+        if (reason == "Cancelled") return
         if (!manager.areNotificationsEnabled()) return
         val title = when {
             transfer == null -> "File transfer failed"

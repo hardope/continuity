@@ -120,6 +120,12 @@ public struct Transfer: Decodable, Equatable, Identifiable {
         return min(1, Double(bytesDone) / Double(sizeBytes))
     }
 
+    /// Still moving, or waiting to pick up again — the only kind
+    /// continuityd will cancel (`cancel_transfer`).
+    public var canBeCancelled: Bool {
+        state == .active || state == .stalled
+    }
+
     /// A received file that finished arriving — the only kind continuityd
     /// will open or show (`open_transfer`).
     public var canBeOpened: Bool {

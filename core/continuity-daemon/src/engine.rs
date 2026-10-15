@@ -385,6 +385,9 @@ struct SharedState {
     /// `transfer::SENDS_PER_PEER` at a time, the rest waiting (see
     /// `transfer::send_over_data_channel`).
     outgoing_slots: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
+    /// In-band transfers cancelled before their own tasks noticed, by
+    /// transfer id — see `transfer::cancel_in_band`.
+    cancelled_in_band: Mutex<HashMap<String, transfer::InBandCancel>>,
     /// Space promised to every file being received, either path — see
     /// `transfer::SpaceReservations`.
     reserved_space: transfer::SpaceReservations,
@@ -1025,6 +1028,7 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
         incoming_transfers: Mutex::new(HashMap::new()),
         outgoing_transfers: Mutex::new(HashMap::new()),
         outgoing_slots: Mutex::new(HashMap::new()),
+        cancelled_in_band: Mutex::new(HashMap::new()),
         reserved_space: transfer::SpaceReservations::default(),
         incoming_transfers_changed: Notify::new(),
         next_transfer_epoch: AtomicU64::new(1),
@@ -1256,6 +1260,7 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                             send_file(&state, &peer_crypto_id, PathBuf::from(path)).await;
                         });
                     }
+                    EngineCommand::CancelTransfer { transfer_id } => transfer::cancel_transfer(&state, &transfer_id),
                     EngineCommand::SetReceivedFilesDir { path } => {
                         // Checked on the blocking pool — creating a
                         // directory and probing it is synchronous file
@@ -2053,6 +2058,16 @@ async fn handle_connection_inner(
                     // than treated as fatal.
                     tracing::debug!("ignoring ScreenStreamHandshake on the mesh connection from '{}'", peer.name);
                 }
+                Ok(Message::FileCancel { transfer_id }) => {
+                    // An in-band file it's sending this device arrives on this
+                    // very connection, its cancel after the chunks already
+                    // queued — so it's ended here, not left for a next chunk
+                    // that won't come.
+                    let reason = format!("Cancelled on '{}'", peer.name);
+                    if !drop_received_in_band(state, &mut receiving, &transfer_id, reason, false).await {
+                        transfer::cancelled_by_peer(state, &peer, &transfer_id);
+                    }
+                }
                 Ok(Message::FileStreamHandshake { .. } | Message::FileVerified { .. }) => {
                     // Same as `ScreenStreamHandshake` just above: these
                     // only belong on a v3 file data connection.
@@ -2356,6 +2371,9 @@ async fn handle_file_chunk(
     transfer_id: &str,
     data: Vec<u8>,
 ) {
+    if take_in_band_cancel(state, receiving, transfer_id).await {
+        return;
+    }
     let Some(rf) = receiving.get_mut(transfer_id) else {
         tracing::debug!("chunk for unknown/already-finished transfer {transfer_id}, ignoring");
         return;
@@ -2388,12 +2406,51 @@ async fn handle_file_chunk(
     }
 }
 
+/// An in-band file being received that was cancelled on this device since
+/// its last chunk (see `transfer::cancel_in_band`): ended, if so — true —
+/// and nothing more of it is to be handled.
+async fn take_in_band_cancel(state: &Arc<SharedState>, receiving: &mut HashMap<String, ReceivingFile>, transfer_id: &str) -> bool {
+    if !receiving.contains_key(transfer_id) {
+        return false;
+    }
+    let Some(cancel) = state.cancelled_in_band.lock().unwrap().remove(transfer_id) else {
+        return false;
+    };
+    drop_received_in_band(state, receiving, transfer_id, cancel.reason, cancel.tell_peer).await
+}
+
+/// Ends an in-band file being received on this connection — what's
+/// arrived is deleted, and it's reported failed with `reason` — telling the
+/// sender if `tell_peer`. False if no such file is being received here.
+async fn drop_received_in_band(
+    state: &Arc<SharedState>,
+    receiving: &mut HashMap<String, ReceivingFile>,
+    transfer_id: &str,
+    reason: String,
+    tell_peer: bool,
+) -> bool {
+    let Some(rf) = receiving.remove(transfer_id) else {
+        return false;
+    };
+    state.end_file_transfer(&rf.peer_crypto_id);
+    if tell_peer {
+        transfer::tell_peer(state, &rf.peer_crypto_id, transfer_id);
+    }
+    drop(rf.file);
+    let _ = tokio::fs::remove_file(&rf.path).await;
+    state.emit(SyncEvent::FileTransferFailed { transfer_id: transfer_id.to_string(), reason });
+    true
+}
+
 async fn handle_file_complete(
     state: &Arc<SharedState>,
     receiving: &mut HashMap<String, ReceivingFile>,
     transfer_id: &str,
     expected_hash: String,
 ) {
+    if take_in_band_cancel(state, receiving, transfer_id).await {
+        return;
+    }
     let Some(mut rf) = receiving.remove(transfer_id) else {
         return;
     };
@@ -2727,7 +2784,18 @@ async fn send_in_band(
         // because the connection died (see `handle_connection_inner`'s
         // cleanup), not that this should hang forever waiting on it.
         let Ok(permit) = window.acquire().await else {
-            fail_transfer!("connection closed mid-transfer".to_string());
+            // Closed: the connection died — or the transfer was cancelled,
+            // which closes the window to wake this (`transfer::cancel_in_band`).
+            let cancel = state.cancelled_in_band.lock().unwrap().remove(&transfer_id);
+            match cancel {
+                Some(cancel) => {
+                    if cancel.tell_peer {
+                        transfer::tell_peer(state, peer_crypto_id, &transfer_id);
+                    }
+                    fail_transfer!(cancel.reason)
+                }
+                None => fail_transfer!("connection closed mid-transfer".to_string()),
+            }
         };
         permit.forget();
 

@@ -16,7 +16,7 @@ pub use clipboard::ClipboardBackend;
 #[cfg(feature = "arboard-clipboard")]
 pub use clipboard::ArboardClipboard;
 pub use engine::{start, EngineConfig, EngineHandle};
-pub use events::{EngineCommand, FileTransferDirection, RemoteControlRole, SyncEvent};
+pub use events::{EngineCommand, FileTransferDirection, RemoteControlRole, SyncEvent, TRANSFER_CANCELLED};
 pub use media::{MediaController, NoopMediaController};
 pub use remote_control::{NoopRemoteControlHost, RemoteControlHost};
 pub use screen_lock::{NoopScreenLockController, ScreenLockController, ScreenLockError};

@@ -266,6 +266,13 @@ pub enum Message {
         reason: Option<String>,
     },
 
+    /// v3: ends a transfer — sent on the mesh connection by whichever side
+    /// cancels it, sending or receiving. The other side stops too, the
+    /// receiver deletes what it has of the file, and both report it
+    /// failed. Only sent to a peer that announced `protocol_version >= 3`
+    /// (a v2 one would skip it anyway).
+    FileCancel { transfer_id: TransferId },
+
     /// Asks the receiving device to lock or unlock its own screen (v2+,
     /// see `PROTOCOL_VERSION`). Unlike remote control there's no prompt on
     /// the receiving side at request time — for unlock, by definition,
@@ -486,6 +493,10 @@ mod tests {
 
         let verified: Message = serde_json::from_str(r#"{"type":"file_verified","transfer_id":"t1","ok":true}"#).unwrap();
         assert!(matches!(verified, Message::FileVerified { ok: true, reason: None, .. }));
+
+        let cancel = serde_json::to_string(&Message::FileCancel { transfer_id: "t1".into() }).unwrap();
+        assert_eq!(cancel, r#"{"type":"file_cancel","transfer_id":"t1"}"#);
+        assert!(matches!(serde_json::from_str(&cancel).unwrap(), Message::FileCancel { transfer_id } if transfer_id == "t1"));
     }
 
     /// `RemoteControlEnded.reason` was added without a protocol version
