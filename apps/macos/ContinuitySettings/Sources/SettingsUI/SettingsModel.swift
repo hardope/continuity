@@ -49,6 +49,12 @@ public final class SettingsModel: ObservableObject {
         connection = .connected
     }
 
+    /// Sends its changes to a `continuityd` somewhere else, without
+    /// watching it — for tests.
+    init(client: ControlClient) {
+        self.client = client
+    }
+
     public func device(_ id: String) -> PairedDevice? {
         status?.devices.first { $0.id == id }
     }
@@ -106,12 +112,48 @@ public final class SettingsModel: ObservableObject {
         perform(["op": "send_files", "device": device.id, "paths": panel.urls.map(\.path)])
     }
 
-    public func showReceivedFiles() {
-        guard let dir = status?.receivedFilesDir else { return }
-        // Created on the first file received; make sure there's
-        // something to show before that.
-        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-        NSWorkspace.shared.open(URL(fileURLWithPath: dir, isDirectory: true))
+    /// Asks a connected computer to let this Mac control it. It asks
+    /// whoever's at it first, unless it already allows this Mac; once it
+    /// agrees, its screen opens in a window of its own here.
+    public func requestRemoteControl(_ device: PairedDevice) {
+        perform(["op": "request_remote_control", "device": device.id])
+    }
+
+    /// Shows the received-files folder in Finder. continuityd opens it —
+    /// creating it first if nothing has arrived yet.
+    public func openReceivedFilesDir() {
+        perform(["op": "open_received_files_dir"])
+    }
+
+    /// Picks a new folder for received files. continuityd checks it can
+    /// write there before taking it, and the next status shows it.
+    public func chooseReceivedFilesDir() {
+        let panel = NSOpenPanel()
+        panel.title = "Received Files"
+        panel.message = "Choose where files sent to this Mac are saved."
+        panel.prompt = "Choose"
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        if let dir = status?.receivedFilesDir {
+            panel.directoryURL = URL(fileURLWithPath: dir, isDirectory: true)
+        }
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        setReceivedFilesDir(url.path)
+    }
+
+    /// Received files go to `path` from now on; ones already saved stay
+    /// where they are. Refused (and shown as a problem) if continuityd
+    /// can't use it.
+    public func setReceivedFilesDir(_ path: String) {
+        perform(["op": "set_received_files_dir", "path": path])
+    }
+
+    /// Opens a file that finished arriving — or, with `reveal`, selects it
+    /// in Finder. continuityd only opens files in its transfers list.
+    public func openTransfer(_ transfer: Transfer, reveal: Bool) {
+        perform(["op": "open_transfer", "id": transfer.id, "reveal": reveal])
     }
 
     /// Selects the log in Finder — what to attach to a bug report.

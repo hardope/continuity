@@ -2,10 +2,14 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+    <!-- The main Continuity window, not a settings panel: its menu bar and
+         About box say Continuity. The bundle itself is still
+         "Continuity Settings.app" (build-app.sh), the name continuityd
+         looks for in Contents/Helpers, and keeps its identifier. -->
     <key>CFBundleName</key>
-    <string>Continuity Settings</string>
+    <string>Continuity</string>
     <key>CFBundleDisplayName</key>
-    <string>Continuity Settings</string>
+    <string>Continuity</string>
     <key>CFBundleIdentifier</key>
     <string>app.continuity.settings</string>
     <!-- Stamped with the release version by build-app.sh. -->

@@ -1,4 +1,4 @@
-// Development-only views of the settings window, with sample data —
+// Development-only views of the Continuity window, with sample data —
 // nothing talks to continuityd:
 //
 //     swift run SettingsPreview <output dir>   # every page to PNGs, offscreen
@@ -15,6 +15,11 @@ import SwiftUI
 
 let legacy = CommandLine.arguments.contains("--legacy")
 
+/// A Unix time `seconds` before now.
+func ago(_ seconds: TimeInterval) -> UInt64 {
+    UInt64(Date().addingTimeInterval(-seconds).timeIntervalSince1970)
+}
+
 let sample = Status(
     device: ThisDevice(name: "MacBook Air", id: "9f2c4e81b07a5d3361e8a0c2f4b9d7e1", platform: .macOS, version: "0.1.6-beta.9"),
     paused: false,
@@ -27,6 +32,31 @@ let sample = Status(
     receivedFilesDir: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads/Continuity").path,
     canBeControlled: true,
     canBeUnlocked: false,
+    canControlOthers: true,
+    transfers: [
+        Transfer(
+            id: "t4", direction: .sending, fileName: "Keynote rehearsal.mov", peerName: "ubuntu-desk", sizeBytes: 1_300_000_000,
+            bytesDone: 820_000_000, state: .active, startedAtUnix: ago(90)
+        ),
+        Transfer(
+            id: "t3", direction: .receiving, fileName: "Scan 2025-10-02.pdf", peerName: "Pixel 8", sizeBytes: 2_400_000,
+            bytesDone: 800_000, state: .stalled, reason: "Lost the connection to Pixel 8",
+            startedAtUnix: ago(300)
+        ),
+        Transfer(
+            id: "t2", direction: .receiving, fileName: "PXL_20251002_181544.jpg", peerName: "Pixel 8", sizeBytes: 2_100_000,
+            bytesDone: 2_100_000, state: .done,
+            path: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads/Continuity/PXL_20251002_181544.jpg").path,
+            startedAtUnix: ago(1200),
+            finishedAtUnix: ago(1198)
+        ),
+        Transfer(
+            id: "t1", direction: .sending, fileName: "Photos backup.zip", peerName: "Pixel 8", sizeBytes: 5_000_000_000,
+            bytesDone: 0, state: .failed, reason: "Not enough free space on Pixel 8 (needs 5 GB, 300 MB free)",
+            startedAtUnix: ago(3600),
+            finishedAtUnix: ago(3599)
+        ),
+    ],
     about: About(
         protocolVersion: 2,
         os: "macOS \(ProcessInfo.processInfo.operatingSystemVersion.majorVersion).\(ProcessInfo.processInfo.operatingSystemVersion.minorVersion)",
@@ -109,6 +139,7 @@ if CommandLine.arguments.contains("--window") {
             (.thisDevice, "this-device"),
             (.device("pixel"), "device-connected"),
             (.device("office"), "device-offline"),
+            (.device("ubuntu"), "device-computer"),
             (.nearby("tab"), "nearby"),
         ]
         let suffix = legacy ? "-legacy" : ""

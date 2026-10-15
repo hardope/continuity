@@ -53,7 +53,7 @@ public struct InfoView: View {
                     }
                 }
                 PageSection(title: "Files") {
-                    PathRow(label: "Received files", path: status.receivedFilesDir) { model.showReceivedFiles() }
+                    PathRow(label: "Received files", path: status.receivedFilesDir) { model.openReceivedFilesDir() }
                     if let log = status.about?.logFile {
                         PathRow(label: "Log — attach it to a bug report", path: log) { model.showLogFile() }
                     }

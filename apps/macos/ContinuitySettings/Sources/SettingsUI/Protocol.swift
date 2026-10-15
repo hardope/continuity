@@ -12,6 +12,12 @@ public struct Status: Decodable, Equatable {
     public var canBeControlled: Bool
     public var canBeUnlocked: Bool
     // Optional so a window newer than the running continuityd still opens.
+    /// Whether this Mac can take control of another computer — it has the
+    /// remote-control viewer (off in a "lite" build).
+    public var canControlOthers: Bool?
+    /// Every transfer under way and the most recently finished ones, newest
+    /// first.
+    public var transfers: [Transfer]?
     public var about: About?
     public var activity: Activity?
     /// macOS privacy permissions, as continuityd itself has them.
@@ -20,6 +26,7 @@ public struct Status: Decodable, Equatable {
     public init(
         device: ThisDevice, paused: Bool, devices: [PairedDevice], nearby: [NearbyDevice],
         receivedFilesDir: String, canBeControlled: Bool, canBeUnlocked: Bool,
+        canControlOthers: Bool? = nil, transfers: [Transfer]? = nil,
         about: About? = nil, activity: Activity? = nil, permissions: Permissions? = nil
     ) {
         self.device = device
@@ -29,6 +36,8 @@ public struct Status: Decodable, Equatable {
         self.receivedFilesDir = receivedFilesDir
         self.canBeControlled = canBeControlled
         self.canBeUnlocked = canBeUnlocked
+        self.canControlOthers = canControlOthers
+        self.transfers = transfers
         self.about = about
         self.activity = activity
         self.permissions = permissions
@@ -39,6 +48,77 @@ public struct Status: Decodable, Equatable {
     public var missingPermissions: [Permission] {
         guard canBeControlled, let permissions else { return [] }
         return Permission.allCases.filter { !permissions.allows($0) }
+    }
+
+    /// Whether a device's page offers to take control of it: this build
+    /// has the viewer, the device is connected right now, and it's a
+    /// computer — phones can control a computer but can't be controlled. A
+    /// device whose platform isn't known yet doesn't get the button either.
+    public func canControl(_ device: PairedDevice) -> Bool {
+        guard canControlOthers == true, device.connected, let platform = device.platform else { return false }
+        return [Platform.macOS, .windows, .linux].contains(platform)
+    }
+}
+
+/// A file on its way to or from a paired device (`Transfer` in
+/// core/continuityd/src/control.rs).
+public struct Transfer: Decodable, Equatable, Identifiable {
+    public enum Direction: String, Decodable, Equatable {
+        case sending
+        case receiving
+    }
+
+    public enum State: String, Decodable, Equatable {
+        case active
+        /// Lost its connection partway; picks up where it left off once
+        /// the device is back (within ten minutes, or it fails).
+        case stalled
+        case done
+        case failed
+    }
+
+    public var id: String
+    public var direction: Direction
+    public var fileName: String
+    /// The device it's going to or coming from.
+    public var peerName: String
+    public var sizeBytes: UInt64
+    public var bytesDone: UInt64
+    public var state: State
+    /// Why it failed, or why it's stalled.
+    public var reason: String?
+    /// Where a received file was saved — only once it's done.
+    public var path: String?
+    public var startedAtUnix: UInt64
+    public var finishedAtUnix: UInt64?
+
+    public init(
+        id: String, direction: Direction, fileName: String, peerName: String, sizeBytes: UInt64, bytesDone: UInt64,
+        state: State, reason: String? = nil, path: String? = nil, startedAtUnix: UInt64, finishedAtUnix: UInt64? = nil
+    ) {
+        self.id = id
+        self.direction = direction
+        self.fileName = fileName
+        self.peerName = peerName
+        self.sizeBytes = sizeBytes
+        self.bytesDone = bytesDone
+        self.state = state
+        self.reason = reason
+        self.path = path
+        self.startedAtUnix = startedAtUnix
+        self.finishedAtUnix = finishedAtUnix
+    }
+
+    /// How far along it is, from 0 to 1. An empty file counts as all there.
+    public var fraction: Double {
+        guard sizeBytes > 0 else { return 1 }
+        return min(1, Double(bytesDone) / Double(sizeBytes))
+    }
+
+    /// A received file that finished arriving — the only kind continuityd
+    /// will open or show (`open_transfer`).
+    public var canBeOpened: Bool {
+        direction == .receiving && state == .done && path != nil
     }
 }
 

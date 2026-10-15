@@ -2,9 +2,10 @@ import AppKit
 import SettingsUI
 import SwiftUI
 
-/// Continuity's settings window. Opened from the tray menu's "Settings…",
-/// which launches this app from inside Continuity.app; it talks to the
-/// running `continuityd` and keeps nothing of its own.
+/// The Continuity window — devices, transfers and settings. Opened from the
+/// menu bar's "Open Continuity", which launches this app from inside
+/// Continuity.app; it talks to the running `continuityd` and keeps nothing
+/// of its own.
 ///
 /// One window, made by whichever scene this macOS has: `Window` from macOS
 /// 13, or on macOS 12 a window group with "New Window" taken out.
@@ -61,7 +62,8 @@ private func profileArgument() -> String {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    /// A settings window, not a document app: closing it quits.
+    /// One window, not a document app: closing it quits. Continuity itself
+    /// keeps running in the menu bar.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
     }

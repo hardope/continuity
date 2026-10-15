@@ -27,6 +27,61 @@
     "received_files_dir": "/Users/me/Downloads/Continuity",
     "can_be_controlled": true,
     "can_be_unlocked": false,
+    "can_control_others": true,
+    "transfers": [
+      {
+        "id": "t4",
+        "direction": "sending",
+        "file_name": "talk.mov",
+        "peer_name": "Pixel 8",
+        "size_bytes": 1300000000,
+        "bytes_done": 650000000,
+        "state": "active",
+        "reason": null,
+        "path": null,
+        "started_at_unix": 1760000400,
+        "finished_at_unix": null
+      },
+      {
+        "id": "t3",
+        "direction": "receiving",
+        "file_name": "scan.pdf",
+        "peer_name": "Pixel 8",
+        "size_bytes": 2400000,
+        "bytes_done": 800000,
+        "state": "stalled",
+        "reason": "Lost the connection to Pixel 8",
+        "path": null,
+        "started_at_unix": 1760000300,
+        "finished_at_unix": null
+      },
+      {
+        "id": "t2",
+        "direction": "receiving",
+        "file_name": "IMG_2041.jpg",
+        "peer_name": "Pixel 8",
+        "size_bytes": 820000,
+        "bytes_done": 820000,
+        "state": "done",
+        "reason": null,
+        "path": "/Users/me/Downloads/Continuity/IMG_2041.jpg",
+        "started_at_unix": 1760000100,
+        "finished_at_unix": 1760000102
+      },
+      {
+        "id": "t1",
+        "direction": "sending",
+        "file_name": "backup.zip",
+        "peer_name": "Pixel 8",
+        "size_bytes": 5000000000,
+        "bytes_done": 0,
+        "state": "failed",
+        "reason": "Not enough free space on Pixel 8 (needs 5 GB, 300 MB free)",
+        "path": null,
+        "started_at_unix": 1760000000,
+        "finished_at_unix": 1760000001
+      }
+    ],
     "about": {
       "protocol_version": 2,
       "os": "macOS 12.7.6",

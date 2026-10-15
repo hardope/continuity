@@ -232,8 +232,14 @@ struct ThisDeviceView: View {
                     isOn: Binding(get: { status.paused }, set: { model.setPaused($0) })
                 )
             }
-            PageSection(title: "Received Files") {
-                PathRow(label: "Saved to", path: status.receivedFilesDir) { model.showReceivedFiles() }
+            // Missing from a continuityd older than this window.
+            if let transfers = status.transfers {
+                TransfersSection(transfers: transfers)
+            }
+            PageSection {
+                ReceivedFilesRow(path: status.receivedFilesDir)
+            } footer: {
+                Text("Files your devices send to this Mac are saved here.")
             }
             PageSection {
                 Button("Forget All Devices…", role: .destructive) { confirmingForgetAll = true }
@@ -242,7 +248,8 @@ struct ThisDeviceView: View {
                 Text("Every device will need to be paired again, on both sides.")
             }
         }
-        .navigationTitle(status.device.name)
+        .navigationTitle("Continuity")
+        .navigationSubtitle(status.device.name)
         .confirmationDialog(
             "Forget all \(status.devices.count) paired devices?",
             isPresented: $confirmingForgetAll,
@@ -291,6 +298,15 @@ struct DeviceView: View {
                     }
                     .primaryActionStyle()
                     .disabled(!device.connected)
+                    if status.canControl(device) {
+                        Button {
+                            model.requestRemoteControl(device)
+                        } label: {
+                            Label("Control \(device.name)…", systemImage: "display")
+                        }
+                        .secondaryActionStyle()
+                        .help("See \(device.name)'s screen and use its keyboard and mouse from this \(here). It asks whoever's at it first, unless it already lets this \(here) in without asking.")
+                    }
                     if device.connected {
                         Button("Disconnect") { model.disconnect(device.id) }
                             .secondaryActionStyle()
@@ -347,7 +363,8 @@ struct DeviceView: View {
                 Text("Paired \(Date(timeIntervalSince1970: TimeInterval(device.pairedAtUnix)).formatted(date: .long, time: .omitted))")
             }
         }
-        .navigationTitle(device.name)
+        .navigationTitle("Continuity")
+        .navigationSubtitle(device.name)
         .confirmationDialog("Let \(device.name) control this \(here) without asking?", isPresented: $confirmingRemoteControl, titleVisibility: .visible) {
             Button("Allow") { model.setRemoteControlAllowed(device, true) }
         } message: {
@@ -393,7 +410,133 @@ struct NearbyView: View {
                     : "Pairing shows a code on both devices. Confirm on each only if the codes match.")
             }
         }
-        .navigationTitle(device.name)
+        .navigationTitle("Continuity")
+        .navigationSubtitle(device.name)
+    }
+}
+
+/// Files on their way to or from your devices, and the last ones that
+/// finished — continuityd keeps every one under way and the 20 most
+/// recently finished, newest first.
+struct TransfersSection: View {
+    let transfers: [Transfer]
+
+    var body: some View {
+        PageSection(title: "Transfers") {
+            if transfers.isEmpty {
+                Text("Files you send or receive show up here.")
+                    .foregroundStyle(.secondary)
+            }
+            ForEach(transfers) { transfer in
+                TransferRow(transfer: transfer)
+            }
+        }
+    }
+}
+
+/// One transfer: what's moving and where, how far along it is, and — once a
+/// received file is in — buttons to open it or show it in Finder.
+struct TransferRow: View {
+    @EnvironmentObject private var model: SettingsModel
+    let transfer: Transfer
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: symbol)
+                .font(.title3)
+                .foregroundStyle(tint)
+                .frame(width: 26)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(transfer.fileName)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                if transfer.state == .active || transfer.state == .stalled {
+                    // Stays where it stopped while it waits to pick up again.
+                    ProgressView(value: transfer.fraction)
+                        .controlSize(.small)
+                        .opacity(transfer.state == .stalled ? 0.5 : 1)
+                }
+                Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                if transfer.state == .failed, let reason = transfer.reason {
+                    Text(reason)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                }
+            }
+            Spacer(minLength: 8)
+            if transfer.canBeOpened {
+                Button("Open") { model.openTransfer(transfer, reveal: false) }
+                Button("Show in Finder") { model.openTransfer(transfer, reveal: true) }
+            }
+        }
+    }
+
+    private var symbol: String {
+        switch transfer.state {
+        case .active, .done: transfer.direction == .sending ? "arrow.up.circle" : "arrow.down.circle"
+        case .stalled: "pause.circle"
+        case .failed: "exclamationmark.circle"
+        }
+    }
+
+    private var tint: Color {
+        switch transfer.state {
+        case .active: .accentColor
+        case .stalled: .orange
+        case .done: .green
+        case .failed: .red
+        }
+    }
+
+    private var detail: String {
+        let sending = transfer.direction == .sending
+        let peer = sending ? "To \(transfer.peerName)" : "From \(transfer.peerName)"
+        switch transfer.state {
+        case .active:
+            return "\(peer) · \(bytes(transfer.bytesDone)) of \(bytes(transfer.sizeBytes))"
+        case .stalled:
+            return "\(peer) · Waiting to reconnect…"
+        case .done:
+            return sending
+                ? "Sent to \(transfer.peerName) · \(bytes(transfer.sizeBytes))"
+                : "Received from \(transfer.peerName) · \(bytes(transfer.sizeBytes))"
+        case .failed:
+            return sending ? "Couldn't send to \(transfer.peerName)" : "Couldn't receive from \(transfer.peerName)"
+        }
+    }
+
+    private func bytes(_ count: UInt64) -> String {
+        ByteCountFormatter.string(fromByteCount: Int64(clamping: count), countStyle: .file)
+    }
+}
+
+/// Where received files go, with buttons to pick another folder or show
+/// this one in Finder.
+struct ReceivedFilesRow: View {
+    @EnvironmentObject private var model: SettingsModel
+    let path: String
+
+    var body: some View {
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Received files")
+                Text(abbreviatingHome(path))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .textSelection(.enabled)
+            }
+            Spacer(minLength: 8)
+            Button("Change…") { model.chooseReceivedFilesDir() }
+            Button("Open") { model.openReceivedFilesDir() }
+        }
     }
 }
 
@@ -408,7 +551,7 @@ struct NotRunningView: View {
             if case .unavailable(let reason) = model.connection {
                 Text(reason)
                     .font(.title3.weight(.semibold))
-                Text("Settings appear here once it's running.")
+                Text("Your devices appear here once it's running.")
                     .foregroundStyle(.secondary)
                 Button("Open Continuity") { model.openContinuity() }
                     .primaryActionStyle()

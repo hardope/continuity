@@ -1,7 +1,8 @@
 #!/bin/bash
 # Builds "Continuity Settings.app" — universal (Apple silicon + Intel) —
 # into <output dir>. CI then copies it into Continuity.app/Contents/Helpers/,
-# where continuityd's "Settings…" menu item looks for it.
+# where continuityd's "Open Continuity" menu item looks for it. The bundle
+# keeps that file name; to the user (Info.plist) the app is "Continuity".
 #
 #   ./build-app.sh <output dir> [version] [AppIcon.icns]
 #
