@@ -331,6 +331,44 @@ async fn a_cut_data_connection_resumes_where_it_left_off() {
     finish(vec![a, b], &[&a_dir, &b_dir], &[&source_dir]);
 }
 
+/// A disk error on the receiver partway through (a full disk, a FAT32
+/// volume's 4 GiB limit) ends the transfer once, on both sides, with the
+/// reason — the sender's resume offer is refused, not taken as a new
+/// transfer that starts over from 0 and hits the same error again. The
+/// hook fails only the first data connection, so a second one would show
+/// up here as the file arriving after all.
+#[tokio::test]
+async fn a_disk_error_on_the_receiver_fails_the_transfer_once() {
+    let (mut a, mut b, _a_id, b_id, a_dir, b_dir) = connected_pair("DiskErrorA", "DiskErrorB").await;
+
+    let source_dir = temp_dir("disk-error-source");
+    let source = source_dir.join("too big.iso");
+    write_test_file(&source, 12 * MIB, 5);
+
+    b.test_hooks().fail_writes_after.store(3 * MIB as u64, Ordering::Relaxed);
+    a.send_command(EngineCommand::SendFile { peer_crypto_id: b_id.clone(), path: source.display().to_string() });
+    let log = collect_until(&mut a, &mut b, Duration::from_secs(60), |log| {
+        log.iter().any(|(s, e)| *s == Side::A && matches!(e, SyncEvent::FileSent { .. } | SyncEvent::FileTransferFailed { .. }))
+    })
+    .await;
+
+    let sender_reason = log.iter().find_map(|(s, e)| match e {
+        SyncEvent::FileTransferFailed { reason, .. } if *s == Side::A => Some(reason.clone()),
+        _ => None,
+    });
+    let sender_reason = sender_reason.unwrap_or_else(|| panic!("the sender should report the transfer failed: {log:?}"));
+    assert!(sender_reason.starts_with("DiskErrorB couldn't save the file:"), "{sender_reason}");
+    assert!(sender_reason.contains("disk full (test hook)"), "{sender_reason}");
+    // Announced once and failed once on the receiver — never restarted.
+    assert_eq!(count(&log, Side::B, |e| matches!(e, SyncEvent::FileReceiving { .. })), 1, "{log:?}");
+    assert_eq!(count(&log, Side::B, |e| matches!(e, SyncEvent::FileTransferFailed { .. })), 1, "{log:?}");
+    assert_eq!(count(&log, Side::B, |e| matches!(e, SyncEvent::FileReceived { .. })), 0, "{log:?}");
+    assert_eq!(b.test_hooks().data_channel_files_received.load(Ordering::Relaxed), 0);
+    assert!(part_files_in(&b_dir).is_empty(), "a .part file was left behind: {:?}", part_files_in(&b_dir));
+
+    finish(vec![a, b], &[&a_dir, &b_dir], &[&source_dir]);
+}
+
 /// The mesh connection going down too while a transfer is stalled: the
 /// sender waits for the peer to come back, re-offers on the new mesh
 /// connection — whose arrival the receiver has to tell apart from a data

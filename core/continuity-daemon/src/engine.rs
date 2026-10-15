@@ -168,6 +168,10 @@ pub struct TestHooks {
     /// Sender: drop the next data connection once this many bytes of file
     /// data have gone out on it. One-shot (reset to 0 when used); 0 = off.
     pub cut_data_connection_after: AtomicU64,
+    /// Receiver: the next data connection's disk writes fail, as on a full
+    /// disk, once the file would grow past this many bytes. One-shot (reset
+    /// to 0 when used); 0 = off.
+    pub fail_writes_after: AtomicU64,
     /// Receiver: files verified and saved after arriving over a data
     /// connection.
     pub data_channel_files_received: AtomicU64,

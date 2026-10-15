@@ -178,7 +178,7 @@ pub(super) struct IncomingTransfer {
     /// connection this side hasn't noticed is dead yet, and a cancel can
     /// end one that's alive.
     stream: Option<AbortHandle>,
-    /// When it last went idle (`Waiting` or `Completed`) — what
+    /// When it last went idle (`Waiting`, `Completed` or `Failed`) — what
     /// `RESUME_WINDOW` counts from.
     idle_since: Instant,
 }
@@ -194,6 +194,11 @@ enum Phase {
     /// told "you're done" instead of being taken as a new transfer and the
     /// file saved twice.
     Completed { content_hash: String },
+    /// Writing it failed (a full disk, a FAT32 volume's 4 GiB limit, an
+    /// I/O error), already reported here, partial file deleted. Kept for
+    /// `RESUME_WINDOW` like `Completed`, so the sender's resume offer is
+    /// refused with `reason` — see `return_part`.
+    Failed { reason: String },
 }
 
 struct PartFile {
@@ -364,6 +369,7 @@ async fn answer_offer(
         Nothing,
         Resumable { written: u64, size: u64, dir: PathBuf },
         Done { size: u64 },
+        Failed { reason: String },
         Busy,
     }
     let deadline = Instant::now() + RELEASE_WAIT;
@@ -385,6 +391,7 @@ async fn answer_offer(
                         }
                     }
                     Phase::Completed { .. } => Found::Done { size: entry.size_bytes },
+                    Phase::Failed { reason } => Found::Failed { reason: reason.clone() },
                     // The sender only re-offers once it's given up on its
                     // data connection, so this side's end of it is dead
                     // too, just not noticed yet (a half-open TCP
@@ -404,6 +411,7 @@ async fn answer_offer(
         match found {
             Found::Nothing => break,
             Found::Done { size } => return accept(size),
+            Found::Failed { reason } => return refuse(reason),
             Found::Resumable { written, size, dir } => {
                 if let Some(reason) = free_space_refusal_for(&dir, &state.my_device.name, size - written) {
                     tracing::warn!("can't resume '{file_name}' from '{}': {reason}", peer.name);
@@ -497,7 +505,7 @@ fn discard_incoming(state: &Arc<SharedState>, key: &(String, String), reason: Op
         drop(part);
         let _ = std::fs::remove_file(&entry.part_path);
     }
-    if let (Some(reason), false) = (reason, matches!(entry.phase, Phase::Completed { .. })) {
+    if let (Some(reason), false) = (reason, matches!(entry.phase, Phase::Completed { .. } | Phase::Failed { .. })) {
         state.emit(SyncEvent::FileTransferFailed { transfer_id: key.1.clone(), reason: reason.to_string() });
     }
     state.incoming_transfers_changed.notify_waiters();
@@ -723,7 +731,13 @@ async fn receive_stream(mut conn: Connection, state: Arc<SharedState>, key: (Str
                     discard_incoming(&state, &key, Some(&reason));
                     let _ = write_message(&mut conn, &Message::FileVerified { transfer_id, ok: false, reason: Some(reason) }).await;
                 }
-                _ => {}
+                // A disk error: the writer reported it and left the entry
+                // `Failed`, which is what the sender hears when it re-offers
+                // — it's still writing frames, so it wouldn't read a
+                // `FileVerified` sent here.
+                ReceiveError::WriterStopped => {}
+                // Cancelled, expired or replaced meanwhile.
+                ReceiveError::Interrupted(_) => {}
             }
             return;
         }
@@ -745,8 +759,12 @@ async fn receive_stream(mut conn: Connection, state: Arc<SharedState>, key: (Str
         // The writer failed (and reported it), or this was cancelled —
         // either way it's over here, and the sender should hear that
         // rather than take a closed connection as something to resume.
-        let reason = Some(format!("{} couldn't save the file", state.my_device.name));
-        let _ = write_message(&mut conn, &Message::FileVerified { transfer_id, ok: false, reason }).await;
+        let failed = state.incoming_transfers.lock().unwrap().get(&key).and_then(|e| match &e.phase {
+            Phase::Failed { reason } => Some(reason.clone()),
+            _ => None,
+        });
+        let reason = failed.unwrap_or_else(|| format!("{} couldn't save the file", state.my_device.name));
+        let _ = write_message(&mut conn, &Message::FileVerified { transfer_id, ok: false, reason: Some(reason) }).await;
         return;
     };
 
@@ -797,9 +815,15 @@ fn write_part(
     size_bytes: u64,
 ) {
     let mut failure = None;
+    let fail_after = state.test_hooks.fail_writes_after.swap(0, Ordering::Relaxed);
     while let Some(frame) = frames.blocking_recv() {
-        if let Err(e) = part.file.write_all(&frame) {
-            failure = Some(format!("couldn't write the file: {e}"));
+        let written = if fail_after > 0 && part.written + frame.len() as u64 > fail_after {
+            Err(std::io::Error::other("disk full (test hook)"))
+        } else {
+            part.file.write_all(&frame)
+        };
+        if let Err(e) = written {
+            failure = Some(e);
             break;
         }
         part.hasher.update(&frame);
@@ -811,21 +835,32 @@ fn write_part(
     return_part(state, key, epoch, part, part_path, failure);
 }
 
-fn return_part(state: &SharedState, key: &(String, String), epoch: u64, part: PartFile, part_path: &Path, failure: Option<String>) {
+/// **Real bug fixed here**: a disk error used to remove the transfer's
+/// entry outright. The sender, still writing frames, only saw its data
+/// connection close — which looks like any other interruption — so it
+/// re-offered with `resume: true`, the receiver found nothing under that
+/// id and took it as a new transfer from 0, and the file was sent again,
+/// failed at the same point (a full disk, a FAT32 volume's 4 GiB limit),
+/// and went round again forever. The entry now stays as `Phase::Failed` for
+/// `RESUME_WINDOW`, so that re-offer is refused with the reason.
+fn return_part(state: &SharedState, key: &(String, String), epoch: u64, part: PartFile, part_path: &Path, failure: Option<std::io::Error>) {
     let mut incoming = state.incoming_transfers.lock().unwrap();
     let ours = incoming.get(key).is_some_and(|e| e.epoch == epoch);
     if !ours || failure.is_some() {
         // Cancelled, expired or shut down while this held the file (its
         // remover couldn't delete an open file everywhere), or a disk
         // error: either way this partial file is finished with.
-        if ours {
-            incoming.remove(key);
+        if let (true, Some(e)) = (ours, &failure) {
+            let entry = incoming.get_mut(key).expect("checked just above");
+            entry.phase = Phase::Failed { reason: format!("{} couldn't save the file: {e}", state.my_device.name) };
+            entry.idle_since = Instant::now();
+            entry.stream = None;
         }
         drop(incoming);
         drop(part);
         let _ = std::fs::remove_file(part_path);
-        if let (true, Some(reason)) = (ours, failure) {
-            state.emit(SyncEvent::FileTransferFailed { transfer_id: key.1.clone(), reason });
+        if let (true, Some(e)) = (ours, failure) {
+            state.emit(SyncEvent::FileTransferFailed { transfer_id: key.1.clone(), reason: format!("couldn't write the file: {e}") });
         }
         state.incoming_transfers_changed.notify_waiters();
         return;
@@ -1309,7 +1344,7 @@ fn end_transfers(state: &Arc<SharedState>, peer_id: Option<&str>, reason: Option
 
 /// Drops incoming transfers idle for longer than `RESUME_WINDOW`: a partial
 /// file whose sender never came back is reported failed and deleted; a
-/// completed one's record just goes.
+/// completed or failed one's record just goes.
 pub(super) fn spawn_expiry_sweeper(state: Arc<SharedState>) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(SWEEP_INTERVAL);
@@ -1320,12 +1355,15 @@ pub(super) fn spawn_expiry_sweeper(state: Arc<SharedState>) -> JoinHandle<()> {
                 let incoming = state.incoming_transfers.lock().unwrap();
                 incoming
                     .iter()
-                    .filter(|(_, e)| matches!(e.phase, Phase::Waiting | Phase::Completed { .. }) && e.idle_since.elapsed() >= RESUME_WINDOW)
-                    .map(|(key, e)| (key.clone(), matches!(e.phase, Phase::Completed { .. }), e.peer_name.clone()))
+                    .filter(|(_, e)| {
+                        matches!(e.phase, Phase::Waiting | Phase::Completed { .. } | Phase::Failed { .. })
+                            && e.idle_since.elapsed() >= RESUME_WINDOW
+                    })
+                    .map(|(key, e)| (key.clone(), matches!(e.phase, Phase::Waiting), e.peer_name.clone()))
                     .collect()
             };
-            for (key, completed, peer_name) in expired {
-                let reason = (!completed).then(|| format!("'{peer_name}' didn't resume sending within 10 minutes"));
+            for (key, waiting, peer_name) in expired {
+                let reason = waiting.then(|| format!("'{peer_name}' didn't resume sending within 10 minutes"));
                 discard_incoming(&state, &key, reason.as_deref());
             }
         }
