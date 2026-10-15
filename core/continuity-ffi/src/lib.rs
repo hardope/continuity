@@ -215,6 +215,10 @@ pub enum FfiSyncEvent {
     FileReceived { transfer_id: String, file_name: String, path: String },
     FileSent { transfer_id: String, file_name: String, to_name: String },
     FileTransferFailed { transfer_id: String, reason: String },
+    /// The transfer lost its connection and is waiting to resume — not an
+    /// end state. The next `FileTransferProgress` for it means it resumed;
+    /// if it can't within 10 minutes, `FileTransferFailed` follows.
+    FileTransferStalled { transfer_id: String, reason: String },
     Error { message: String },
     WasReset,
     PausedStateChanged { paused: bool },
@@ -336,6 +340,7 @@ impl From<continuity_daemon::SyncEvent> for FfiSyncEvent {
             E::FileTransferFailed { transfer_id, reason } => {
                 FfiSyncEvent::FileTransferFailed { transfer_id, reason }
             }
+            E::FileTransferStalled { transfer_id, reason } => FfiSyncEvent::FileTransferStalled { transfer_id, reason },
             E::Error(message) => FfiSyncEvent::Error { message },
             E::WasReset => FfiSyncEvent::WasReset,
             E::PausedStateChanged { paused } => FfiSyncEvent::PausedStateChanged { paused },

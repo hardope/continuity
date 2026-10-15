@@ -678,6 +678,9 @@ fn handle_sync_event(
         SyncEvent::FileTransferFailed { reason, .. } => {
             notify(&format!("File transfer failed: {reason}"));
         }
+        SyncEvent::FileTransferStalled { transfer_id, reason } => {
+            tracing::info!("file transfer {transfer_id} stalled: {reason}");
+        }
         SyncEvent::Error(e) => tracing::warn!("{e}"),
         SyncEvent::WasReset => {
             connected_peers.lock().unwrap().clear();

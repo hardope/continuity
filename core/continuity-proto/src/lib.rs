@@ -41,7 +41,17 @@ mod b64 {
 /// fatal), so a sender should only send a message newer than v1 to a peer
 /// that announced `protocol_version >= 2` — that's what the version number
 /// is actually for now, a capability check rather than a pairing gate.
-pub const PROTOCOL_VERSION: u32 = 2;
+///
+/// **v3** moves file data off the mesh connection: a sender that sees
+/// `protocol_version >= 3` offers a dedicated data connection
+/// (`FileOffer::data_channel`), and once the receiver agrees the file goes
+/// over its own TLS connection as raw 1 MiB frames (see
+/// `FileStreamHandshake`), resumable after an interruption
+/// (`FileOffer::resume`, `FileAccept::offset`). Every new field is
+/// `#[serde(default)]`, so a v2 peer's `FileOffer`/`FileAccept` still
+/// parses (and simply means the in-band `FileChunk` path), and a v2 peer
+/// ignores the fields it doesn't know.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Hex-encoded Ed25519 public key. This is the device's permanent identity.
 pub type DeviceId = String;
@@ -110,10 +120,35 @@ pub enum Message {
         file_name: String,
         size_bytes: u64,
         mime: Option<String>,
+        /// v3: the sender wants to stream the file over a dedicated data
+        /// connection (see `FileStreamHandshake`) instead of `FileChunk`s
+        /// on this one. Only set for a peer that announced
+        /// `protocol_version >= 3`; absent (false) from older senders.
+        #[serde(default)]
+        data_channel: bool,
+        /// v3: a re-offer of an interrupted transfer — same `transfer_id`
+        /// as the original offer. The receiver answers with how much of it
+        /// it still has (`FileAccept::offset`), or 0 if it has nothing left
+        /// of it (it restarted, or the partial file expired).
+        #[serde(default)]
+        resume: bool,
     },
     FileAccept {
         transfer_id: TransferId,
         accepted: bool,
+        /// v3: the receiver agrees to the dedicated data connection the
+        /// offer asked for. False (or absent, from an older receiver) means
+        /// the sender falls back to `FileChunk`s on this connection.
+        #[serde(default)]
+        data_channel: bool,
+        /// v3: bytes of the file the receiver already has, so the data
+        /// connection starts from here. 0 for a new transfer.
+        #[serde(default)]
+        offset: u64,
+        /// v3: human-readable reason for a refusal (e.g. not enough free
+        /// space), for the sender to show its user.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     FileChunk {
         transfer_id: TransferId,
@@ -206,6 +241,30 @@ pub enum Message {
     /// write_frame`/`read_frame` for the leaner raw-bytes framing the
     /// video path uses instead, once this handshake completes.
     ScreenStreamHandshake { session_id: String },
+
+    /// v3: the first (JSON) message on a *separate* connection the file's
+    /// **sender** dials to the receiver's listener once the receiver has
+    /// answered `FileAccept { data_channel: true, .. }` — the file-transfer
+    /// counterpart of `ScreenStreamHandshake`, identified the same way
+    /// (mutual TLS proves who dialed; this binds the connection to one of
+    /// that peer's transfers). `offset` must equal the `FileAccept::offset`
+    /// it follows. After it: the file's bytes from `offset` on as raw
+    /// frames (`continuity_net::framing::write_frame`'s framing, 1 MiB
+    /// each), a zero-length frame for end of data, then a JSON
+    /// `FileComplete` carrying the whole file's hash. The receiver answers
+    /// with `FileVerified` and both sides close the connection.
+    FileStreamHandshake { transfer_id: TransferId, offset: u64 },
+
+    /// v3: the receiver's verdict on a file that arrived over a data
+    /// connection, sent on that connection after its `FileComplete`. `ok`
+    /// means the size and the whole file's hash matched and the file is
+    /// saved under its final name — the sender reports it sent only then.
+    FileVerified {
+        transfer_id: TransferId,
+        ok: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
 
     /// Asks the receiving device to lock or unlock its own screen (v2+,
     /// see `PROTOCOL_VERSION`). Unlike remote control there's no prompt on
@@ -379,6 +438,54 @@ mod tests {
     fn an_unknown_message_type_is_a_parse_error_not_a_panic() {
         let result = serde_json::from_str::<Message>(r#"{"type":"some_future_message","field":1}"#);
         assert!(result.is_err());
+    }
+
+    /// The v3 fields are only safe to add if a v2 peer's messages — which
+    /// don't have them — still parse, and mean the in-band path.
+    #[test]
+    fn old_format_file_offer_and_accept_still_parse() {
+        let offer: Message = serde_json::from_str(
+            r#"{"type":"file_offer","transfer_id":"t1","origin_device":"d","file_name":"a.txt","size_bytes":5,"mime":null}"#,
+        )
+        .expect("v2 offer parses");
+        assert!(matches!(offer, Message::FileOffer { data_channel: false, resume: false, size_bytes: 5, .. }));
+
+        let accept: Message =
+            serde_json::from_str(r#"{"type":"file_accept","transfer_id":"t1","accepted":true}"#).expect("v2 accept parses");
+        match accept {
+            Message::FileAccept { accepted, data_channel, offset, reason, .. } => {
+                assert!(accepted);
+                assert!(!data_channel);
+                assert_eq!(offset, 0);
+                assert_eq!(reason, None);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn v3_file_messages_round_trip_through_json() {
+        let accept = Message::FileAccept {
+            transfer_id: "t1".into(),
+            accepted: false,
+            data_channel: true,
+            offset: 42,
+            reason: Some("Not enough free space".into()),
+        };
+        let back: Message = serde_json::from_str(&serde_json::to_string(&accept).unwrap()).unwrap();
+        assert!(matches!(back, Message::FileAccept { data_channel: true, offset: 42, reason: Some(_), .. }));
+
+        // No reason: omitted on the wire, exactly as an older receiver
+        // would have sent it.
+        let plain = Message::FileAccept { transfer_id: "t1".into(), accepted: true, data_channel: false, offset: 0, reason: None };
+        assert!(!serde_json::to_string(&plain).unwrap().contains("reason"));
+
+        let handshake = Message::FileStreamHandshake { transfer_id: "t1".into(), offset: 1 << 20 };
+        let back: Message = serde_json::from_str(&serde_json::to_string(&handshake).unwrap()).unwrap();
+        assert!(matches!(back, Message::FileStreamHandshake { offset, .. } if offset == 1 << 20));
+
+        let verified: Message = serde_json::from_str(r#"{"type":"file_verified","transfer_id":"t1","ok":true}"#).unwrap();
+        assert!(matches!(verified, Message::FileVerified { ok: true, reason: None, .. }));
     }
 
     /// `RemoteControlEnded.reason` was added without a protocol version

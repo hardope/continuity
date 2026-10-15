@@ -145,6 +145,31 @@ mod tests {
         assert!(matches!(read_message(&mut b).await.unwrap(), Message::Ping));
     }
 
+    /// The v3 file data connection's whole shape on the wire: a JSON
+    /// handshake, unflushed raw frames, a zero-length end-of-data frame,
+    /// then JSON again — each read back in order, nothing lost to the
+    /// missing per-frame flushes once the last JSON message flushes.
+    #[tokio::test]
+    async fn unflushed_frames_between_json_messages_read_back_in_order() {
+        let (mut a, mut b) = tokio::io::duplex(64 * 1024);
+        let writer = tokio::spawn(async move {
+            write_message(&mut a, &Message::FileStreamHandshake { transfer_id: "t".into(), offset: 0 }).await.unwrap();
+            for i in 0..3u8 {
+                write_frame_unflushed(&mut a, &vec![i; 100_000]).await.unwrap();
+            }
+            write_frame_unflushed(&mut a, &[]).await.unwrap();
+            write_message(&mut a, &Message::FileComplete { transfer_id: "t".into(), content_hash: "h".into() }).await.unwrap();
+        });
+
+        assert!(matches!(read_message(&mut b).await.unwrap(), Message::FileStreamHandshake { .. }));
+        for i in 0..3u8 {
+            assert_eq!(read_frame(&mut b).await.unwrap(), vec![i; 100_000]);
+        }
+        assert!(read_frame(&mut b).await.unwrap().is_empty());
+        assert!(matches!(read_message(&mut b).await.unwrap(), Message::FileComplete { .. }));
+        writer.await.unwrap();
+    }
+
     #[tokio::test]
     async fn frame_bytes_round_trip_over_an_in_memory_duplex_stream() {
         let (mut a, mut b) = tokio::io::duplex(4096);

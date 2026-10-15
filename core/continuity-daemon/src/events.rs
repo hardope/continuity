@@ -52,6 +52,14 @@ pub enum SyncEvent {
     FileReceived { transfer_id: String, file_name: String, path: String },
     FileSent { transfer_id: String, file_name: String, to_name: String },
     FileTransferFailed { transfer_id: String, reason: String },
+    /// A transfer over a v3 data connection lost that connection partway
+    /// and is waiting to pick up where it left off — on either side, the
+    /// sender retrying (or waiting for the peer to reconnect) and the
+    /// receiver keeping what it has. Not an end state: the next
+    /// `FileTransferProgress` for the same `transfer_id` means it resumed,
+    /// and if it can't within 10 minutes it ends with `FileTransferFailed`.
+    /// May fire more than once while stalled, when `reason` changes.
+    FileTransferStalled { transfer_id: String, reason: String },
     Error(String),
     /// Trust store cleared and every active connection dropped, in
     /// response to `EngineCommand::Reset` — confirms it actually happened
@@ -164,6 +172,12 @@ pub enum SyncEvent {
 pub enum EngineCommand {
     ConfirmPairing { peer_crypto_id: String, accept: bool },
     SendFile { peer_crypto_id: String, path: String },
+    /// Where files received from now on are saved — offers that arrive
+    /// after this; a transfer already under way (or waiting to resume)
+    /// finishes where it started. Creates the directory if it's missing.
+    /// If it can't be created or written to, emits `SyncEvent::Error` and
+    /// keeps the previous directory.
+    SetReceivedFilesDir { path: String },
     /// Clears the trust store and disconnects every active peer, as if
     /// freshly installed. Every previously paired device will need to be
     /// paired again.

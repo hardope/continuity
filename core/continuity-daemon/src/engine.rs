@@ -8,8 +8,9 @@ use continuity_crypto::{
     TrustedDevice,
 };
 use continuity_net::{
-    announce_and_identify, connect, peer_from_service_info, read_frame, read_message,
-    start_pairing, write_frame, write_message, Connection, Discovery, FramingError, Listener, ServiceEvent,
+    announce_and_identify, announce_and_identify_after, connect, peer_from_service_info, read_frame, read_message,
+    start_pairing, start_pairing_after, write_frame, write_message, Connection, Discovery, FramingError, Listener,
+    ServiceEvent,
 };
 use continuity_proto::{
     DeviceInfo, Message, NowPlayingInfo, Platform, ScreenLockAction, ScreenLockOutcome, PROTOCOL_VERSION,
@@ -17,13 +18,21 @@ use continuity_proto::{
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::task::JoinHandle;
 
+/// The v3 file data connection: dialing it, streaming over it, receiving
+/// from it, and the resume state that outlives it — see that module's own
+/// docs. Everything below this point that still talks about `FileChunk`s is
+/// the in-band path, kept unchanged for peers older than v3.
+mod transfer;
+
+/// In-band (pre-v3) `FileChunk` size — see `transfer::FRAME_SIZE` for the
+/// data connection's.
 const CHUNK_SIZE: usize = 64 * 1024;
 const FILE_ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
 /// How much progress has to accumulate before another `FileTransferProgress`
@@ -72,9 +81,6 @@ const PING_INTERVAL: Duration = Duration::from_secs(30);
 /// better than the pre-keepalive "never" for a truly dead connection
 /// (wifi off, device asleep, out of range).
 const CONNECTION_READ_TIMEOUT: Duration = Duration::from_secs(180);
-/// Only a trusted (paired) peer can send a file at all, but this still
-/// bounds how much an unattended auto-accept can write to disk.
-const MAX_AUTO_ACCEPT_BYTES: u64 = 500 * 1024 * 1024;
 
 /// How long the controlling side waits, after its screen stream closes, for
 /// the controlled side's own `RemoteControlEnded` (which says why) before
@@ -126,6 +132,56 @@ impl EngineHandle {
     pub fn shutdown(self) {
         drop(self);
     }
+
+    /// Switches for this crate's own integration tests — see `TestHooks`.
+    /// Not part of the API any shell should use.
+    #[doc(hidden)]
+    pub fn test_hooks(&self) -> &TestHooks {
+        &self.state.test_hooks
+    }
+
+    /// Drops the mesh connection to `peer_crypto_id` the way a network
+    /// failure would — no manual-disconnect flag, transfers left to stall
+    /// and resume — for this crate's own integration tests.
+    #[doc(hidden)]
+    pub fn drop_connection_for_test(&self, peer_crypto_id: &str) {
+        if let Some(handle) = self.state.connection_handles.lock().unwrap().remove(peer_crypto_id) {
+            handle.abort();
+        }
+        self.state.connected.lock().unwrap().remove(peer_crypto_id);
+        self.state.peer_senders.lock().unwrap().remove(peer_crypto_id);
+    }
+}
+
+/// Knobs and counters that let `tests/` drive the v3 file transfer paths
+/// two real engines can't otherwise be made to take on demand (a data
+/// connection cut mid-file, a receiver that won't use one), and see which
+/// path a transfer actually took. All off / zero by default, and nothing
+/// outside tests sets them.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct TestHooks {
+    /// Sender: treat every peer as pre-v3 — in-band `FileChunk`s only.
+    pub force_in_band: AtomicBool,
+    /// Receiver: answer data-channel offers with `data_channel: false`.
+    pub refuse_data_channel: AtomicBool,
+    /// Sender: drop the next data connection once this many bytes of file
+    /// data have gone out on it. One-shot (reset to 0 when used); 0 = off.
+    pub cut_data_connection_after: AtomicU64,
+    /// Receiver: files verified and saved after arriving over a data
+    /// connection.
+    pub data_channel_files_received: AtomicU64,
+    /// Receiver: files received over the in-band path.
+    pub in_band_files_received: AtomicU64,
+    /// Receiver: the last non-zero offset it answered a resume offer with.
+    pub last_resume_offset: AtomicU64,
+    /// Inbound mesh connections that had to be read before they could be
+    /// told apart from a data connection (`transfer::route_inbound`).
+    pub mesh_connections_read_first: AtomicU64,
+    /// Announce this `protocol_version` instead of the real one on
+    /// connections made from now on (0 = the real one) — to stand in for
+    /// an older peer.
+    pub announce_protocol_version: std::sync::atomic::AtomicU32,
 }
 
 /// Dropping the handle shuts the engine down, so a handle that goes away
@@ -158,6 +214,10 @@ impl Drop for EngineHandle {
         for handle in self.state.connection_handles.lock().unwrap().values() {
             handle.abort();
         }
+        // Same gap, for v3 file transfers: each one runs in its own task
+        // (and its data connection in another), tracked in the transfer
+        // maps rather than `tasks` or `connection_handles`.
+        transfer::shut_down_transfers(&self.state);
         let _ = self.state.discovery.lock().unwrap().shutdown();
     }
 }
@@ -233,9 +293,21 @@ struct SharedState {
     /// to dial, since the trust store itself only has id/name, no address.
     known_addresses: Mutex<HashMap<String, SocketAddr>>,
     peer_senders: Mutex<HashMap<String, mpsc::UnboundedSender<Message>>>,
+    /// What each peer announced as its `protocol_version` on its most
+    /// recent connection — read by `send_file` to decide whether it can
+    /// offer a v3 data connection. Kept after a disconnect (it's only ever
+    /// read for a connected peer, and a reconnect overwrites it).
+    peer_protocol_versions: Mutex<HashMap<String, u32>>,
+    /// Notified (`notify_waiters`) whenever a peer's mesh connection comes
+    /// up, right after its `peer_senders` entry exists — a v3 transfer
+    /// stalled because the mesh dropped waits on this to re-offer.
+    peer_connected: Notify,
     last_programmatic_hash: Mutex<Option<String>>,
     pending_pairings: Mutex<HashMap<String, oneshot::Sender<bool>>>,
-    pending_file_accepts: Mutex<HashMap<String, oneshot::Sender<bool>>>,
+    /// Outstanding `FileOffer`s, keyed by `transfer_id`: the peer the offer
+    /// went to (a `FileAccept` from anyone else is ignored) and where its
+    /// answer goes.
+    pending_file_accepts: Mutex<HashMap<String, (String, oneshot::Sender<transfer::FileAcceptReply>)>>,
     /// Count of file transfers currently in flight with each peer (sending
     /// *or* receiving; a peer could in principle have one of each at
     /// once), keyed by `peer_crypto_id` — see the reader loop's ping-tick
@@ -252,6 +324,28 @@ struct SharedState {
     /// by the writer loop's own `break` on failure, completely
     /// independent of this staleness heuristic.
     file_transfers_in_flight: Mutex<HashMap<String, u32>>,
+    /// The same suppression for v3 transfers, counted separately: a v3
+    /// transfer's data goes over its own connection, which can outlive the
+    /// mesh connection (`clear_file_transfers` runs on every mesh teardown
+    /// and would otherwise zero a count a data connection still holds).
+    /// Counted only while a data connection is actually streaming — see
+    /// `transfer::DataStreamGuard` — not while a transfer is stalled
+    /// waiting to resume, when there's nothing on the wire to protect.
+    data_streams_in_flight: Mutex<HashMap<String, u32>>,
+    /// Engine-wide (not per-connection) v3 transfer state — see the
+    /// `transfer` module. Incoming keyed by (peer id, transfer id), since a
+    /// transfer id is only unique per sender; outgoing by transfer id.
+    incoming_transfers: Mutex<HashMap<(String, String), transfer::IncomingTransfer>>,
+    outgoing_transfers: Mutex<HashMap<String, transfer::OutgoingTransfer>>,
+    /// Notified (`notify_waiters`) whenever an incoming transfer changes
+    /// phase — a resume offer that found its transfer still attached to a
+    /// dying data connection waits on this for it to let go.
+    incoming_transfers_changed: Notify,
+    /// Unique id for each `IncomingTransfer` entry, so a data connection's
+    /// writer that finishes late never touches a *newer* entry under the
+    /// same key.
+    next_transfer_epoch: AtomicU64,
+    test_hooks: TestHooks,
     /// One `Semaphore` per outbound transfer currently streaming, holding
     /// `SEND_WINDOW_CHUNKS` permits — `send_file`'s read loop acquires
     /// one per chunk (blocking, i.e. pausing both reading *and* sending,
@@ -296,7 +390,10 @@ struct SharedState {
     /// outlives the connection that authorized it.
     remote_control_stream_handles: Mutex<HashMap<String, tokio::task::AbortHandle>>,
     events_tx: mpsc::UnboundedSender<SyncEvent>,
-    received_files_dir: PathBuf,
+    /// Behind a `Mutex` since `EngineCommand::SetReceivedFilesDir` can
+    /// change it while running. Read once per offer — a transfer keeps the
+    /// directory it started in.
+    received_files_dir: Mutex<PathBuf>,
     /// See `EngineCommand::SetPaused`. Checked by the accept loop, the
     /// dial loop, the clipboard watcher, and inbound clipboard-update
     /// handling — everywhere new syncing activity could start.
@@ -347,6 +444,7 @@ impl SharedState {
 
     fn has_file_transfer_in_flight(&self, peer_crypto_id: &str) -> bool {
         self.file_transfers_in_flight.lock().unwrap().contains_key(peer_crypto_id)
+            || self.data_streams_in_flight.lock().unwrap().contains_key(peer_crypto_id)
     }
 
     /// Unconditionally zeroes out `peer_crypto_id`'s in-flight count —
@@ -734,10 +832,18 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
         manually_disconnected: Mutex::new(HashSet::new()),
         known_addresses: Mutex::new(HashMap::new()),
         peer_senders: Mutex::new(HashMap::new()),
+        peer_protocol_versions: Mutex::new(HashMap::new()),
+        peer_connected: Notify::new(),
         last_programmatic_hash: Mutex::new(None),
         pending_pairings: Mutex::new(HashMap::new()),
         pending_file_accepts: Mutex::new(HashMap::new()),
         file_transfers_in_flight: Mutex::new(HashMap::new()),
+        data_streams_in_flight: Mutex::new(HashMap::new()),
+        incoming_transfers: Mutex::new(HashMap::new()),
+        outgoing_transfers: Mutex::new(HashMap::new()),
+        incoming_transfers_changed: Notify::new(),
+        next_transfer_epoch: AtomicU64::new(1),
+        test_hooks: TestHooks::default(),
         file_send_windows: Mutex::new(HashMap::new()),
         clipboard: config.clipboard,
         media: config.media,
@@ -748,7 +854,7 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
         pending_screen_stream_peers: Mutex::new(HashSet::new()),
         remote_control_stream_handles: Mutex::new(HashMap::new()),
         events_tx,
-        received_files_dir: config.received_files_dir,
+        received_files_dir: Mutex::new(config.received_files_dir),
         paused: AtomicBool::new(false),
         shutting_down: AtomicBool::new(false),
     });
@@ -835,10 +941,28 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                                 .insert(id_for_registry, join.abort_handle());
                             continue;
                         }
+                        // A v3 file data connection can't be told apart by
+                        // identity alone the way a screen stream is: the
+                        // same peer can dial this device for its mesh
+                        // connection at any moment too — and is especially
+                        // likely to while one of its transfers waits to
+                        // resume after the mesh dropped. So while a
+                        // transfer from this peer exists at all, its
+                        // connections are read first and sorted by their
+                        // first message (`transfer::route_inbound`); every
+                        // other inbound connection still goes straight to
+                        // `handle_connection`, unread.
+                        if transfer::may_dial_data_connection(&state, &peer_crypto_id) {
+                            let conn_state = state.clone();
+                            tokio::spawn(async move {
+                                transfer::route_inbound(conn, conn_state, peer_crypto_id, addr).await;
+                            });
+                            continue;
+                        }
                         let conn_state = state.clone();
                         let id_for_registry = peer_crypto_id.clone();
                         let join = tokio::spawn(async move {
-                            if let Err(e) = handle_connection(conn, conn_state, peer_crypto_id).await {
+                            if let Err(e) = handle_connection(conn, conn_state, peer_crypto_id, None).await {
                                 tracing::debug!("inbound connection from {addr} ended: {e}");
                             }
                         });
@@ -953,7 +1077,7 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                 let join = tokio::spawn(async move {
                     match connect(peer_addr, &conn_state.tls_identity).await {
                         Ok(conn) => {
-                            if let Err(e) = handle_connection(conn, conn_state, peer_id).await {
+                            if let Err(e) = handle_connection(conn, conn_state, peer_id, None).await {
                                 tracing::debug!("outbound connection to {peer_addr} ended: {e}");
                             }
                         }
@@ -1026,6 +1150,28 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                             send_file(&state, &peer_crypto_id, PathBuf::from(path)).await;
                         });
                     }
+                    EngineCommand::SetReceivedFilesDir { path } => {
+                        // Checked on the blocking pool — creating a
+                        // directory and probing it is synchronous file
+                        // I/O, possibly on a slow or network volume — but
+                        // awaited here, so a command sent after this one
+                        // already sees the new directory.
+                        let dir = PathBuf::from(&path);
+                        let probe = dir.clone();
+                        let usable = tokio::task::spawn_blocking(move || transfer::check_usable_dir(&probe))
+                            .await
+                            .unwrap_or_else(|e| Err(e.to_string()));
+                        match usable {
+                            Ok(()) => {
+                                tracing::info!("received files now go to {}", dir.display());
+                                *state.received_files_dir.lock().unwrap() = dir;
+                            }
+                            Err(e) => {
+                                tracing::warn!("can't use {path} for received files: {e}");
+                                state.emit(SyncEvent::Error(format!("Couldn't use '{path}' for received files: {e}")));
+                            }
+                        }
+                    }
                     EngineCommand::Reset => {
                         let handles: Vec<_> = state
                             .connection_handles
@@ -1057,6 +1203,12 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                         for peer_id in session_peers {
                             end_remote_control_session(&state, &peer_id, None, false);
                         }
+                        // v3 transfers outlive their mesh connections by
+                        // design (that's what lets them resume), so
+                        // aborting those connections doesn't stop them —
+                        // and nothing should keep streaming to or from a
+                        // device this one just forgot.
+                        transfer::cancel_transfers(&state, None, "cancelled: all paired devices were forgotten");
                         if let Err(e) = state.trust_store.lock().unwrap().clear() {
                             tracing::warn!("failed to clear trust store during reset: {e}");
                         }
@@ -1087,6 +1239,15 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                         release_dial_claim(&state, &peer_crypto_id);
                         state.peer_senders.lock().unwrap().remove(&peer_crypto_id);
                         end_remote_control_session(&state, &peer_crypto_id, None, false);
+                        // Same reasoning as `Reset`'s cancel: a v3
+                        // transfer's own data connection doesn't go down
+                        // with the mesh one, and a manual disconnect means
+                        // nothing more moves until the user reconnects.
+                        transfer::cancel_transfers(
+                            &state,
+                            Some(&peer_crypto_id),
+                            &format!("cancelled: disconnected from '{peer_name}'"),
+                        );
 
                         // Aborting the connection task skips its own normal
                         // exit-path `Disconnected` emit (abort cancels
@@ -1122,6 +1283,11 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                         // abort below — a shell updating its UI shouldn't
                         // wait on a network flush it has no reason to care
                         // about.
+                        transfer::cancel_transfers(
+                            &state,
+                            Some(&peer_crypto_id),
+                            &format!("cancelled: '{peer_name}' was forgotten"),
+                        );
                         state.emit(SyncEvent::WasRevoked { peer_id: peer_crypto_id.clone(), peer_name });
 
                         // Queuing onto `tx` above only *schedules* the
@@ -1176,7 +1342,7 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                         let join = tokio::spawn(async move {
                             match connect(addr, &conn_state.tls_identity).await {
                                 Ok(conn) => {
-                                    if let Err(e) = handle_connection(conn, conn_state, peer_crypto_id).await {
+                                    if let Err(e) = handle_connection(conn, conn_state, peer_crypto_id, None).await {
                                         tracing::debug!("reconnect to {addr} ended: {e}");
                                     }
                                 }
@@ -1319,6 +1485,7 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
     tasks.push(spawn_now_playing_watcher(state.clone()));
     tasks.push(spawn_reconnect_ticker(state.clone()));
     tasks.push(spawn_network_watcher(commands_tx.clone()));
+    tasks.push(transfer::spawn_expiry_sweeper(state.clone()));
 
     Ok(EngineHandle {
         events: events_rx,
@@ -1395,10 +1562,14 @@ fn finish_screen_lock_request(state: &Arc<SharedState>, peer: &DeviceInfo, actio
     state.emit(SyncEvent::ScreenLockRequested { peer_id: peer.id.clone(), peer_name: peer.name.clone(), action, outcome });
 }
 
+/// `first` is the connection's first message when the accept loop already
+/// had to read it to tell this connection from a v3 file data connection
+/// (see `transfer::route_inbound`) — `None` everywhere else.
 async fn handle_connection(
     conn: Connection,
     state: Arc<SharedState>,
     peer_crypto_id: String,
+    first: Option<Message>,
 ) -> anyhow::Result<()> {
     // No-op for an inbound connection (never claimed a dial in the first
     // place — `remove` on an absent key just returns `false`). For an
@@ -1415,7 +1586,7 @@ async fn handle_connection(
         connected.insert(peer_crypto_id.clone());
     }
 
-    let result = handle_connection_inner(conn, &state, &peer_crypto_id).await;
+    let result = handle_connection_inner(conn, &state, &peer_crypto_id, first).await;
 
     state.connected.lock().unwrap().remove(&peer_crypto_id);
     state.peer_senders.lock().unwrap().remove(&peer_crypto_id);
@@ -1438,16 +1609,28 @@ async fn handle_connection_inner(
     mut conn: Connection,
     state: &Arc<SharedState>,
     peer_crypto_id: &str,
+    first: Option<Message>,
 ) -> anyhow::Result<()> {
     let is_trusted = state.trust_store.lock().unwrap().is_trusted(peer_crypto_id);
 
     tracing::debug!("handle_connection_inner: peer={peer_crypto_id} is_trusted={is_trusted}");
 
+    let mut my_device = state.my_device.clone();
+    match state.test_hooks.announce_protocol_version.load(Ordering::Relaxed) {
+        0 => {}
+        version => my_device.protocol_version = version,
+    }
     let peer = if is_trusted {
-        announce_and_identify(&mut conn, &state.my_device).await?
+        match first {
+            Some(first) => announce_and_identify_after(&mut conn, &my_device, first).await?,
+            None => announce_and_identify(&mut conn, &my_device).await?,
+        }
     } else {
         tracing::debug!("calling start_pairing for {peer_crypto_id}");
-        let pending = start_pairing(conn, &state.my_device).await?;
+        let pending = match first {
+            Some(first) => start_pairing_after(conn, &my_device, first).await?,
+            None => start_pairing(conn, &my_device).await?,
+        };
         tracing::debug!("start_pairing returned, code={}", pending.code);
         let peer_name = pending.peer.name.clone();
 
@@ -1491,11 +1674,15 @@ async fn handle_connection_inner(
 
     let (mut read_half, mut write_half) = tokio::io::split(conn);
     let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+    state.peer_protocol_versions.lock().unwrap().insert(peer.id.clone(), peer.protocol_version);
     state
         .peer_senders
         .lock()
         .unwrap()
         .insert(peer_crypto_id.to_string(), tx.clone());
+    // After `peer_senders` has the entry — a stalled v3 transfer woken by
+    // this looks it up straight away to re-offer.
+    state.peer_connected.notify_waiters();
 
     // Tracks time since the last *activity* — a successful read OR write,
     // shared between the reader and writer loops below. Two real bugs
@@ -1625,12 +1812,30 @@ async fn handle_connection_inner(
                     file_name,
                     size_bytes,
                     mime: _,
+                    data_channel,
+                    resume,
                 }) => {
-                    handle_file_offer(state, &tx, &peer, &mut receiving, transfer_id, file_name, size_bytes).await;
+                    if data_channel && !state.test_hooks.refuse_data_channel.load(Ordering::Relaxed) {
+                        // Answered from its own task (free-space check,
+                        // creating the `.part` file, possibly waiting for
+                        // an old data connection to let go of it), so
+                        // none of that holds up this connection's reader.
+                        transfer::handle_data_channel_offer(state, &tx, &peer, transfer_id, file_name, size_bytes, resume);
+                    } else {
+                        handle_file_offer(state, &tx, &peer, &mut receiving, transfer_id, file_name, size_bytes).await;
+                    }
                 }
-                Ok(Message::FileAccept { transfer_id, accepted }) => {
-                    if let Some(waiter) = state.pending_file_accepts.lock().unwrap().remove(&transfer_id) {
-                        let _ = waiter.send(accepted);
+                Ok(Message::FileAccept { transfer_id, accepted, data_channel, offset, reason }) => {
+                    let waiter = {
+                        let mut pending = state.pending_file_accepts.lock().unwrap();
+                        // Only the peer the offer went to gets to answer it.
+                        match pending.get(&transfer_id) {
+                            Some((to, _)) if *to == peer.id => pending.remove(&transfer_id).map(|(_, waiter)| waiter),
+                            _ => None,
+                        }
+                    };
+                    if let Some(waiter) = waiter {
+                        let _ = waiter.send(transfer::FileAcceptReply { accepted, data_channel, offset, reason });
                     }
                 }
                 Ok(Message::FileChunk { transfer_id, seq: _, data }) => {
@@ -1738,6 +1943,11 @@ async fn handle_connection_inner(
                     // than treated as fatal.
                     tracing::debug!("ignoring ScreenStreamHandshake on the mesh connection from '{}'", peer.name);
                 }
+                Ok(Message::FileStreamHandshake { .. } | Message::FileVerified { .. }) => {
+                    // Same as `ScreenStreamHandshake` just above: these
+                    // only belong on a v3 file data connection.
+                    tracing::debug!("ignoring a data-connection message on the mesh connection from '{}'", peer.name);
+                }
                 Ok(Message::ScreenLockRequest { action }) => {
                     handle_screen_lock_request(state, &peer, action);
                 }
@@ -1774,6 +1984,9 @@ async fn handle_connection_inner(
     let mut sending_totals: HashMap<String, u64> = HashMap::new();
     let mut sending_progress: HashMap<String, u64> = HashMap::new();
     let mut sending_names: HashMap<String, String> = HashMap::new();
+    // v3 data-channel offers written by this loop — size and name, for the
+    // rare one the receiver turns down in favour of in-band chunks.
+    let mut data_channel_offers: HashMap<String, (u64, String)> = HashMap::new();
 
     let writer = async {
         while let Some(msg) = rx.recv().await {
@@ -1781,9 +1994,28 @@ async fn handle_connection_inner(
             // afterward — inspecting it post-write (not pre-) matters
             // here: everything below reacts to what was *actually*
             // written, not what was merely about to be attempted.
-            if let Message::FileOffer { transfer_id, size_bytes, file_name, .. } = &msg {
-                sending_totals.insert(transfer_id.clone(), *size_bytes);
-                sending_names.insert(transfer_id.clone(), file_name.clone());
+            // In-band offers only: a v3 data-channel transfer's data never
+            // passes through this loop, and its own task reports its end —
+            // tracking it here would fail it at this connection's teardown
+            // even though it's meant to survive (and resume past) exactly
+            // that. A data-channel offer is only remembered on the side,
+            // in case the receiver answers it with "in-band, please" and
+            // its `FileChunk`s turn up here after all (see below).
+            match &msg {
+                Message::FileOffer { transfer_id, size_bytes, file_name, data_channel: false, .. } => {
+                    sending_totals.insert(transfer_id.clone(), *size_bytes);
+                    sending_names.insert(transfer_id.clone(), file_name.clone());
+                }
+                Message::FileOffer { transfer_id, size_bytes, file_name, data_channel: true, .. } => {
+                    data_channel_offers.insert(transfer_id.clone(), (*size_bytes, file_name.clone()));
+                }
+                Message::FileChunk { transfer_id, .. } if !sending_totals.contains_key(transfer_id) => {
+                    if let Some((size_bytes, file_name)) = data_channel_offers.remove(transfer_id) {
+                        sending_totals.insert(transfer_id.clone(), size_bytes);
+                        sending_names.insert(transfer_id.clone(), file_name);
+                    }
+                }
+                _ => {}
             }
             if write_message(&mut write_half, &msg).await.is_err() {
                 break;
@@ -1927,19 +2159,30 @@ async fn handle_file_offer(
     file_name: String,
     size_bytes: u64,
 ) {
-    if size_bytes > MAX_AUTO_ACCEPT_BYTES {
-        tracing::warn!(
-            "rejecting file '{file_name}' from '{}': {size_bytes} bytes exceeds the auto-accept limit",
-            peer.name
-        );
+    // A v3 sender that couldn't open its data connection falls back to
+    // this path by re-offering the same transfer in-band — drop whatever
+    // was set up for the data connection first (an empty `.part` file).
+    // The user already saw this transfer start, so it isn't announced twice.
+    let already_announced = transfer::discard_for_in_band_fallback(state, &peer.id, &transfer_id);
+
+    // No size cap any more (there used to be a 500 MB auto-accept limit):
+    // the only reason to refuse a paired device's file is that it can't
+    // fit. The reason only reaches a v3 sender — older ones ignore the
+    // field and report a plain decline.
+    let dir = state.received_files_dir.lock().unwrap().clone();
+    if let Some(reason) = transfer::free_space_refusal_for(&dir, &state.my_device.name, size_bytes) {
+        tracing::warn!("refusing '{file_name}' from '{}': {reason}", peer.name);
         let _ = tx.send(Message::FileAccept {
             transfer_id,
             accepted: false,
+            data_channel: false,
+            offset: 0,
+            reason: Some(reason),
         });
         return;
     }
 
-    let path = unique_destination_path(&state.received_files_dir, &file_name);
+    let path = unique_destination_path(&dir, &file_name);
     let file = match tokio::fs::File::create(&path).await {
         Ok(f) => f,
         Err(e) => {
@@ -1950,17 +2193,22 @@ async fn handle_file_offer(
             let _ = tx.send(Message::FileAccept {
                 transfer_id,
                 accepted: false,
+                data_channel: false,
+                offset: 0,
+                reason: Some(format!("{} couldn't create the file: {e}", state.my_device.name)),
             });
             return;
         }
     };
 
-    state.emit(SyncEvent::FileReceiving {
-        transfer_id: transfer_id.clone(),
-        from_name: peer.name.clone(),
-        file_name: file_name.clone(),
-        size_bytes,
-    });
+    if !already_announced {
+        state.emit(SyncEvent::FileReceiving {
+            transfer_id: transfer_id.clone(),
+            from_name: peer.name.clone(),
+            file_name: file_name.clone(),
+            size_bytes,
+        });
+    }
 
     receiving.insert(
         transfer_id.clone(),
@@ -1979,6 +2227,9 @@ async fn handle_file_offer(
     let _ = tx.send(Message::FileAccept {
         transfer_id,
         accepted: true,
+        data_channel: false,
+        offset: 0,
+        reason: None,
     });
 }
 
@@ -2038,6 +2289,7 @@ async fn handle_file_complete(
         let _ = tokio::fs::remove_file(&rf.path).await;
         return;
     }
+    state.test_hooks.in_band_files_received.fetch_add(1, Ordering::Relaxed);
     state.emit(SyncEvent::FileReceived {
         transfer_id: transfer_id.to_string(),
         file_name: rf.file_name,
@@ -2103,7 +2355,7 @@ async fn send_file(state: &Arc<SharedState>, peer_crypto_id: &str, path: PathBuf
         }
     };
 
-    let Some(tx) = state
+    let Some(mut tx) = state
         .peer_senders
         .lock()
         .unwrap()
@@ -2117,35 +2369,6 @@ async fn send_file(state: &Arc<SharedState>, peer_crypto_id: &str, path: PathBuf
         return;
     };
 
-    let (accept_tx, accept_rx) = oneshot::channel();
-    state
-        .pending_file_accepts
-        .lock()
-        .unwrap()
-        .insert(transfer_id.clone(), accept_tx);
-
-    let _ = tx.send(Message::FileOffer {
-        transfer_id: transfer_id.clone(),
-        origin_device: state.my_device.id.clone(),
-        file_name: file_name.clone(),
-        size_bytes,
-        mime: None,
-    });
-
-    let accepted = matches!(
-        tokio::time::timeout(FILE_ACCEPT_TIMEOUT, accept_rx).await,
-        Ok(Ok(true))
-    );
-
-    if !accepted {
-        state.pending_file_accepts.lock().unwrap().remove(&transfer_id);
-        state.emit(SyncEvent::FileTransferFailed {
-            transfer_id,
-            reason: "declined, or the peer didn't respond in time".into(),
-        });
-        return;
-    }
-
     let peer_name = state
         .trust_store
         .lock()
@@ -2154,6 +2377,100 @@ async fn send_file(state: &Arc<SharedState>, peer_crypto_id: &str, path: PathBuf
         .map(|d| d.name.clone())
         .unwrap_or_else(|| peer_crypto_id.to_string());
 
+    // v3: the file goes over a dedicated data connection this side dials
+    // to the peer — which needs a peer that understands one, and an
+    // address to dial (the same mDNS-resolved cache the screen stream's
+    // dial-back uses; a mesh connection's own remote address is only
+    // dialable when this side was the one that dialed it, so it isn't one
+    // to rely on). Without either, it's the in-band path from the start,
+    // exactly as before v3.
+    let peer_version = state.peer_protocol_versions.lock().unwrap().get(peer_crypto_id).copied().unwrap_or(0);
+    let force_in_band = state.test_hooks.force_in_band.load(Ordering::Relaxed);
+    let has_address = || state.known_addresses.lock().unwrap().contains_key(peer_crypto_id);
+    let mut has_address_now = has_address();
+    if peer_version >= 3 && !force_in_band && !has_address_now {
+        // Same wait as accepting a remote-control request does for its
+        // dial-back address (`accept_remote_control_session`): a peer
+        // that dialed this device can be connected a moment before this
+        // side's own mDNS has resolved it, and a file sent in that moment
+        // shouldn't miss out on the data connection for it.
+        let deadline = tokio::time::Instant::now() + DIAL_BACK_ADDRESS_WAIT;
+        while !has_address_now && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            has_address_now = has_address();
+        }
+    }
+    let has_address = has_address_now;
+    let mut announced = false;
+    if peer_version >= 3 && has_address && !force_in_band {
+        drop(file);
+        let outgoing = transfer::Outgoing {
+            transfer_id: transfer_id.clone(),
+            peer_id: peer_crypto_id.to_string(),
+            peer_name: peer_name.clone(),
+            path: path.clone(),
+            file_name: file_name.clone(),
+            size_bytes,
+        };
+        let transfer::DataChannelEnd::InBand { tx: in_band_tx, reoffer, announced: was_announced } =
+            transfer::send_over_data_channel(state, outgoing).await
+        else {
+            return;
+        };
+        // The data connection didn't happen: either the receiver chose
+        // in-band itself, or this side couldn't open the connection before
+        // any data went over it — the in-band path below, from the start.
+        announced = was_announced;
+        file = match tokio::fs::File::open(&path).await {
+            Ok(f) => f,
+            Err(e) => {
+                state.emit(SyncEvent::FileTransferFailed {
+                    transfer_id,
+                    reason: format!("couldn't read '{}': {e}", path.display()),
+                });
+                return;
+            }
+        };
+        if !reoffer {
+            send_in_band(state, peer_crypto_id, &in_band_tx, transfer_id, file_name, size_bytes, file, &path, &peer_name, announced)
+                .await;
+            return;
+        }
+        tx = in_band_tx;
+    }
+
+    let reply = transfer::offer(state, &tx, peer_crypto_id, &transfer_id, &file_name, size_bytes, false, false).await;
+    match reply {
+        Some(reply) if reply.accepted => {}
+        reply => {
+            let reason = reply
+                .and_then(|r| r.reason)
+                .unwrap_or_else(|| "declined, or the peer didn't respond in time".to_string());
+            state.emit(SyncEvent::FileTransferFailed { transfer_id, reason });
+            return;
+        }
+    }
+
+    send_in_band(state, peer_crypto_id, &tx, transfer_id, file_name, size_bytes, file, &path, &peer_name, announced).await;
+}
+
+/// The in-band (pre-v3) send, once the peer has accepted: every chunk as a
+/// `FileChunk` on the mesh connection. Unchanged from before v3 apart from
+/// being split out of `send_file` — `announced` skips `FileSending` when a
+/// v3 attempt that fell back to this already emitted it.
+#[allow(clippy::too_many_arguments)]
+async fn send_in_band(
+    state: &Arc<SharedState>,
+    peer_crypto_id: &str,
+    tx: &mpsc::UnboundedSender<Message>,
+    transfer_id: String,
+    file_name: String,
+    size_bytes: u64,
+    mut file: tokio::fs::File,
+    path: &Path,
+    peer_name: &str,
+    announced: bool,
+) {
     // Marks this transfer as in flight until the *writer loop* actually
     // finishes putting `FileComplete` on the wire (see the `Message::
     // FileComplete` match arm there) — deliberately not balanced by an
@@ -2166,12 +2483,14 @@ async fn send_file(state: &Arc<SharedState>, peer_crypto_id: &str, path: PathBuf
     // still be slowly draining the backlog — exactly the window this
     // exists to protect. See `file_transfers_in_flight`'s doc comment.
     state.begin_file_transfer(peer_crypto_id);
-    state.emit(SyncEvent::FileSending {
-        transfer_id: transfer_id.clone(),
-        to_name: peer_name.clone(),
-        file_name: file_name.clone(),
-        size_bytes,
-    });
+    if !announced {
+        state.emit(SyncEvent::FileSending {
+            transfer_id: transfer_id.clone(),
+            to_name: peer_name.to_string(),
+            file_name: file_name.clone(),
+            size_bytes,
+        });
+    }
 
     let window = Arc::new(tokio::sync::Semaphore::new(SEND_WINDOW_CHUNKS));
     state.file_send_windows.lock().unwrap().insert(transfer_id.clone(), window.clone());
@@ -2434,7 +2753,7 @@ fn redial_disconnected_trusted_peers(state: &Arc<SharedState>) {
         let join = tokio::spawn(async move {
             match connect(addr, &conn_state.tls_identity).await {
                 Ok(conn) => {
-                    if let Err(e) = handle_connection(conn, conn_state, peer_crypto_id).await {
+                    if let Err(e) = handle_connection(conn, conn_state, peer_crypto_id, None).await {
                         tracing::debug!("reconnect to {addr} ended: {e}");
                     }
                 }

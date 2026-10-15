@@ -107,6 +107,7 @@ fn handle_event(event: SyncEvent, cli_state: &CliState) {
         SyncEvent::FileReceived { file_name, path, .. } => println!("received '{file_name}' -> {path}"),
         SyncEvent::FileSent { file_name, to_name, .. } => println!("sent '{file_name}' to '{to_name}'"),
         SyncEvent::FileTransferFailed { reason, .. } => println!("file transfer failed: {reason}"),
+        SyncEvent::FileTransferStalled { reason, .. } => println!("file transfer stalled: {reason}"),
         SyncEvent::Error(e) => tracing::warn!("{e}"),
         SyncEvent::WasReset => println!("reset: all paired devices forgotten"),
         SyncEvent::PausedStateChanged { paused } => {

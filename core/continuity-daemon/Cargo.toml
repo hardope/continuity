@@ -22,4 +22,11 @@ hostname = "0.4"
 # for the network-change watcher (polls the local interface/address list to
 # react to Wi-Fi switches, VPN connects, cable plug/unplug).
 if-addrs = "0.13"
+# Free space on the received-files volume, checked before accepting a file
+# (there's no size cap — the only reason to refuse a paired device's file is
+# that it won't fit). statvfs via rustix on Unix/Android/macOS,
+# GetDiskFreeSpaceExW on Windows; both of its backends' dependencies are
+# already in the tree. Without its default `sync` feature, which only adds
+# file locking.
+fs4 = { version = "1", default-features = false }
 arboard = { version = "3", optional = true }
