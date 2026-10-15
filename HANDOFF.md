@@ -12,11 +12,19 @@ installers in `installers/`).
   the final commit (Linux build + all unit/integration tests, Windows and macOS
   type-checks, lite build). The Android compile passed before the last few
   desktop/engine fixes and none of those touched Android.
-- Fixed from the review so far (ticked in REVIEW-NOTES.md): transfer-engine-1,
-  -4, -5, -7, -8; desktop-shell-1, -3, -5, -6, -7, -10.
-- Next up, in this order: transfer-engine-2 (was about to start), -9, -3, -6;
-  desktop-shell-2, -8, -4 + -9 together; then the remote-control and Android
-  findings at the bottom of this file. remote-control-2 is probably already
+- Fixed from the review so far (ticked in REVIEW-NOTES.md): every
+  transfer-engine finding (-1 to -9); desktop-shell-1, -3, -5, -6, -7, -10.
+  transfer-engine-9 used the owner's choice: the sender sends one device at
+  most 4 files at a time, the receiver refuses a 17th unfinished one.
+- Next up, in this order: desktop-shell-2, -8, -4 + -9 together; then the
+  remote-control and Android findings at the bottom of this file.
+- Open question for the owner: `a_cut_data_connection_resumes_where_it_left_off`
+  fails on macOS (also on the code before these fixes; CI runs it on Linux
+  only). On macOS loopback a TLS connection dropped without close_notify
+  while bytes are still queued never errors on the reader, so the receiver
+  only learns of the cut when the sender's resume offer ends it. The file
+  still arrives. Options: relax the test, or have the sender shut data
+  connections down cleanly (a behaviour change — ask first). remote-control-2 is probably already
   fixed by commit "Control one computer at a time from the window" (it ends the
   previous session before opening a new viewer) — check, then tick it.
 - The review of the macOS SwiftUI app + cross-component contracts never
