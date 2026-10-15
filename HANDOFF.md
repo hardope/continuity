@@ -157,6 +157,21 @@ Approved decisions (all implemented):
    testing on real devices (everything GUI/device-level — nothing was run on a
    real Mac/PC/phone), and the "Waiting for approval" list.
 
+## Approved by the owner on 2026-10-15 (after the review fixes)
+
+- Fix the listener: run each inbound TLS handshake in its own task with a
+  timeout (a LAN host could freeze the listener with one idle connection).
+- From the list below, items 1, 2, 3, 5, 6, 7, 8, 9 — everything except the
+  macOS banners-while-active item (later): macOS frame downscaling, Windows
+  scan codes, renaming the "Continuity Settings" helper bundle, a v3 cancel
+  message + Cancel button, `.part` cleanup at startup, falling back to the
+  default folder mid-run, Android's quiet send-start notification + lint
+  baseline, Linux `StartupWMClass`.
+- Then: one CI run (release.yml dispatched on tmp/review-fixes — approved),
+  then the branch move (fast-forward feature/fast-transfers, drop
+  REVIEW-NOTES.md and HANDOFF.md in a final commit, plain push), then
+  delete tmp/review-fixes and tmp/review-fixes-engine (approved).
+
 ## Waiting for the owner's approval (do NOT implement without a yes)
 
 - macOS controlled side: downscale captured frames (max ~1920 wide, as Linux
