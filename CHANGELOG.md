@@ -4,6 +4,49 @@ All notable user-facing changes to Continuity are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- **Fast, resumable file transfers.** Files now go over a connection of
+  their own, several times faster than before, without holding up the
+  clipboard or remote control meanwhile. A big file that's interrupted —
+  the Wi-Fi dropping, a laptop going to sleep — picks up where it stopped
+  instead of starting over, for up to ten minutes. There's no size limit any
+  more (it used to be 500 MB): a device turns a file down only when it hasn't
+  the room, and the sender says why ("Not enough free space on Pixel (needs
+  1.3 GB, 300 MB free)"). Many files at once go to a device a few at a time.
+  Devices still on 0.1.6 or older get files the old way.
+- **Choose where received files go** (#1). In the Continuity window,
+  Received files → **Change…** picks the folder and **Open** shows it. On
+  Android, files now go to `Download/Continuity`, where the Files app shows
+  them, and **Change folder** picks another.
+- **A notification for every received file** (#2), with an **Open** button —
+  on Android a pop-up that shows the progress while it arrives.
+- **The Continuity window is the app's main window.** Tray menu → **Open
+  Continuity** (on Windows, a click on the tray icon); it also opens by
+  itself the first time, and when you start Continuity again while it's
+  running. The tray menu keeps just Send File, Pause Syncing and Quit. A
+  Transfers page lists files on their way and the ones that just finished,
+  with **Open** and **Show in folder**.
+- **Control a computer from another computer.** On a connected computer's
+  page in the window, **Control** opens its screen in a window of its own,
+  with the whole keyboard — Command and Control swap places between a Mac and
+  a PC, so shortcuts stay where your hands expect them — and drags and
+  double-clicks.
+- A refresh button under Nearby in the macOS window looks for devices again.
+
+### Fixed
+
+- **Notifications on macOS came from Finder** — Finder's name, icon and
+  notification settings — and on Windows from "Windows PowerShell". They're
+  Continuity's own now.
+- **A paired device can no longer save a file outside the received-files
+  folder** by putting a path in the file's name.
+- **Opening a received file on Windows** no longer goes through the command
+  prompt, where a file name containing `&` could run a command.
+- Starting Continuity twice in quick succession no longer runs two copies.
+- Holding a key while controlling a Linux computer no longer leaves it stuck
+  down there.
+
 ## [0.1.6] - 2026-10-08
 
 ### Added
