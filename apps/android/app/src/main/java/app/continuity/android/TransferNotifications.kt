@@ -132,7 +132,7 @@ class TransferNotifications(private val context: Context) {
             .setAutoCancel(true)
             .setContentIntent(open ?: openApp)
         if (open != null) builder.addAction(0, "Open", open)
-        manager.notify(doneTag(transferId), NOTIFICATION_ID, builder.build())
+        postDone(transferId, builder.build())
     }
 
     fun sent(transferId: String, fileName: String, toName: String) {
@@ -146,7 +146,7 @@ class TransferNotifications(private val context: Context) {
             .setAutoCancel(true)
             .setContentIntent(openApp)
             .build()
-        manager.notify(doneTag(transferId), NOTIFICATION_ID, notification)
+        postDone(transferId, notification)
     }
 
     /** Also covers a send refused before it ever started — say, not enough
@@ -170,6 +170,26 @@ class TransferNotifications(private val context: Context) {
             .setAutoCancel(true)
             .setContentIntent(openApp)
             .build()
+        postDone(transferId, notification)
+    }
+
+    /** Posts a finished transfer's notification, first taking down the
+     * oldest finished ones beyond [MAX_DONE_SHOWN] — including any left from
+     * before a restart. **Real bug fixed here**: each one stayed until
+     * tapped, and Android stops showing an app's new notifications once it
+     * has 50 up (the status one and any in progress count too), so in a
+     * share of 60 photos, from about the 48th on neither progress nor
+     * "Received" notifications appeared at all. */
+    private fun postDone(transferId: String, notification: Notification) {
+        try {
+            manager.activeNotifications
+                .filter { it.id == NOTIFICATION_ID && it.tag?.startsWith(DONE_TAG_PREFIX) == true && it.tag != doneTag(transferId) }
+                .sortedBy { it.postTime }
+                .dropLast(MAX_DONE_SHOWN - 1)
+                .forEach { manager.cancel(it.tag, it.id) }
+        } catch (e: Exception) {
+            android.util.Log.w("TransferNotifications", "couldn't take down old transfer notifications", e)
+        }
         manager.notify(doneTag(transferId), NOTIFICATION_ID, notification)
     }
 
@@ -249,6 +269,11 @@ class TransferNotifications(private val context: Context) {
         private const val PROGRESS_MAX = 1000
         private const val PER_TRANSFER_INTERVAL_MS = 500L
         private const val OVERALL_INTERVAL_MS = 250L
+
+        /** Finished-transfer notifications kept up at once (see
+         * `postDone`): plenty to see what just arrived, well under the 50
+         * an app may show. */
+        private const val MAX_DONE_SHOWN = 20
 
         private fun activeTag(transferId: String) = ACTIVE_TAG_PREFIX + transferId
         private fun doneTag(transferId: String) = DONE_TAG_PREFIX + transferId
