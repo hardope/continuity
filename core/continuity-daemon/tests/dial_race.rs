@@ -120,3 +120,40 @@ async fn natural_mdns_auto_dial_produces_exactly_one_connection_per_side() {
     assert_eq!(a_disconnects, 0, "A should see no disconnect — a race would show up as an immediate spurious one");
     assert_eq!(b_disconnects, 0, "B should see no disconnect — a race would show up as an immediate spurious one");
 }
+
+/// A connection that opens and never starts its TLS handshake — anyone on
+/// the network can make one, no pairing needed — doesn't stop the engine
+/// accepting others: a paired device connecting after it still gets
+/// through straight away. Driven by hand over loopback.
+#[tokio::test]
+async fn an_idle_connection_does_not_hold_up_the_listener() {
+    use continuity_proto::{DeviceInfo, Platform};
+
+    let peer_identity = Identity::generate();
+    let peer_id = peer_identity.device_id();
+    let mut engine = make_engine("IdleListener", Identity::generate(), &peer_id, "HandPeer").await.expect("start engine");
+    let port = loop {
+        match tokio::time::timeout(Duration::from_secs(5), engine.events.recv()).await {
+            Ok(Some(SyncEvent::Listening { port })) => break port,
+            Ok(Some(_)) => continue,
+            other => panic!("no Listening event: {other:?}"),
+        }
+    };
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+    // Opens and says nothing, for the rest of the test.
+    let _idle = tokio::net::TcpStream::connect(addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let tls = continuity_crypto::generate_self_signed(&peer_identity).unwrap();
+    let device = DeviceInfo { id: peer_id.clone(), name: "HandPeer".into(), platform: Platform::Linux, protocol_version: 3 };
+    let connected = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut conn = continuity_net::connect(addr, &tls).await?;
+        continuity_net::announce_and_identify(&mut conn, &device).await?;
+        anyhow::Ok(conn)
+    })
+    .await;
+    assert!(matches!(connected, Ok(Ok(_))), "a paired device couldn't connect behind an idle connection: {:?}", connected.map(|r| r.map(|_| ())));
+
+    engine.shutdown();
+}

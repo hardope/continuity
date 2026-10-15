@@ -38,6 +38,8 @@ TLS 1.3 (rustls) over TCP, with mutual client-certificate authentication — bot
 
 Whether that cryptographically-proven id is *trusted* is a separate, application-level decision — the same split SSH makes between "handshake succeeded" and "host key is known." See Pairing below.
 
+**Accepting.** The engine's accept loop only accepts TCP connections (`Listener::accept_tcp`); each one's TLS handshake runs in a task of its own, given 15 s to finish, with at most 64 under way at once (any more are dropped at once), and only then is the connection routed. **Real bug fixed here**: the accept loop used to do each handshake itself, with no time limit, so one connection that opened and never sent its hello — anyone on the network can make one, no pairing needed — stopped the device accepting anything else for good: reconnects, file data connections and screen streams. Covered by `an_idle_connection_does_not_hold_up_the_listener` (`tests/dial_race.rs`).
+
 ## Connection liveness
 
 **Real bug found post-release:** a peer's message loop only ever exited when `read_message` returned an error — fine for a connection that closes cleanly, but nothing detected a connection that just goes *silent* (wifi drops, the device sleeps, a NAT/router drops an idle UDP/TCP mapping) with no FIN/RST ever arriving. No `SO_KEEPALIVE` was set either. A connection like that stayed in `connected`/`peer_senders` forever from this side's perspective, which meant the mDNS tie-break auto-reconnect logic saw "already connected" and skipped redialing once the peer came back — the reported symptom was "device doesn't reconnect until I restart the app."

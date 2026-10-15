@@ -92,6 +92,22 @@ const SCREEN_STREAM_END_GRACE: Duration = Duration::from_millis(750);
 /// `accept_remote_control_session`.
 const DIAL_BACK_ADDRESS_WAIT: Duration = Duration::from_secs(5);
 
+/// How long an inbound connection may take over its TLS handshake. Each one
+/// runs in a task of its own (see the accept loop), so a slow one only
+/// holds up itself. **Real bug fixed here**: the accept loop used to do
+/// each handshake itself, with no limit, so one connection that never sent
+/// its hello — anyone on the network can open one, no pairing needed —
+/// stopped this device accepting anything ever again: reconnects, file
+/// data connections, screen streams. A handshake on a LAN takes
+/// milliseconds; this only has to outlast a very busy machine.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Inbound TLS handshakes allowed under way at once. Each holds a socket
+/// for up to `TLS_HANDSHAKE_TIMEOUT`; past this, new connections are
+/// dropped straight away rather than let a flood of idle ones use up this
+/// process's file descriptors.
+const MAX_PENDING_HANDSHAKES: usize = 64;
+
 pub struct EngineConfig {
     pub identity: Identity,
     pub device_name: String,
@@ -550,6 +566,108 @@ fn end_remote_control_session(state: &Arc<SharedState>, peer_crypto_id: &str, re
 /// (see `pending_screen_stream_peers`) — a second identity round-trip
 /// would confirm nothing a redundant read wouldn't already need to pay
 /// for.
+/// Where an inbound connection goes once its TLS handshake is done — to
+/// the screen stream, a file's data connection, or the mesh — by who it
+/// is (and, where that isn't enough, by its first message).
+fn route_accepted(state: &Arc<SharedState>, conn: Connection, addr: SocketAddr) {
+    if state.paused.load(Ordering::Relaxed) {
+        tracing::debug!("dropping inbound connection from {addr}: paused");
+        return;
+    }
+    let peer_crypto_id = match conn.peer_device_id() {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::debug!("couldn't read peer id for inbound conn from {addr}: {e}");
+            return;
+        }
+    };
+    // **Real bug found and fixed while adding the
+    // remote-control screen stream**: this used to
+    // cache `addr` into `known_addresses` here, but
+    // `addr` is the *remote ephemeral port* of this
+    // specific inbound TCP connection (straight from
+    // `TcpListener::accept()`), never the peer's
+    // actual listening port — dialing it back later
+    // would connect to nothing, or nothing useful.
+    // Mostly silently harmless before now: the mDNS
+    // browse loop below writes the *correct*
+    // (listening-port) address for every peer it
+    // sees regardless of connection direction, and
+    // usually re-writes it again soon after,
+    // papering over the bad entry in practice. It
+    // stopped being harmless once something needed
+    // to reliably dial a peer *immediately* after
+    // accepting a connection from them, before
+    // mDNS's next natural re-announce had a chance
+    // to overwrite the bad value again —
+    // `push_screen_stream` dialing back to open the
+    // dedicated screen-stream connection right after
+    // accepting a remote-control request does
+    // exactly that. Caught by
+    // `core/continuity-daemon/tests/remote_control.rs`
+    // flaking under real concurrent mDNS activity
+    // (multiple engine pairs in one test binary) —
+    // reliable in isolation, where there was more
+    // incidental time for mDNS to have already
+    // fixed the entry. Fixed by simply not writing
+    // here at all — mDNS discovery (see below) is
+    // the only source that's ever actually correct
+    // for this map.
+    if state.manually_disconnected.lock().unwrap().contains(&peer_crypto_id) {
+        tracing::debug!("rejecting inbound connection from {addr}: manually disconnected");
+        return;
+    }
+    // A screen-stream connection is recognized purely
+    // by identity, not by peeking at anything it
+    // sends — this device already knows it's
+    // expecting exactly one more inbound connection
+    // from this specific, TLS-cert-proven peer id
+    // (see `pending_screen_stream_peers`'s doc
+    // comment), so there's nothing to read-and-decide
+    // here, no added latency on the far more common
+    // plain-reconnect case.
+    //
+    // Unless that peer may also be dialing a file data
+    // connection (below): the two could arrive in
+    // either order, so then the screen stream is told
+    // apart by its first message like everything else.
+    let may_dial_data = transfer::may_dial_data_connection(&state, &peer_crypto_id);
+    if !may_dial_data && state.pending_screen_stream_peers.lock().unwrap().remove(&peer_crypto_id) {
+        spawn_screen_stream_connection(&state, conn, peer_crypto_id, addr, None);
+        return;
+    }
+    // A v3 file data connection can't be told apart by
+    // identity alone the way a screen stream is: the
+    // same peer can dial this device for its mesh
+    // connection at any moment too — and is especially
+    // likely to while one of its transfers waits to
+    // resume after the mesh dropped. So while a
+    // transfer from this peer exists at all, its
+    // connections are read first and sorted by their
+    // first message (`transfer::route_inbound`); every
+    // other inbound connection still goes straight to
+    // `handle_connection`, unread.
+    if may_dial_data {
+        let conn_state = state.clone();
+        tokio::spawn(async move {
+            transfer::route_inbound(conn, conn_state, peer_crypto_id, addr).await;
+        });
+        return;
+    }
+    let conn_state = state.clone();
+    let id_for_registry = peer_crypto_id.clone();
+    let join = tokio::spawn(async move {
+        if let Err(e) = handle_connection(conn, conn_state, peer_crypto_id, None).await {
+            tracing::debug!("inbound connection from {addr} ended: {e}");
+        }
+    });
+    state
+        .connection_handles
+        .lock()
+        .unwrap()
+        .insert(id_for_registry, join.abort_handle());
+}
+
 /// Runs `handle_screen_stream_connection` in its own task, registered so
 /// ending the session can abort it. `first` is its handshake, if
 /// `transfer::route_inbound` already read it.
@@ -925,105 +1043,28 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
     tasks.push({
         let state = state.clone();
         tokio::spawn(async move {
+            let handshakes = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_HANDSHAKES));
             loop {
-                match listener.accept().await {
-                    Ok((conn, addr)) => {
-                        if state.paused.load(Ordering::Relaxed) {
-                            tracing::debug!("dropping inbound connection from {addr}: paused");
+                match listener.accept_tcp().await {
+                    Ok(incoming) => {
+                        let addr = incoming.peer_addr();
+                        // Over the cap, the connection is just dropped:
+                        // more half-open ones than any real set of devices
+                        // makes is someone holding sockets open.
+                        let Ok(permit) = handshakes.clone().try_acquire_owned() else {
+                            tracing::debug!("dropping inbound connection from {addr}: {MAX_PENDING_HANDSHAKES} handshakes already under way");
                             continue;
-                        }
-                        let peer_crypto_id = match conn.peer_device_id() {
-                            Ok(id) => id,
-                            Err(e) => {
-                                tracing::debug!("couldn't read peer id for inbound conn from {addr}: {e}");
-                                continue;
-                            }
                         };
-                        // **Real bug found and fixed while adding the
-                        // remote-control screen stream**: this used to
-                        // cache `addr` into `known_addresses` here, but
-                        // `addr` is the *remote ephemeral port* of this
-                        // specific inbound TCP connection (straight from
-                        // `TcpListener::accept()`), never the peer's
-                        // actual listening port — dialing it back later
-                        // would connect to nothing, or nothing useful.
-                        // Mostly silently harmless before now: the mDNS
-                        // browse loop below writes the *correct*
-                        // (listening-port) address for every peer it
-                        // sees regardless of connection direction, and
-                        // usually re-writes it again soon after,
-                        // papering over the bad entry in practice. It
-                        // stopped being harmless once something needed
-                        // to reliably dial a peer *immediately* after
-                        // accepting a connection from them, before
-                        // mDNS's next natural re-announce had a chance
-                        // to overwrite the bad value again —
-                        // `push_screen_stream` dialing back to open the
-                        // dedicated screen-stream connection right after
-                        // accepting a remote-control request does
-                        // exactly that. Caught by
-                        // `core/continuity-daemon/tests/remote_control.rs`
-                        // flaking under real concurrent mDNS activity
-                        // (multiple engine pairs in one test binary) —
-                        // reliable in isolation, where there was more
-                        // incidental time for mDNS to have already
-                        // fixed the entry. Fixed by simply not writing
-                        // here at all — mDNS discovery (see below) is
-                        // the only source that's ever actually correct
-                        // for this map.
-                        if state.manually_disconnected.lock().unwrap().contains(&peer_crypto_id) {
-                            tracing::debug!("rejecting inbound connection from {addr}: manually disconnected");
-                            continue;
-                        }
-                        // A screen-stream connection is recognized purely
-                        // by identity, not by peeking at anything it
-                        // sends — this device already knows it's
-                        // expecting exactly one more inbound connection
-                        // from this specific, TLS-cert-proven peer id
-                        // (see `pending_screen_stream_peers`'s doc
-                        // comment), so there's nothing to read-and-decide
-                        // here, no added latency on the far more common
-                        // plain-reconnect case.
-                        //
-                        // Unless that peer may also be dialing a file data
-                        // connection (below): the two could arrive in
-                        // either order, so then the screen stream is told
-                        // apart by its first message like everything else.
-                        let may_dial_data = transfer::may_dial_data_connection(&state, &peer_crypto_id);
-                        if !may_dial_data && state.pending_screen_stream_peers.lock().unwrap().remove(&peer_crypto_id) {
-                            spawn_screen_stream_connection(&state, conn, peer_crypto_id, addr, None);
-                            continue;
-                        }
-                        // A v3 file data connection can't be told apart by
-                        // identity alone the way a screen stream is: the
-                        // same peer can dial this device for its mesh
-                        // connection at any moment too — and is especially
-                        // likely to while one of its transfers waits to
-                        // resume after the mesh dropped. So while a
-                        // transfer from this peer exists at all, its
-                        // connections are read first and sorted by their
-                        // first message (`transfer::route_inbound`); every
-                        // other inbound connection still goes straight to
-                        // `handle_connection`, unread.
-                        if may_dial_data {
-                            let conn_state = state.clone();
-                            tokio::spawn(async move {
-                                transfer::route_inbound(conn, conn_state, peer_crypto_id, addr).await;
-                            });
-                            continue;
-                        }
-                        let conn_state = state.clone();
-                        let id_for_registry = peer_crypto_id.clone();
-                        let join = tokio::spawn(async move {
-                            if let Err(e) = handle_connection(conn, conn_state, peer_crypto_id, None).await {
-                                tracing::debug!("inbound connection from {addr} ended: {e}");
+                        let state = state.clone();
+                        tokio::spawn(async move {
+                            let handshake = tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, incoming.handshake()).await;
+                            drop(permit);
+                            match handshake {
+                                Ok(Ok(conn)) => route_accepted(&state, conn, addr),
+                                Ok(Err(e)) => tracing::debug!("TLS handshake with {addr} failed: {e}"),
+                                Err(_) => tracing::debug!("{addr} didn't finish its TLS handshake within {TLS_HANDSHAKE_TIMEOUT:?}, dropping it"),
                             }
                         });
-                        state
-                            .connection_handles
-                            .lock()
-                            .unwrap()
-                            .insert(id_for_registry, join.abort_handle());
                     }
                     Err(e) => {
                         tracing::warn!("accept error: {e}");

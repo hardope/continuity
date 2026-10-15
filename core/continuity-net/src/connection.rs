@@ -305,11 +305,44 @@ impl Listener {
         Ok(self.tcp.local_addr()?)
     }
 
+    /// The next connection, TLS handshake and all. Waits for as long as
+    /// that handshake takes, so it suits a caller with one peer at a time;
+    /// a server should use `accept_tcp` and run each handshake elsewhere.
     pub async fn accept(&self) -> Result<(Connection, SocketAddr), ConnectionError> {
-        let (tcp_stream, peer_addr) = self.tcp.accept().await?;
-        tune_socket(&tcp_stream);
-        let tls_stream = self.acceptor.accept(tcp_stream).await?;
-        Ok((Connection::Server(tls_stream), peer_addr))
+        let incoming = self.accept_tcp().await?;
+        let peer_addr = incoming.peer_addr();
+        Ok((incoming.handshake().await?, peer_addr))
+    }
+
+    /// The next TCP connection, its TLS handshake still to do — so the
+    /// caller can run that in a task of its own, under a time limit, and
+    /// go straight back to accepting. A handshake done in the accept loop
+    /// holds up every connection behind it, for as long as the client
+    /// likes: one that never sends its hello holds it up for good.
+    pub async fn accept_tcp(&self) -> std::io::Result<Incoming> {
+        let (tcp, peer_addr) = self.tcp.accept().await?;
+        tune_socket(&tcp);
+        Ok(Incoming { tcp, peer_addr, acceptor: self.acceptor.clone() })
+    }
+}
+
+/// A connection accepted at the TCP level, waiting for its TLS handshake
+/// (see `Listener::accept_tcp`).
+pub struct Incoming {
+    tcp: TcpStream,
+    peer_addr: SocketAddr,
+    acceptor: TlsAcceptor,
+}
+
+impl Incoming {
+    pub fn peer_addr(&self) -> SocketAddr {
+        self.peer_addr
+    }
+
+    /// The server side of the mutual-TLS handshake. Has no time limit of
+    /// its own — the caller sets one.
+    pub async fn handshake(self) -> Result<Connection, ConnectionError> {
+        Ok(Connection::Server(self.acceptor.accept(self.tcp).await?))
     }
 }
 
