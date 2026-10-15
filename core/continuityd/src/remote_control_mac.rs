@@ -39,6 +39,7 @@ use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep, NSEvent};
 use objc2_core_foundation::{CFRetained, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
     CGBitmapContextCreate, CGBitmapContextCreateImage, CGColorSpace, CGContext, CGDisplayBounds, CGDisplayPixelsHigh, CGDisplayPixelsWide,
+    CGInterpolationQuality,
     CGEvent, CGEventField, CGEventFlags, CGEventTapLocation, CGEventType, CGImage, CGImageAlphaInfo, CGMainDisplayID, CGMouseButton,
     CGPreflightScreenCaptureAccess, CGRequestScreenCaptureAccess, CGScrollEventUnit,
 };
@@ -321,10 +322,7 @@ fn capture_jpeg(display_id: u32, cursor_norm: Option<(f64, f64)>) -> Option<Vec<
     #[allow(deprecated)]
     let image = objc2_core_graphics::CGDisplayCreateImage(display_id)?;
 
-    let image = match cursor_norm {
-        Some((nx, ny)) => composite_cursor_marker(&image, nx, ny).unwrap_or(image),
-        None => image,
-    };
+    let image = render_frame(&image, cursor_norm).unwrap_or(image);
 
     let bitmap = NSBitmapImageRep::initWithCGImage(NSBitmapImageRep::alloc(), &image);
     let quality = objc2_foundation::NSNumber::new_f64(JPEG_QUALITY);
@@ -335,17 +333,37 @@ fn capture_jpeg(display_id: u32, cursor_norm: Option<(f64, f64)>) -> Option<Vec<
     Some(data.to_vec())
 }
 
-/// Draws a small filled circle onto a copy of `image` at `(nx, ny)`
-/// (normalized, top-left-origin, matching `InputEventKind::MouseMove`'s
-/// own convention — flipped to Core Graphics' bottom-left-origin
-/// coordinate space for the actual drawing). Standard
-/// draw-into-a-bitmap-context-then-read-the-image-back-out pattern:
-/// none of this needs to know `NSBitmapImageRep`'s internal pixel layout,
-/// unlike poking the raw bitmap buffer directly would.
-fn composite_cursor_marker(image: &CGImage, nx: f64, ny: f64) -> Option<CFRetained<CGImage>> {
-    let width = CGImage::width(Some(image));
-    let height = CGImage::height(Some(image));
-    if width == 0 || height == 0 {
+/// Frames wider than this are scaled down by a whole factor before JPEG
+/// encoding, as on Linux: a Retina screen captures at twice its size in
+/// points (2880 or more across), far more than a viewer shows, and
+/// encoding — and the other side decoding — that ten times a second made
+/// the remote view lag.
+const MAX_ENCODED_WIDTH: usize = 1920;
+
+/// The size `width` × `height` is encoded at: divided by the smallest whole
+/// factor that brings it within `MAX_ENCODED_WIDTH` (2880 → 1440, 5120 →
+/// 1707 — a whole factor keeps a Retina frame as sharp as the screen's own
+/// point grid).
+fn encoded_size(width: usize, height: usize) -> (usize, usize) {
+    let factor = width.div_ceil(MAX_ENCODED_WIDTH).max(1);
+    (width.div_ceil(factor).max(1), height.div_ceil(factor).max(1))
+}
+
+/// A copy of `image` at its encoded size (`encoded_size`), with, if
+/// there's a position, a small filled circle drawn at `cursor` (normalized,
+/// top-left-origin, matching `InputEventKind::MouseMove`'s own convention —
+/// flipped to Core Graphics' bottom-left-origin coordinate space for the
+/// actual drawing). `None` when there's nothing to change. Standard
+/// draw-into-a-bitmap-context-then-read-the-image-back-out pattern: none of
+/// this needs to know `NSBitmapImageRep`'s internal pixel layout, unlike
+/// poking the raw bitmap buffer directly would.
+fn render_frame(image: &CGImage, cursor: Option<(f64, f64)>) -> Option<CFRetained<CGImage>> {
+    let source = (CGImage::width(Some(image)), CGImage::height(Some(image)));
+    if source.0 == 0 || source.1 == 0 {
+        return None;
+    }
+    let (width, height) = encoded_size(source.0, source.1);
+    if (width, height) == source && cursor.is_none() {
         return None;
     }
     let color_space = CGColorSpace::new_device_rgb()?;
@@ -363,7 +381,11 @@ fn composite_cursor_marker(image: &CGImage, nx: f64, ny: f64) -> Option<CFRetain
         )
     }?;
     let full_rect = CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: CGSize { width: width as f64, height: height as f64 } };
+    CGContext::set_interpolation_quality(Some(&context), CGInterpolationQuality::Medium);
     CGContext::draw_image(Some(&context), full_rect, Some(image));
+    let Some((nx, ny)) = cursor else {
+        return CGBitmapContextCreateImage(Some(&context));
+    };
 
     // ~0.6% of the smaller screen dimension — big enough to actually see,
     // small enough not to obscure whatever's under it.
@@ -747,7 +769,7 @@ mod manual_verification {
         }
     }
 
-    /// Visual verification for `composite_cursor_marker`: captures with a
+    /// Visual verification for `render_frame`'s cursor marker: captures with a
     /// marker at a known, deliberately off-center position and writes the
     /// JPEG to disk so it can be eyeballed directly — the thing this
     /// actually needs to prove (marker present, correctly oriented, not
@@ -853,6 +875,43 @@ mod tests {
 
     fn modifier(code: u16, down: bool, flags: u64) -> Option<KeyPost> {
         Some(KeyPost { code, down, kind: KeyPostKind::FlagsChanged, flags })
+    }
+
+    #[test]
+    fn retina_frames_are_encoded_at_a_whole_fraction_of_their_size() {
+        assert_eq!(encoded_size(1920, 1080), (1920, 1080), "small enough already");
+        assert_eq!(encoded_size(1440, 900), (1440, 900));
+        assert_eq!(encoded_size(2880, 1800), (1440, 900), "a 13-inch Retina MacBook");
+        assert_eq!(encoded_size(3456, 2234), (1728, 1117), "a 16-inch MacBook Pro");
+        assert_eq!(encoded_size(5120, 2880), (1707, 960), "a 5K display");
+        assert_eq!(encoded_size(1, 1), (1, 1));
+    }
+
+    /// A plain image of `width` × `height`, standing in for a capture.
+    fn solid_image(width: usize, height: usize) -> CFRetained<CGImage> {
+        let color_space = CGColorSpace::new_device_rgb().unwrap();
+        let context = unsafe {
+            CGBitmapContextCreate(std::ptr::null_mut(), width, height, 8, 0, Some(&color_space), CGImageAlphaInfo::PremultipliedLast.0)
+        }
+        .unwrap();
+        CGContext::set_rgb_fill_color(Some(&context), 0.2, 0.4, 0.6, 1.0);
+        CGContext::fill_rect(
+            Some(&context),
+            CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: CGSize { width: width as f64, height: height as f64 } },
+        );
+        CGBitmapContextCreateImage(Some(&context)).unwrap()
+    }
+
+    #[test]
+    fn a_retina_capture_is_drawn_at_its_encoded_size_with_the_cursor() {
+        let frame = render_frame(&solid_image(2880, 1800), Some((0.5, 0.5))).expect("scaled");
+        assert_eq!((CGImage::width(Some(&frame)), CGImage::height(Some(&frame))), (1440, 900));
+        let frame = render_frame(&solid_image(2880, 1800), None).expect("scaled even with no cursor");
+        assert_eq!(CGImage::width(Some(&frame)), 1440);
+        // Small enough, and no cursor to draw: left as it is.
+        assert!(render_frame(&solid_image(1280, 800), None).is_none());
+        let frame = render_frame(&solid_image(1280, 800), Some((0.1, 0.9))).expect("cursor drawn");
+        assert_eq!(CGImage::width(Some(&frame)), 1280);
     }
 
     #[test]
