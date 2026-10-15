@@ -30,3 +30,8 @@ if-addrs = "0.13"
 # file locking.
 fs4 = { version = "1", default-features = false }
 arboard = { version = "3", optional = true }
+
+[dev-dependencies]
+# Paused time (`#[tokio::test(start_paused = true)]`), for the transfer
+# timeouts that are measured in minutes.
+tokio = { workspace = true, features = ["test-util"] }

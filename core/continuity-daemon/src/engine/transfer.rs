@@ -49,6 +49,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::task::{AbortHandle, JoinHandle};
 
@@ -835,18 +836,32 @@ fn finalize_part(part: PartFile, part_path: &Path, file_name: &str, size_bytes: 
 /// A data connection for a transfer that already completed here: the
 /// sender lost the connection before `FileVerified` reached it and resumed
 /// at the very end. Confirms the hash again without saving anything twice.
-async fn confirm_already_complete(mut conn: Connection, transfer_id: String, content_hash: String) {
-    let checked = tokio::time::timeout(VERIFY_TIMEOUT, async {
+///
+/// **Real bug fixed here**: the whole exchange used to be under
+/// `VERIFY_TIMEOUT`. But the sender only sends its end frame once it has
+/// re-hashed the entire file from disk (`read_for_stream` hashes
+/// `[0, offset)`, and here the offset is the whole size), which for a big
+/// file on slow storage takes minutes — so a transfer saved here could be
+/// answered "different contents" and reported failed on the sender. Like
+/// `receive_stream`, the wait for the end of the data has no limit of its
+/// own: this side is idle reading meanwhile, so TCP keepalive notices a
+/// sender that's gone. Only the `FileComplete` that follows the end frame
+/// straight away is timed.
+async fn confirm_already_complete<S: AsyncRead + AsyncWrite + Unpin>(mut conn: S, transfer_id: String, content_hash: String) {
+    let checked = async {
         if !read_frame(&mut conn).await?.is_empty() {
             return Ok(false);
         }
+        let Ok(complete) = tokio::time::timeout(VERIFY_TIMEOUT, read_message(&mut conn)).await else {
+            return Ok(false);
+        };
         Ok::<_, FramingError>(matches!(
-            read_message(&mut conn).await?,
+            complete?,
             Message::FileComplete { content_hash: claimed, .. } if claimed == content_hash
         ))
-    })
+    }
     .await;
-    let ok = matches!(checked, Ok(Ok(true)));
+    let ok = matches!(checked, Ok(true));
     let reason = (!ok).then(|| "this transfer already finished here with different contents".to_string());
     let _ = write_message(&mut conn, &Message::FileVerified { transfer_id, ok, reason }).await;
 }
@@ -1352,6 +1367,36 @@ mod tests {
         assert!(check_usable_dir(&file).is_err());
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    async fn confirm_over_a_slow_sender(claimed_hash: &str) -> (bool, Option<String>) {
+        let (receiver_end, mut sender_end) = tokio::io::duplex(64 * 1024);
+        let confirm = tokio::spawn(confirm_already_complete(receiver_end, "t".to_string(), "the hash".to_string()));
+        // The sender re-hashing a big file on slow storage before it sends
+        // anything — well past `VERIFY_TIMEOUT`, in paused time.
+        tokio::time::sleep(VERIFY_TIMEOUT * 3).await;
+        write_frame_unflushed(&mut sender_end, &[]).await.unwrap();
+        let complete = Message::FileComplete { transfer_id: "t".to_string(), content_hash: claimed_hash.to_string() };
+        write_message(&mut sender_end, &complete).await.unwrap();
+        let verdict = read_message(&mut sender_end).await.unwrap();
+        confirm.await.unwrap();
+        match verdict {
+            Message::FileVerified { ok, reason, .. } => (ok, reason),
+            other => panic!("expected FileVerified, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_finished_transfer_is_confirmed_however_long_the_sender_takes_to_rehash() {
+        let (ok, reason) = confirm_over_a_slow_sender("the hash").await;
+        assert!(ok, "refused: {reason:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_finished_transfer_with_another_hash_is_still_refused() {
+        let (ok, reason) = confirm_over_a_slow_sender("some other hash").await;
+        assert!(!ok);
+        assert_eq!(reason.as_deref(), Some("this transfer already finished here with different contents"));
     }
 
     #[test]
