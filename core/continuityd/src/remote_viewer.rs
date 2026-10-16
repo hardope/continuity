@@ -57,8 +57,8 @@ use std::time::{Duration, Instant};
 use tao::dpi::{LogicalSize, PhysicalPosition};
 use tao::event::{ElementState, MouseButton as TaoMouseButton, MouseScrollDelta, WindowEvent};
 use tao::event_loop::EventLoopWindowTarget;
-use tao::keyboard::KeyCode;
-use tao::window::{Window, WindowBuilder, WindowId};
+use tao::keyboard::{KeyCode, ModifiersState};
+use tao::window::{Fullscreen, Window, WindowBuilder, WindowId};
 use tokio::sync::mpsc::UnboundedSender;
 
 pub enum ViewerAction {
@@ -87,6 +87,9 @@ pub struct RemoteViewer {
     session: SessionKey,
     commands: UnboundedSender<EngineCommand>,
     keyboard: KeyboardForwarder,
+    /// The modifier keys held on this side, for the full-screen shortcut
+    /// (see `is_fullscreen_shortcut`).
+    modifiers: ModifiersState,
     #[cfg(target_os = "macos")]
     caps_lock: CapsLockWatch,
     /// Mouse buttons pressed on the peer and not yet released — released
@@ -162,7 +165,7 @@ impl RemoteViewer {
         commands: UnboundedSender<EngineCommand>,
     ) -> anyhow::Result<Self> {
         let window = WindowBuilder::new()
-            .with_title(format!("Continuity — Controlling '{}'", peer.name))
+            .with_title(format!("Continuity — Controlling '{}' ({FULLSCREEN_SHORTCUT} for full screen)", peer.name))
             .with_inner_size(LogicalSize::new(1024.0, 640.0))
             .build(target)?;
         let window = Rc::new(window);
@@ -205,6 +208,7 @@ impl RemoteViewer {
             session: SessionKey::new(peer.id, peer.session_id),
             commands,
             keyboard: KeyboardForwarder::new(KeyTranslator::new(cfg!(target_os = "macos"), peer.platform)),
+            modifiers: ModifiersState::empty(),
             // The window was just given focus above.
             #[cfg(target_os = "macos")]
             caps_lock: CapsLockWatch::focused(caps_lock_on()),
@@ -391,6 +395,14 @@ impl RemoteViewer {
                 if *is_synthetic {
                     return ViewerAction::None;
                 }
+                // This side's own, never the other computer's — neither
+                // its press nor its release goes over.
+                if is_fullscreen_shortcut(event.physical_key, self.modifiers, cfg!(target_os = "macos")) {
+                    if event.state == ElementState::Pressed && !event.repeat {
+                        self.toggle_fullscreen();
+                    }
+                    return ViewerAction::None;
+                }
                 let pressed = match event.state {
                     ElementState::Pressed => true,
                     ElementState::Released => false,
@@ -406,6 +418,7 @@ impl RemoteViewer {
                     None => {}
                 }
             }
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = *modifiers,
             WindowEvent::Focused(focused) => {
                 tracing::debug!("handle_window_event: window focus changed to {focused}");
                 if !*focused {
@@ -467,6 +480,17 @@ impl RemoteViewer {
             self.last_move_sent = Instant::now();
             self.last_sent_position = Some((x, y));
         }
+    }
+
+    /// In or out of full screen, by the viewer's own shortcut. **Real bug
+    /// fixed here**: every key went to the other computer, the OS's own
+    /// full-screen shortcut and Esc included, so a viewer put in full screen
+    /// had no way back short of a trackpad gesture. The modifiers held for
+    /// the shortcut already went over; they're let go of there first.
+    fn toggle_fullscreen(&mut self) {
+        self.release_all();
+        let full = self.window.fullscreen().is_some();
+        self.window.set_fullscreen(if full { None } else { Some(Fullscreen::Borderless(None)) });
     }
 
     /// Lets go of every key and mouse button this viewer still holds down
@@ -992,9 +1016,15 @@ impl KeyboardForwarder {
     }
 
     /// `KeyUp`s for everything still held, last pressed first — so a
-    /// shortcut lets go of its letter before its modifier, as hands do.
+    /// shortcut lets go of its letter before its modifier, as hands do. A
+    /// Windows key let go of on its own opens a PC's Start menu, and a
+    /// Mac's Control arrives there as one — so with one held, an unassigned
+    /// key (`VK_UNASSIGNED_E8`, the usual trick) is tapped first.
     fn release_all(&mut self) -> Vec<InputEventKind> {
-        self.held.drain(..).rev().map(|code| InputEventKind::KeyUp { code }).collect()
+        let windows_key_held =
+            self.translator.peer == Platform::Windows && self.held.iter().any(|&code| code == VK_LWIN || code == VK_RWIN);
+        let tap = windows_key_held.then_some([InputEventKind::KeyDown { code: VK_UNASSIGNED_E8 }, InputEventKind::KeyUp { code: VK_UNASSIGNED_E8 }]);
+        tap.into_iter().flatten().chain(self.held.drain(..).rev().map(|code| InputEventKind::KeyUp { code })).collect()
     }
 }
 
@@ -1038,6 +1068,29 @@ impl CapsLockWatch {
 fn caps_lock_on() -> bool {
     use objc2_core_graphics::{CGEventFlags, CGEventSource, CGEventSourceStateID};
     CGEventSource::flags_state(CGEventSourceStateID::CombinedSessionState).contains(CGEventFlags::MaskAlphaShift)
+}
+
+const VK_LWIN: u32 = 0x5B;
+const VK_RWIN: u32 = 0x5C;
+/// No key is assigned this virtual-key code, so tapping it does nothing
+/// but count as "another key" — which stops a Windows key being released
+/// from opening the Start menu.
+const VK_UNASSIGNED_E8: u32 = 0xE8;
+
+/// The viewer's own full-screen shortcut — the one the OS uses for full
+/// screen on this side: Control-Command-F on a Mac, F11 elsewhere.
+#[cfg(target_os = "macos")]
+const FULLSCREEN_SHORTCUT: &str = "⌃⌘F";
+#[cfg(not(target_os = "macos"))]
+const FULLSCREEN_SHORTCUT: &str = "F11";
+
+/// Whether `key`, with `modifiers` held, is that shortcut.
+fn is_fullscreen_shortcut(key: KeyCode, modifiers: ModifiersState, mac: bool) -> bool {
+    if mac {
+        key == KeyCode::KeyF && modifiers.control_key() && modifiers.super_key() && !modifiers.alt_key() && !modifiers.shift_key()
+    } else {
+        key == KeyCode::F11
+    }
 }
 
 /// A physical key's native code on `platform`: macOS `kVK_*` virtual key
@@ -1373,6 +1426,40 @@ mod tests {
         watch.focus(true, true);
         assert!(!watch.flipped(true));
         assert!(watch.flipped(false));
+    }
+
+    #[test]
+    fn the_full_screen_shortcut_is_the_systems_own() {
+        let control_command = ModifiersState::CONTROL | ModifiersState::SUPER;
+        assert!(is_fullscreen_shortcut(KeyCode::KeyF, control_command, true));
+        assert!(!is_fullscreen_shortcut(KeyCode::KeyF, ModifiersState::SUPER, true), "Command-F is Find");
+        assert!(!is_fullscreen_shortcut(KeyCode::KeyF, control_command | ModifiersState::SHIFT, true));
+        assert!(!is_fullscreen_shortcut(KeyCode::F11, ModifiersState::empty(), true), "a Mac's F11 shows the desktop");
+        assert!(is_fullscreen_shortcut(KeyCode::F11, ModifiersState::empty(), false));
+        assert!(!is_fullscreen_shortcut(KeyCode::KeyF, control_command, false));
+    }
+
+    #[test]
+    fn letting_go_of_a_windows_key_never_opens_the_start_menu() {
+        // A Mac's Control-Command-F: Control arrives as the Windows key.
+        let mut keyboard = KeyboardForwarder::new(KeyTranslator::new(true, Platform::Windows));
+        keyboard.key(KeyCode::ControlLeft, true);
+        keyboard.key(KeyCode::SuperLeft, true);
+        assert_eq!(
+            keyboard.release_all(),
+            vec![
+                InputEventKind::KeyDown { code: 0xE8 },
+                InputEventKind::KeyUp { code: 0xE8 },
+                InputEventKind::KeyUp { code: 0xA2 },
+                InputEventKind::KeyUp { code: 0x5B },
+            ]
+        );
+        // Nothing extra without one held, or for another kind of peer.
+        keyboard.key(KeyCode::ShiftLeft, true);
+        assert_eq!(keyboard.release_all(), vec![InputEventKind::KeyUp { code: 0xA0 }]);
+        let mut to_mac = KeyboardForwarder::new(KeyTranslator::new(false, Platform::MacOs));
+        to_mac.key(KeyCode::SuperLeft, true);
+        assert_eq!(to_mac.release_all().len(), 1);
     }
 
     #[test]
