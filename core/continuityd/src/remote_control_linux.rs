@@ -55,6 +55,10 @@ pub struct LinuxRemoteControlHost {
     /// Why the latest capture stopped on its own — see
     /// `capture_failure_reason`.
     failure: Arc<Mutex<Option<String>>>,
+    /// Whether frames show the pointer — see
+    /// `RemoteControlHost::set_pointer_in_frames`. Chosen with the portal
+    /// when a session starts.
+    pointer_in_frames: AtomicBool,
 }
 
 /// One `start_capture`'s worth of state, so a session that's still winding
@@ -68,7 +72,12 @@ struct CaptureRun {
 
 impl LinuxRemoteControlHost {
     pub fn new(restore_token_path: Option<PathBuf>) -> Self {
-        Self { restore_token_path, current: Mutex::new(None), failure: Arc::new(Mutex::new(None)) }
+        Self {
+            restore_token_path,
+            current: Mutex::new(None),
+            failure: Arc::new(Mutex::new(None)),
+            pointer_in_frames: AtomicBool::new(true),
+        }
     }
 }
 
@@ -101,6 +110,7 @@ impl RemoteControlHost for LinuxRemoteControlHost {
         let (frames_tx, frames_rx) = mpsc::channel(2);
         let failure = self.failure.clone();
         let token_path = self.restore_token_path.clone();
+        let pointer = self.pointer_in_frames.load(Ordering::Relaxed);
         // Portal setup is async D-Bus traffic that can wait minutes on a
         // person, so it gets its own thread and runtime instead of
         // borrowing the engine's.
@@ -112,7 +122,7 @@ impl RemoteControlHost for LinuxRemoteControlHost {
                     return;
                 }
             };
-            runtime.block_on(run_session(run, stop_rx, frames_tx, failure, token_path));
+            runtime.block_on(run_session(run, stop_rx, frames_tx, failure, token_path, pointer));
         });
         if let Err(e) = spawned {
             tracing::warn!("couldn't start the remote-desktop thread: {e}");
@@ -130,6 +140,10 @@ impl RemoteControlHost for LinuxRemoteControlHost {
     fn capture_failure_reason(&self) -> Option<String> {
         self.failure.lock().unwrap().clone()
     }
+
+    fn set_pointer_in_frames(&self, include: bool) {
+        self.pointer_in_frames.store(include, Ordering::Relaxed);
+    }
 }
 
 /// One session start to finish: set it up with the portal, capture until
@@ -143,9 +157,10 @@ async fn run_session(
     frames: mpsc::Sender<Vec<u8>>,
     failure: Arc<Mutex<Option<String>>>,
     token_path: Option<PathBuf>,
+    pointer: bool,
 ) {
     let restore_token = token_path.as_deref().and_then(read_restore_token);
-    let negotiated = match portal::negotiate(restore_token.as_deref(), &stop).await {
+    let negotiated = match portal::negotiate(restore_token.as_deref(), pointer, &stop).await {
         Ok(negotiated) => negotiated,
         Err(e) => {
             if e.kind == portal::ErrorKind::Cancelled {

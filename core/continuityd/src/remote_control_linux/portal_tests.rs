@@ -340,6 +340,18 @@ async fn negotiation_completes_with_handle_tokens_on_every_request() {
     assert!(record.closed_sessions.is_empty() && record.closed_requests.is_empty());
 }
 
+/// A desktop viewer shows its own pointer, so the frames go without this
+/// computer's: no cursor mode asked for, which is the portal's "hidden".
+#[tokio::test]
+async fn frames_for_a_desktop_viewer_leave_the_pointer_out() {
+    let (client, _server, shared) = start_mock(StartBehavior::Approve, false, true).await;
+    let (_stop_tx, stop) = watch::channel(false);
+    negotiate_with(client, None, false, &stop, Duration::from_secs(5)).await.expect("negotiates");
+    let record = shared.record.lock().unwrap();
+    let sources = &record.calls[2].1;
+    assert!(sources.get("cursor_mode").is_none(), "{sources:?}");
+}
+
 #[tokio::test]
 async fn input_reaches_the_portal_with_the_session_and_stream() {
     let (client, _server, shared) = start_mock(StartBehavior::Approve, false, true).await;

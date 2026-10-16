@@ -38,6 +38,14 @@ pub trait RemoteControlHost: Send + Sync {
     /// than silently sending no frames forever.
     fn start_capture(&self) -> Option<mpsc::Receiver<Vec<u8>>>;
 
+    /// Whether the frames of the next `start_capture` should show this
+    /// computer's pointer. Yes for a phone, which has no pointer of its own
+    /// on the picture; no for a desktop viewer, which shows its own where
+    /// the mouse is — the one drawn into a picture that updates a few dozen
+    /// times a second would only trail behind it. Called just before
+    /// `start_capture`; a host that can't leave it out ignores it.
+    fn set_pointer_in_frames(&self, _include: bool) {}
+
     /// Stops any capture in progress. Safe to call even if nothing was
     /// started (e.g. `start_capture` already returned `None`).
     fn stop_capture(&self);

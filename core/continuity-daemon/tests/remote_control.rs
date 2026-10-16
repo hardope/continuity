@@ -41,6 +41,8 @@ impl ClipboardBackend for NoopClipboard {
 struct FakeRemoteControlHost {
     injected: Arc<Mutex<Vec<InputEventKind>>>,
     capturing: Arc<AtomicBool>,
+    /// What the engine last said about drawing the pointer into frames.
+    pointer_in_frames: Arc<Mutex<Option<bool>>>,
 }
 
 impl RemoteControlHost for FakeRemoteControlHost {
@@ -76,6 +78,10 @@ impl RemoteControlHost for FakeRemoteControlHost {
 
     fn stop_capture(&self) {
         self.capturing.store(false, Ordering::Relaxed);
+    }
+
+    fn set_pointer_in_frames(&self, include: bool) {
+        *self.pointer_in_frames.lock().unwrap() = Some(include);
     }
 }
 
@@ -185,6 +191,9 @@ async fn full_remote_control_session_lifecycle() {
     assert!(b_saw_request, "B should have seen the incoming request");
     assert!(a_saw_started_controlling, "A should see its session start as Controlling");
     assert!(b_saw_started_controlled, "B should see its session start as Controlled");
+    // A is a desktop: it shows its own pointer, so B's frames go without
+    // B's (a phone would get it drawn in).
+    assert_eq!(*b_host.pointer_in_frames.lock().unwrap(), Some(false));
 
     // Fresh deadline for the screen stream specifically — this is the
     // *separate* dedicated connection (see `handle_screen_stream_connection`

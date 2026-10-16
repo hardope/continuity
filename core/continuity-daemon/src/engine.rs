@@ -334,6 +334,10 @@ struct SharedState {
     /// offer a v3 data connection. Kept after a disconnect (it's only ever
     /// read for a connected peer, and a reconnect overwrites it).
     peer_protocol_versions: Mutex<HashMap<String, u32>>,
+    /// What each peer announced as its platform, on its latest connection —
+    /// for whether a session's frames should carry this computer's pointer
+    /// (`pointer_in_frames_for`).
+    peer_platforms: Mutex<HashMap<String, Platform>>,
     /// Notified (`notify_waiters`) whenever a peer's mesh connection comes
     /// up, right after its `peer_senders` entry exists — a v3 transfer
     /// stalled because the mesh dropped waits on this to re-offer.
@@ -835,6 +839,17 @@ fn accept_remote_control_session(state: &Arc<SharedState>, peer_crypto_id: Strin
 /// spawns the screen-stream push. Re-checks the one-controlled-session
 /// rule, since `accept_remote_control_session` may have waited for the
 /// address in the meantime.
+/// Whether a controlling device on `platform` needs this computer's
+/// pointer drawn into the frames: a phone does, having none of its own on
+/// the picture; a desktop viewer shows its own (see
+/// `RemoteControlHost::set_pointer_in_frames`). **Real complaint fixed
+/// here**: on a desktop viewer the other computer's pointer, drawn into the
+/// picture, trailed behind the viewer's own and made the mouse look
+/// choppy. Unknown: drawn, as it always was.
+fn pointer_in_frames_for(platform: Option<Platform>) -> bool {
+    !matches!(platform, Some(Platform::MacOs | Platform::Windows | Platform::Linux))
+}
+
 fn start_controlled_session(
     state: &Arc<SharedState>,
     peer_crypto_id: String,
@@ -860,6 +875,8 @@ fn start_controlled_session(
     // if it fails (no Screen Recording permission, say), the peer hears
     // about a session that never really started instead of one that
     // silently never sends any frames.
+    let controller = state.peer_platforms.lock().unwrap().get(&peer_crypto_id).copied();
+    state.remote_control.set_pointer_in_frames(pointer_in_frames_for(controller));
     let Some(frames) = state.remote_control.start_capture() else {
         let _ = tx.send(Message::RemoteControlResponse { session_id: session_id.clone(), accepted: false });
         state.emit(SyncEvent::RemoteControlSessionEnded {
@@ -1020,6 +1037,7 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
         known_addresses: Mutex::new(HashMap::new()),
         peer_senders: Mutex::new(HashMap::new()),
         peer_protocol_versions: Mutex::new(HashMap::new()),
+        peer_platforms: Mutex::new(HashMap::new()),
         peer_connected: Notify::new(),
         last_programmatic_hash: Mutex::new(None),
         pending_pairings: Mutex::new(HashMap::new()),
@@ -1786,6 +1804,7 @@ async fn handle_connection_inner(
     let (mut read_half, mut write_half) = tokio::io::split(conn);
     let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
     state.peer_protocol_versions.lock().unwrap().insert(peer.id.clone(), peer.protocol_version);
+    state.peer_platforms.lock().unwrap().insert(peer.id.clone(), peer.platform);
     state
         .peer_senders
         .lock()
@@ -3129,6 +3148,16 @@ fn detect_platform() -> Platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_phone_gets_the_pointer_drawn_into_frames() {
+        assert!(pointer_in_frames_for(Some(Platform::Android)));
+        assert!(pointer_in_frames_for(Some(Platform::Ios)));
+        assert!(pointer_in_frames_for(None), "unknown: as before");
+        for desktop in [Platform::MacOs, Platform::Windows, Platform::Linux] {
+            assert!(!pointer_in_frames_for(Some(desktop)), "{desktop:?}");
+        }
+    }
 
     #[test]
     fn received_names_cannot_leave_the_folder() {

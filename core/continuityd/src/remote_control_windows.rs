@@ -54,11 +54,15 @@ pub struct WindowsRemoteControlHost {
     /// down, and the local person's own mouse went on dragging or
     /// selecting until they clicked.
     held_buttons: Mutex<Vec<ProtoMouseButton>>,
+    /// Whether frames show the pointer — see
+    /// `RemoteControlHost::set_pointer_in_frames`.
+    pointer_in_frames: Arc<AtomicBool>,
 }
 
 impl WindowsRemoteControlHost {
     pub fn new() -> Self {
         Self {
+            pointer_in_frames: Arc::new(AtomicBool::new(true)),
             capturing: Arc::new(AtomicBool::new(false)),
             held_keys: Mutex::new(Vec::new()),
             held_buttons: Mutex::new(Vec::new()),
@@ -121,20 +125,21 @@ impl RemoteControlHost for WindowsRemoteControlHost {
         // `BitBlt`-based capture needs no special OS permission grant at
         // all on Windows — this probe is purely "does capture actually
         // produce bytes," not a permission check.
-        if capture_jpeg().is_none() {
+        if capture_jpeg(false).is_none() {
             tracing::warn!("screen capture failed on first attempt");
             return None;
         }
 
         self.capturing.store(true, Ordering::Relaxed);
         let capturing = self.capturing.clone();
+        let pointer = self.pointer_in_frames.clone();
         let (tx, rx) = mpsc::channel(2);
         std::thread::spawn(move || {
             let target_interval = Duration::from_millis(1000 / frame_encoding::FRAMES_PER_SECOND);
             let mut last = LastFrame::default();
             while capturing.load(Ordering::Relaxed) {
                 let started_at = std::time::Instant::now();
-                if let Some(jpeg) = capture_jpeg() {
+                if let Some(jpeg) = capture_jpeg(pointer.load(Ordering::Relaxed)) {
                     if last.is_new(&jpeg) && tx.try_send(jpeg.clone()).is_ok() {
                         last.sent(jpeg);
                     }
@@ -150,6 +155,10 @@ impl RemoteControlHost for WindowsRemoteControlHost {
         Some(rx)
     }
 
+    fn set_pointer_in_frames(&self, include: bool) {
+        self.pointer_in_frames.store(include, Ordering::Relaxed);
+    }
+
     fn stop_capture(&self) {
         self.capturing.store(false, Ordering::Relaxed);
         self.release_held_input();
@@ -160,7 +169,7 @@ impl RemoteControlHost for WindowsRemoteControlHost {
 /// into a memory device context, `GetDIBits` to pull the raw BGRA pixels
 /// back out, then the pure-Rust `image` crate for the JPEG encode itself
 /// (see this crate's Cargo.toml entry for why not Windows' own WIC API).
-fn capture_jpeg() -> Option<Vec<u8>> {
+fn capture_jpeg(draw_pointer: bool) -> Option<Vec<u8>> {
     // SAFETY: every GDI handle obtained here (`screen_dc`, `mem_dc`,
     // `bitmap`) is released/deleted on every exit path below, including
     // the early-return ones — GDI handles are a strictly limited system
@@ -204,7 +213,7 @@ fn capture_jpeg() -> Option<Vec<u8>> {
         // GDI capture has no equivalent of macOS's Screen-Recording-gated
         // "no cursor at all" limitation; the real system cursor is right
         // there for the taking via two long-documented, ordinary calls.
-        if blit_ok {
+        if blit_ok && draw_pointer {
             draw_cursor_onto(mem_dc);
         }
 

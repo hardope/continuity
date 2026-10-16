@@ -132,19 +132,34 @@ pub struct Negotiated {
 /// Runs the whole setup on the session bus. On success the person at this
 /// computer has approved (or a stored approval was restored) and the
 /// stream is ready to connect to.
-pub async fn negotiate(restore_token: Option<&str>, stop: &watch::Receiver<bool>) -> Result<Negotiated, PortalError> {
+pub async fn negotiate(restore_token: Option<&str>, pointer: bool, stop: &watch::Receiver<bool>) -> Result<Negotiated, PortalError> {
     let connection = Connection::session()
         .await
         .map_err(|e| PortalError::new(ErrorKind::Unavailable, "connect", format!("couldn't reach this desktop's session bus: {e}")))?;
-    negotiate_on(connection, restore_token, stop, APPROVAL_TIMEOUT).await
+    negotiate_with(connection, restore_token, pointer, stop, APPROVAL_TIMEOUT).await
+}
+
+/// `negotiate_with`, pointer drawn into the frames — what most tests want.
+#[cfg(test)]
+pub async fn negotiate_on(
+    connection: Connection,
+    restore_token: Option<&str>,
+    stop: &watch::Receiver<bool>,
+    approval_timeout: Duration,
+) -> Result<Negotiated, PortalError> {
+    negotiate_with(connection, restore_token, true, stop, approval_timeout).await
 }
 
 /// `negotiate` on an already-open bus connection, with the approval
 /// timeout as a parameter — split out so a test can run it against a mock
-/// portal without waiting a minute and a half.
-pub async fn negotiate_on(
+/// portal without waiting a minute and a half. `pointer`: whether the
+/// frames should show this computer's pointer (see
+/// `RemoteControlHost::set_pointer_in_frames`); without it the cursor mode
+/// is left at the portal's default, hidden.
+pub async fn negotiate_with(
     connection: Connection,
     restore_token: Option<&str>,
+    pointer: bool,
     stop: &watch::Receiver<bool>,
     approval_timeout: Duration,
 ) -> Result<Negotiated, PortalError> {
@@ -166,10 +181,11 @@ pub async fn negotiate_on(
     let persist = version >= 2;
     // Embedded = the compositor draws the real cursor into the frames.
     // GNOME and KDE both support it; without it the cursor is just absent.
-    let embedded_cursor = property_u32(&connection, SCREEN_CAST_IFACE, "AvailableCursorModes")
-        .await
-        .map(|modes| modes & CURSOR_MODE_EMBEDDED != 0)
-        .unwrap_or(true);
+    let embedded_cursor = pointer
+        && property_u32(&connection, SCREEN_CAST_IFACE, "AvailableCursorModes")
+            .await
+            .map(|modes| modes & CURSOR_MODE_EMBEDDED != 0)
+            .unwrap_or(true);
     tracing::debug!("RemoteDesktop portal v{version}, persistence {persist}, embedded cursor {embedded_cursor}");
 
     match start_session(&connection, persist, restore_token, embedded_cursor, stop, approval_timeout).await {

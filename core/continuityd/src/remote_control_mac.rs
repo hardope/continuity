@@ -146,6 +146,9 @@ pub struct MacRemoteControlHost {
     /// The keys, modifiers and mouse buttons the controlling device
     /// currently holds down here — see `HeldKeys` and `MouseState`.
     held: Mutex<HeldInput>,
+    /// Whether frames show the pointer marker — see
+    /// `RemoteControlHost::set_pointer_in_frames`.
+    pointer_in_frames: Arc<AtomicBool>,
 }
 
 impl MacRemoteControlHost {
@@ -155,6 +158,7 @@ impl MacRemoteControlHost {
             display_sleep_assertion: Mutex::new(None),
             last_cursor: Arc::new(Mutex::new(None)),
             held: Mutex::new(HeldInput::default()),
+            pointer_in_frames: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -223,6 +227,7 @@ impl RemoteControlHost for MacRemoteControlHost {
         self.capturing.store(true, Ordering::Relaxed);
         let capturing = self.capturing.clone();
         let last_cursor = self.last_cursor.clone();
+        let pointer = self.pointer_in_frames.clone();
         // Bounded to a couple of frames' worth, not unbounded — a
         // receiver that falls behind (slow network, the controlling
         // side backgrounded, whatever) should never accumulate an
@@ -242,7 +247,7 @@ impl RemoteControlHost for MacRemoteControlHost {
             let mut last = LastFrame::default();
             while capturing.load(Ordering::Relaxed) {
                 let started_at = std::time::Instant::now();
-                let cursor = *last_cursor.lock().unwrap();
+                let cursor = if pointer.load(Ordering::Relaxed) { *last_cursor.lock().unwrap() } else { None };
                 if let Some(jpeg) = capture_jpeg(display_id, cursor) {
                     // Deliberately `try_send`, not a blocking send — a
                     // full channel means the consumer's behind; dropping
@@ -264,6 +269,10 @@ impl RemoteControlHost for MacRemoteControlHost {
             }
         });
         Some(rx)
+    }
+
+    fn set_pointer_in_frames(&self, include: bool) {
+        self.pointer_in_frames.store(include, Ordering::Relaxed);
     }
 
     fn stop_capture(&self) {
