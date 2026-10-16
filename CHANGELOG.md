@@ -2,7 +2,7 @@
 
 All notable user-facing changes to Continuity are documented here.
 
-## [Unreleased]
+## [0.1.7] - 2026-10-16
 
 ### Added
 

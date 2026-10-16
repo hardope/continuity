@@ -96,7 +96,7 @@ Continuity lives in the menu bar or system tray, and its window opens from there
 
 ## Status
 
-0.1.6 is the current release, built and tested in CI on every platform's own runner.
+0.1.7 is the current release, built and tested in CI on every platform's own runner.
 
 - The Mac app is universal: it runs on Apple silicon (an M1) and on Intel (a Mac on macOS 12).
 - Android only sends its clipboard while the app is open: Android 10 and later don't let apps read the clipboard in the background.
