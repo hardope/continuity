@@ -75,6 +75,11 @@ All notable user-facing changes to Continuity are documented here.
 - On macOS the window shows as "Continuity" in the Dock and Cmd-Tab, not
   "Continuity Settings"; on Linux, GNOME groups it under Continuity's icon.
 - On Android, starting a send no longer pops up a notification.
+- **The log file no longer grows without end.** It reached several
+  gigabytes, mostly one network-discovery message repeated many times a
+  second. That message is no longer logged, and the log now starts over at
+  10 MB, keeping the previous 10 MB beside it. A big log left by an earlier
+  version shrinks to its last 10 MB the first time this version starts.
 
 ## [0.1.6] - 2026-10-08
 

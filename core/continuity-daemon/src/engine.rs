@@ -1134,16 +1134,26 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                         Err(_) => break,
                     },
                 };
-                tracing::debug!("mdns event: {event:?}");
+                // Only a resolved service is acted on, so only that is logged
+                // at debug — and only for another device. **Real bug fixed
+                // here**: every event used to be logged, and mdns-sd can
+                // repeat one service's removal hundreds of times a second (a
+                // device on the network shutting down; a test run's engines
+                // stopping). One removal line filled nearly all of a log
+                // that grew to 5-6 GB, about 100 MB in three hours. The
+                // rest, this device's own service included, is at trace.
                 let ServiceEvent::ServiceResolved(info) = event else {
+                    tracing::trace!("mdns event: {event:?}");
                     continue;
                 };
                 let Some(peer) = peer_from_service_info(&info) else {
+                    tracing::debug!("mdns: {} has no address or device details yet", info.get_fullname());
                     continue;
                 };
                 if peer.device.id == state.my_device.id {
                     continue;
                 }
+                tracing::debug!("mdns: '{}' ({}) at {}", peer.device.name, peer.device.id, peer.addr);
                 // Cache the address regardless of whether this side ends up
                 // dialing — `ReconnectPeer` needs it, and the tie-break
                 // below means this side often won't be the one connecting.

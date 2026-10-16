@@ -52,6 +52,7 @@ mod screen_lock_windows;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 mod settings_window;
 mod control;
+mod log_file;
 mod share;
 
 use continuity_crypto::{Identity, TrustStore};
@@ -1460,13 +1461,9 @@ fn init_logging() {
     // anyone remembered to set anything; third-party crates stay at
     // `info` so rustls/mdns_sd's own considerable chattiness doesn't
     // drown it out.
+    // Size-limited: see log_file.rs.
     let file_layer = log_file_path(&profile())
-        .and_then(|path| {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            std::fs::OpenOptions::new().create(true).append(true).open(&path).ok()
-        })
+        .and_then(|path| log_file::LogFile::open(&path).ok())
         .map(|file| {
             tracing_subscriber::fmt::layer()
                 .with_writer(std::sync::Mutex::new(file))
