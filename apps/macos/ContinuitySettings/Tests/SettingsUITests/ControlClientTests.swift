@@ -67,6 +67,10 @@ final class ControlClientTests: XCTestCase {
         XCTAssertEqual(transfers[3].reason, "Not enough free space on Pixel 8 (needs 5 GB, 300 MB free)")
         XCTAssertEqual(transfers.map(\.canBeOpened), [false, false, true, false], "only a received file that's done")
         XCTAssertEqual(transfers.map(\.canBeCancelled), [true, true, false, false], "only one still moving")
+        let pixel = try XCTUnwrap(status.devices.first { $0.name == "Pixel 8" })
+        let office = try XCTUnwrap(status.devices.first { $0.name == "Office PC" })
+        XCTAssertEqual(status.transfers(with: pixel).map(\.id), ["t4", "t3", "t2", "t1"], "moving first, then the last few finished")
+        XCTAssertEqual(status.transfers(with: office).map(\.id), [])
     }
 
     func testAContinuitydWithoutTransfersStillDecodes() throws {

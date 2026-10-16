@@ -54,6 +54,16 @@ public struct Status: Decodable, Equatable {
         return Permission.allCases.filter { !permissions.allows($0) }
     }
 
+    /// What a device's page lists: its files still on their way, then the
+    /// last few that finished. Transfers carry the device's name, not its
+    /// id — as on Android, that's what they're matched by.
+    public func transfers(with device: PairedDevice) -> [Transfer] {
+        let theirs = (transfers ?? []).filter { $0.peerName == device.name }
+        let moving = theirs.filter(\.canBeCancelled)
+        let finished = theirs.filter { !$0.canBeCancelled }.prefix(3)
+        return moving + finished
+    }
+
     /// Whether a device's page offers to take control of it: this build
     /// has the viewer, it isn't controlling another computer already, the
     /// device is connected right now, and it's a computer — phones can

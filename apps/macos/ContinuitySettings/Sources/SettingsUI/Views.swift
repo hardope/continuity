@@ -333,6 +333,11 @@ struct DeviceView: View {
                     }
                 }
             }
+            // Its files on their way, where Send Files… was clicked.
+            let theirs = status.transfers(with: device)
+            if !theirs.isEmpty {
+                TransfersSection(transfers: theirs)
+            }
             if status.canBeControlled {
                 PageSection(title: "Remote Control") {
                     ToggleRow(

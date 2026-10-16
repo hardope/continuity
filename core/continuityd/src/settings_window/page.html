@@ -618,6 +618,14 @@ function devicePage(status, device) {
   if (canControl) {
     html += `<div class="footer">${esc(`${device.name} will ask whoever's there first, unless it already trusts this ${HERE}.`)}</div>`;
   }
+  // Its files on their way, where Send files… was clicked — and the last
+  // few that finished. (Transfers carry the device's name, as on Android.)
+  const theirs = (status.transfers || []).filter((t) => t.peer_name === device.name);
+  const moving = theirs.filter((t) => t.state === "active" || t.state === "stalled");
+  const finished = theirs.filter((t) => t.state === "done" || t.state === "failed").slice(0, 3);
+  if (moving.length + finished.length > 0) {
+    html += section("Transfers", moving.concat(finished).map(transferRow).join(""), `<button class="btn link" data-action="select" data-kind="transfers">All transfers</button>`);
+  }
   if (status.can_be_controlled) {
     const detail = device.remote_control_allowed
       ? `${device.name} can see this screen and use its keyboard and mouse whenever it asks.`
