@@ -26,6 +26,8 @@ mod media_linux;
 #[cfg(target_os = "linux")]
 mod file_chooser_linux;
 #[cfg(target_os = "macos")]
+mod notifications_mac;
+#[cfg(target_os = "macos")]
 mod permissions_mac;
 #[cfg(all(target_os = "macos", feature = "remote-control"))]
 mod remote_control_mac;
@@ -100,11 +102,11 @@ type FrameSink = ();
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 const SETTINGS_PREPARE_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Who Continuity is to the system's notifications: the bundle identifier
-/// in installers/macos/Info.plist, and the AppUserModelID Windows files
-/// toasts under (and the installer gives the Start-menu shortcut — see
-/// installers/windows/continuity.iss).
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+/// Who Continuity is to Windows's notifications: the AppUserModelID it
+/// files toasts under (and the installer gives the Start-menu shortcut — see
+/// installers/windows/continuity.iss). The same string as the macOS bundle
+/// identifier in installers/macos/Info.plist, which is what macOS goes by.
+#[cfg(target_os = "windows")]
 const APP_ID: &str = "app.continuity.desktop";
 
 /// Who a click on a dynamically-built "Send File" submenu entry should
@@ -1143,17 +1145,10 @@ fn settings_window_failed(error: &anyhow::Error) -> String {
     }
 }
 
-/// Tells the system's notifications who's sending them, before the first
-/// one goes out.
+/// Gets the system's notifications ready, before the first one goes out.
 ///
-/// macOS: notify-rust's notifications come from mac-notification-sys,
-/// which posts every one as whatever app it was told to with
-/// `set_application` — and, when nobody told it, looks one up with an
-/// AppleScript that comes back with Finder, so every notification was
-/// Finder's: Finder's name and icon, and Finder's notification settings.
-/// Inside Continuity.app, that's Continuity's own bundle identifier.
-/// (Outside one — a development build — there's no Continuity app for
-/// macOS to know, and it stays as it was.)
+/// macOS: asks to notify — macOS's own prompt, the first time (see
+/// notifications_mac.rs for why that's needed).
 ///
 /// Windows: a toast is filed under an AppUserModelID, and Windows drops one
 /// silently unless that id belongs to something it knows — notify-rust
@@ -1165,14 +1160,7 @@ fn settings_window_failed(error: &anyhow::Error) -> String {
 /// same id.
 fn init_notifications() {
     #[cfg(target_os = "macos")]
-    {
-        let in_bundle = std::env::current_exe().ok().is_some_and(|exe| exe.to_string_lossy().contains(".app/Contents/MacOS/"));
-        if in_bundle {
-            if let Err(e) = notify_rust::set_application(APP_ID) {
-                tracing::warn!("couldn't post notifications as {APP_ID}: {e}");
-            }
-        }
-    }
+    notifications_mac::request_permission();
     #[cfg(target_os = "windows")]
     register_app_user_model_id();
 }
@@ -1225,7 +1213,8 @@ fn register_app_user_model_id() {
 }
 
 /// A new notification, filed under Continuity's own AppUserModelID on
-/// Windows (see `init_notifications`).
+/// Windows (see `init_notifications`). macOS's are in notifications_mac.rs.
+#[cfg(not(target_os = "macos"))]
 fn notification() -> notify_rust::Notification {
     #[allow(unused_mut)]
     let mut notification = notify_rust::Notification::new();
@@ -1238,33 +1227,11 @@ fn notification() -> notify_rust::Notification {
 /// can't (macOS requires a proper .app bundle with an Info.plist for
 /// reliable notification delivery), so this always logs too — the tray
 /// menu/dialogs are the guaranteed-visible UI; notifications are a bonus.
-///
-/// On macOS this *schedules* the notification for right now instead of
-/// `show()`ing it. notify-rust's `show()` there doesn't post anything
-/// itself — it hands back a handle, and the notification goes out when
-/// that's waited on (`wait_for_action`, which blocks until it's answered)
-/// or dropped, and the drop then waits up to two seconds for macOS to
-/// confirm delivery, turning the main run loop over by hand to get it when
-/// that's the calling thread — this is often called from the event loop.
-/// A scheduled notification is handed to macOS and returns. Even that runs
-/// on a thread of its own: the very first notification can stop to look up
-/// which app to post as (see `init_notifications`), and nothing here may
-/// hold up the event loop.
+/// Never waits: this is often called from the event loop.
 fn notify(body: &str) {
     tracing::info!("{body}");
     #[cfg(target_os = "macos")]
-    {
-        let notification = notification().summary("Continuity").body(body).finalize();
-        std::thread::spawn(move || {
-            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or_default();
-            // Refused as "in the past" if the second ticks over before
-            // mac-notification-sys checks, so a second try a moment later.
-            let scheduled = notification.schedule_raw(now).or_else(|_| notification.schedule_raw(now + 1.0));
-            if let Err(e) = scheduled {
-                tracing::debug!("notification not shown (expected for an unbundled binary): {e}");
-            }
-        });
-    }
+    notifications_mac::show("Continuity", body);
     #[cfg(not(target_os = "macos"))]
     if let Err(e) = notification().summary("Continuity").body(body).show() {
         tracing::debug!("notification not shown (expected for an unbundled binary): {e}");
@@ -1276,8 +1243,8 @@ fn notify(body: &str) {
 /// `wait_for_action` blocks until the user interacts (or the notification
 /// times out/closes), so it runs on its own thread rather than the tao
 /// event loop's thread — blocking that would freeze the whole tray app
-/// until the notification was dismissed. (On macOS that wait is also what
-/// posts it — see `notify`.)
+/// until the notification was dismissed. (macOS's does the same in
+/// notifications_mac.rs.)
 fn notify_file_received(file_name: &str, from: Option<&str>, path: &str) {
     tracing::info!("received '{file_name}' at {path}");
     let body = match from {
@@ -1285,23 +1252,25 @@ fn notify_file_received(file_name: &str, from: Option<&str>, path: &str) {
         None => format!("Received '{file_name}'"),
     };
     let path = path.to_string();
+    let on_action = move |action: &str| match action {
+        "default" => {
+            if let Err(e) = open_path(&path) {
+                tracing::debug!("couldn't open '{path}': {e}");
+            }
+        }
+        "show-folder" => {
+            if let Err(e) = reveal_in_folder(&path) {
+                tracing::debug!("couldn't reveal '{path}': {e}");
+            }
+        }
+        _ => {}
+    };
+    #[cfg(target_os = "macos")]
+    notifications_mac::show_with_actions("Continuity", &body, &[("default", "Open"), ("show-folder", "Show in Folder")], on_action);
+    #[cfg(not(target_os = "macos"))]
     match notification().summary("Continuity").body(&body).action("default", "Open").action("show-folder", "Show in Folder").show() {
         Ok(handle) => {
-            std::thread::spawn(move || {
-                handle.wait_for_action(|action| match action {
-                    "default" => {
-                        if let Err(e) = open_path(&path) {
-                            tracing::debug!("couldn't open '{path}': {e}");
-                        }
-                    }
-                    "show-folder" => {
-                        if let Err(e) = reveal_in_folder(&path) {
-                            tracing::debug!("couldn't reveal '{path}': {e}");
-                        }
-                    }
-                    _ => {}
-                });
-            });
+            std::thread::spawn(move || handle.wait_for_action(on_action));
         }
         Err(e) => tracing::debug!("notification not shown (expected for an unbundled binary): {e}"),
     }

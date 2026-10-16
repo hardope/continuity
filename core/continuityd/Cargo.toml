@@ -61,7 +61,6 @@ tracing-subscriber.workspace = true
 directories = "5"
 tray-icon = "0.24"
 tao = "0.34"
-notify-rust = "4"
 # `share.rs`'s hand-off between `continuityd --share-to` (what the file
 # manager's "Send with Continuity" entries run) and the already-running
 # instance: a one-line JSON request over loopback, authenticated with a
@@ -114,6 +113,13 @@ rfd = "0.15"
 # backend; declared directly here for the specific methods/types this
 # needs, which aren't all enabled by tray-icon's own feature selection.
 [target.'cfg(target_os = "macos")'.dependencies]
+# Notifications, through Apple's UserNotifications framework — see
+# src/notifications_mac.rs (and the Linux/Windows notify-rust entry below for
+# why notify-rust isn't used here). The other two run its futures on plain
+# threads; both are already in the dependency tree.
+mac-usernotifications = "0.3.1"
+futures-lite = "2"
+futures-timer = "3"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = ["NSEvent", "NSGraphicsContext", "objc2-core-graphics"] }
 objc2-core-graphics = "0.3"
@@ -170,6 +176,11 @@ windows = { version = "0.58", features = [
 # (apps/macos/ContinuitySettings).
 [target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
 wry = "0.57"
+# Notifications. Not on macOS: there it goes through NSUserNotificationCenter,
+# which macOS now files away without showing for an app that never asked to
+# notify, and its newer UserNotifications backend waits on the main run loop in
+# ways the tray's event loop can't give it (see src/notifications_mac.rs).
+notify-rust = "4"
 
 # MPRIS media control/reads over D-Bus — see src/media_linux.rs. Also
 # carries rfd's Linux dialog backend (see the non-Linux `rfd` entry above

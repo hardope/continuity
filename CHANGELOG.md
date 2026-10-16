@@ -50,9 +50,11 @@ All notable user-facing changes to Continuity are documented here.
 
 ### Fixed
 
-- **Notifications on macOS came from Finder** — Finder's name, icon and
-  notification settings — and on Windows from "Windows PowerShell". They're
-  Continuity's own now.
+- **Notifications on macOS didn't show at all**, and before that came from
+  Finder; on Windows they came from "Windows PowerShell". They're
+  Continuity's own now. On a Mac, Continuity asks once whether it may send
+  them — Allow is under the prompt's **Options** — and they show even while
+  one of its windows is in front.
 - **A paired device can no longer save a file outside the received-files
   folder** by putting a path in the file's name.
 - **Opening a received file on Windows** no longer goes through the command

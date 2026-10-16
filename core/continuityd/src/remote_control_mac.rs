@@ -107,13 +107,7 @@ fn ensure_screen_recording_trust() {
         tracing::warn!(
             "Continuity isn't trusted for Screen Recording — remote screen sharing will show a blank desktop (only this app's own windows visible) until it's granted in System Settings > Privacy & Security > Screen Recording"
         );
-        if let Err(e) = notify_rust::Notification::new()
-            .summary("Continuity")
-            .body("Grant Screen Recording permission for remote control to show the real screen, not a blank desktop.")
-            .show()
-        {
-            tracing::debug!("screen recording notification not shown: {e}");
-        }
+        crate::notifications_mac::show("Continuity", "Grant Screen Recording permission for remote control to show the real screen, not a blank desktop.");
         if let Err(e) =
             std::process::Command::new("open").arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture").spawn()
         {

@@ -76,7 +76,7 @@ Get the file for each device from the [latest release](https://github.com/hardop
 | **Linux** | `sudo apt install ./continuity-linux.deb`, which also installs the libraries it needs, then run `continuityd`. | Ubuntu 24.04 or Debian 13 or later, x86-64. |
 | **Android** | Open `continuity-android.apk` on the phone, allowing installs from unknown sources. | Android 8 or later. |
 
-Nothing is signed with a paid certificate yet, so expect one warning the first time. On **macOS** the app is ad-hoc signed but not notarized: right-click Continuity → **Open** (on macOS 15 and later: System Settings → Privacy & Security → **Open Anyway**). On **Windows**, SmartScreen: **More info** → **Run anyway**.
+Nothing is signed with a paid certificate yet, so expect one warning the first time. On **macOS** the app is ad-hoc signed but not notarized: right-click Continuity → **Open** (on macOS 15 and later: System Settings → Privacy & Security → **Open Anyway**). On **Windows**, SmartScreen: **More info** → **Run anyway**. The first time it starts on a Mac, macOS asks whether Continuity may send notifications: **Allow** is under the prompt's **Options** button.
 
 Continuity lives in the menu bar or system tray, and its window opens from there. Windows 11 often hides a new tray icon behind the **^** overflow — drag it onto the taskbar to keep it in view. On GNOME the tray icon needs AppIndicator support: Ubuntu has it built in; elsewhere, install the AppIndicator extension.
 
@@ -96,17 +96,7 @@ Continuity lives in the menu bar or system tray, and its window opens from there
 
 ## Status
 
-0.1.6 is the current release, built and tested in CI on every platform's own runner. Tried on real devices so far:
-
-| | Tested on |
-|---|---|
-| Pairing and connections | macOS, Windows, Linux, Android |
-| Clipboard | macOS, Windows, Android |
-| Files | macOS, Windows |
-| Media control from a phone | a Mac |
-| Remote control from a phone | Windows, and a Mac's screen |
-| The desktop window (as 0.1.6's settings window) | macOS, Windows, Linux (Ubuntu) |
-| Android device page | a Galaxy A05 |
+0.1.6 is the current release, built and tested in CI on every platform's own runner.
 
 - The Mac app is universal: it runs on Apple silicon (an M1) and on Intel (a Mac on macOS 12).
 - Android only sends its clipboard while the app is open: Android 10 and later don't let apps read the clipboard in the background.

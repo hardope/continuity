@@ -78,13 +78,7 @@ pub(crate) fn ensure_accessibility_trust() {
         tracing::warn!(
             "Continuity isn't trusted for Accessibility — remote play/pause/next/previous will silently do nothing until it's granted in System Settings > Privacy & Security > Accessibility"
         );
-        if let Err(e) = notify_rust::Notification::new()
-            .summary("Continuity")
-            .body("Grant Accessibility permission for remote play/pause/next/previous to work. Volume control isn't affected.")
-            .show()
-        {
-            tracing::debug!("accessibility notification not shown: {e}");
-        }
+        crate::notifications_mac::show("Continuity", "Grant Accessibility permission for remote play/pause/next/previous to work. Volume control isn't affected.");
         if let Err(e) =
             std::process::Command::new("open").arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility").spawn()
         {
