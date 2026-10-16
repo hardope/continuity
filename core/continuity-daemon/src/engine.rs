@@ -562,17 +562,6 @@ fn end_remote_control_session(state: &Arc<SharedState>, peer_crypto_id: &str, re
     });
 }
 
-/// Handles the *separate*, dedicated connection opened for one session's
-/// screen stream — never the normal mesh connection, and never carries
-/// anything but this one session's frames. Skips the usual `announce_and_
-/// identify` handshake entirely: identity here is already fully proven by
-/// the TLS client certificate alone (`Connection::peer_device_id()`,
-/// exactly what `announce_and_identify` itself cross-checks against), and
-/// this connection is only ever routed here in the first place because
-/// the accept loop already confirmed this exact peer id was expected
-/// (see `pending_screen_stream_peers`) — a second identity round-trip
-/// would confirm nothing a redundant read wouldn't already need to pay
-/// for.
 /// Where an inbound connection goes once its TLS handshake is done — to
 /// the screen stream, a file's data connection, or the mesh — by who it
 /// is (and, where that isn't enough, by its first message).
@@ -689,6 +678,17 @@ fn spawn_screen_stream_connection(state: &Arc<SharedState>, conn: Connection, pe
     state.remote_control_stream_handles.lock().unwrap().insert(id_for_registry, join.abort_handle());
 }
 
+/// Handles the *separate*, dedicated connection opened for one session's
+/// screen stream — never the normal mesh connection, and never carries
+/// anything but this one session's frames. Skips the usual `announce_and_
+/// identify` handshake entirely: identity here is already fully proven by
+/// the TLS client certificate alone (`Connection::peer_device_id()`,
+/// exactly what `announce_and_identify` itself cross-checks against), and
+/// this connection is only ever routed here in the first place because
+/// the accept loop already confirmed this exact peer id was expected
+/// (see `pending_screen_stream_peers`) — a second identity round-trip
+/// would confirm nothing a redundant read wouldn't already need to pay
+/// for.
 async fn handle_screen_stream_connection(
     mut conn: Connection,
     state: Arc<SharedState>,
@@ -834,11 +834,6 @@ fn accept_remote_control_session(state: &Arc<SharedState>, peer_crypto_id: Strin
     });
 }
 
-/// The rest of accepting, once the address to dial the screen stream back
-/// to is known: starts capture, records the session, tells the peer, and
-/// spawns the screen-stream push. Re-checks the one-controlled-session
-/// rule, since `accept_remote_control_session` may have waited for the
-/// address in the meantime.
 /// Whether a controlling device on `platform` needs this computer's
 /// pointer drawn into the frames: a phone does, having none of its own on
 /// the picture; a desktop viewer shows its own (see
@@ -850,6 +845,11 @@ fn pointer_in_frames_for(platform: Option<Platform>) -> bool {
     !matches!(platform, Some(Platform::MacOs | Platform::Windows | Platform::Linux))
 }
 
+/// The rest of accepting, once the address to dial the screen stream back
+/// to is known: starts capture, records the session, tells the peer, and
+/// spawns the screen-stream push. Re-checks the one-controlled-session
+/// rule, since `accept_remote_control_session` may have waited for the
+/// address in the meantime.
 fn start_controlled_session(
     state: &Arc<SharedState>,
     peer_crypto_id: String,

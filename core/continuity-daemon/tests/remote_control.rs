@@ -204,17 +204,26 @@ async fn full_remote_control_session_lifecycle() {
     let mut a_saw_frame = false;
     let frame_deadline = tokio::time::sleep(Duration::from_secs(15));
     tokio::pin!(frame_deadline);
+    // A session that ends here never shows a frame; failing with its
+    // reason says why (a dial-back that failed, a stream taken for a mesh
+    // reconnect) instead of only that nothing came.
     while !a_saw_frame {
         tokio::select! {
             _ = &mut frame_deadline => break,
-            Some(ev) = a.events.recv() => {
-                if let SyncEvent::ScreenFrameReceived { peer_id, frame, .. } = ev {
+            Some(ev) = a.events.recv() => match ev {
+                SyncEvent::ScreenFrameReceived { peer_id, frame, .. } => {
                     assert_eq!(peer_id, b_id);
                     assert!(!frame.is_empty(), "frame should carry real bytes");
                     a_saw_frame = true;
                 }
+                SyncEvent::RemoteControlSessionEnded { reason, .. } => panic!("A's session ended before a frame came: {reason:?}"),
+                _ => {}
+            },
+            Some(ev) = b.events.recv() => {
+                if let SyncEvent::RemoteControlSessionEnded { reason, .. } = ev {
+                    panic!("B's session ended before A saw a frame: {reason:?}");
+                }
             }
-            Some(_) = b.events.recv() => {}
         }
     }
     assert!(a_saw_frame, "A should receive at least one screen frame from B's fake capture");
