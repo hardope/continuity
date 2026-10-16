@@ -36,8 +36,17 @@ All notable user-facing changes to Continuity are documented here.
 - **Cancel a transfer** from either device: a Cancel button on every file
   on its way, in the Continuity window and the Android app. The other
   device stops too, and says it was cancelled there.
-- Controlling a Mac is smoother: its screen is sent at a sensible size
-  rather than at full Retina resolution.
+- **Smoother remote control between computers**: the screen comes at up to
+  30 frames a second (it was 10), sharper, and only when it changes; a
+  computer's screen is sent at a sensible size rather than at full Retina
+  or 4K resolution; and on a computer, your own pointer is the only one on
+  the picture instead of the other computer's trailing behind it.
+- In the remote-control window, the system's full-screen shortcut
+  (Control-Command-F on a Mac, F11 on Windows and Linux) takes it in and out
+  of full screen instead of going to the other computer.
+- Files on their way to or from a device show on that device's page in the
+  Continuity window, with Cancel, and in the tray menu ("Sending
+  'talk.mov' · 45%").
 
 ### Fixed
 
