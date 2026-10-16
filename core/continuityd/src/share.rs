@@ -973,6 +973,7 @@ mod tests {
         server.shutdown();
         assert!(request_share(&profile, "peer1", vec![file.clone()]).is_err(), "no endpoint once shut down");
         let _ = std::fs::remove_file(file);
+        cleanup(&profile);
     }
 
     #[test]
@@ -1024,6 +1025,7 @@ mod tests {
         assert_eq!(next["status"]["paused"], true);
 
         server.shutdown();
+        cleanup(&profile);
     }
 
     #[test]
@@ -1061,5 +1063,7 @@ mod tests {
 
         server.shutdown();
         assert!(!hand_off_to_running_instance(&profile), "an instance that quit doesn't count");
+        cleanup(&profile);
+        cleanup(&other);
     }
 }
