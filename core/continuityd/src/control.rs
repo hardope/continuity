@@ -344,6 +344,27 @@ fn writable_folder(dir: &Path) -> bool {
     written
 }
 
+/// "Sending 'talk.mov' · 45%", "'scan.pdf' is waiting to reconnect", or
+/// for several, "3 transfers · 45%" — `None` when nothing's on its way.
+fn summarize_transfers(transfers: &[Transfer]) -> Option<String> {
+    let moving: Vec<&Transfer> =
+        transfers.iter().filter(|t| matches!(t.state, TransferState::Active | TransferState::Stalled)).collect();
+    let percent = |done: u64, size: u64| if size == 0 { 0 } else { done.min(size).saturating_mul(100) / size };
+    match moving.as_slice() {
+        [] => None,
+        [one] if one.state == TransferState::Stalled => Some(format!("'{}' is waiting to reconnect", one.file_name)),
+        [one] => {
+            let doing = if one.direction == TransferDirection::Sending { "Sending" } else { "Receiving" };
+            Some(format!("{doing} '{}' · {}%", one.file_name, percent(one.bytes_done, one.size_bytes)))
+        }
+        several => {
+            let done = several.iter().map(|t| t.bytes_done).fold(0u64, u64::saturating_add);
+            let size = several.iter().map(|t| t.size_bytes).fold(0u64, u64::saturating_add);
+            Some(format!("{} transfers · {}%", several.len(), percent(done, size)))
+        }
+    }
+}
+
 /// What `ControlState::check_received_dir` did.
 #[derive(Debug, PartialEq)]
 pub enum FolderChange {
@@ -597,6 +618,12 @@ impl ControlState {
 
     /// One transfer as the window lists it, while it's still listed — how
     /// the tray names the device a received file came from.
+    /// One line on the files on their way right now, for the tray — `None`
+    /// when there aren't any. See `summarize_transfers`.
+    pub fn transfer_summary(&self) -> Option<String> {
+        summarize_transfers(&self.live.lock().unwrap().transfers)
+    }
+
     pub fn transfer(&self, id: &str) -> Option<Transfer> {
         self.live.lock().unwrap().transfers.iter().find(|t| t.id == id).cloned()
     }
@@ -1576,6 +1603,23 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(EngineCommand::SetReceivedFilesDir { path }) if path == usb.display().to_string()));
         assert_eq!(state.status().received_files_dir, usb.display().to_string());
         assert!(std::fs::read_dir(&usb).unwrap().next().is_none(), "the write test left nothing behind");
+    }
+
+    #[test]
+    fn the_tray_line_sums_up_whats_on_its_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(&dir);
+        assert_eq!(state.transfer_summary(), None);
+        state.observe(&SyncEvent::FileSending { transfer_id: "t1".into(), to_name: "Pixel".into(), file_name: "talk.mov".into(), size_bytes: 1000 });
+        state.observe(&progress("t1", 450, 1000, FileTransferDirection::Sending));
+        assert_eq!(state.transfer_summary().as_deref(), Some("Sending 'talk.mov' · 45%"));
+        state.observe(&SyncEvent::FileReceiving { transfer_id: "t2".into(), from_name: "Mac".into(), file_name: "a.pdf".into(), size_bytes: 1000 });
+        assert_eq!(state.transfer_summary().as_deref(), Some("2 transfers · 22%"));
+        state.observe(&SyncEvent::FileSent { transfer_id: "t1".into(), file_name: "talk.mov".into(), to_name: "Pixel".into() });
+        state.observe(&SyncEvent::FileTransferStalled { transfer_id: "t2".into(), reason: "lost".into() });
+        assert_eq!(state.transfer_summary().as_deref(), Some("'a.pdf' is waiting to reconnect"));
+        state.observe(&SyncEvent::FileTransferFailed { transfer_id: "t2".into(), reason: "Cancelled".into() });
+        assert_eq!(state.transfer_summary(), None);
     }
 
     #[test]

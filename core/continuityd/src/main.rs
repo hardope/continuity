@@ -217,8 +217,14 @@ fn main() -> anyhow::Result<()> {
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&quit_item)?;
 
+    // While files are on their way, a line about them heads the menu
+    // (clicking it opens the window) — see `refresh_tray_transfers`.
+    let transfer_item = MenuItem::new("", true, None);
+    let transfer_item_id = transfer_item.id().clone();
+    let mut tray_transfers = TrayTransfers::default();
+
     let tray_icon = TrayIconBuilder::new()
-        .with_menu(Box::new(menu))
+        .with_menu(Box::new(menu.clone()))
         .with_tooltip("Continuity")
         .with_icon(build_icon(false));
     // Windows convention: a left click on a tray icon opens the app's
@@ -368,6 +374,18 @@ fn main() -> anyhow::Result<()> {
         match event {
             tao::event::Event::UserEvent(AppEvent::Engine(sync_event)) => {
                 control.observe(&sync_event);
+                let tray_line = match &sync_event {
+                    SyncEvent::FileTransferProgress { .. } => Some(false),
+                    SyncEvent::FileSending { .. }
+                    | SyncEvent::FileReceiving { .. }
+                    | SyncEvent::FileTransferStalled { .. }
+                    | SyncEvent::FileSent { .. }
+                    | SyncEvent::FileReceived { .. }
+                    | SyncEvent::FileTransferFailed { .. }
+                    | SyncEvent::RemoteControlSessionStarted { .. }
+                    | SyncEvent::RemoteControlSessionEnded { .. } => Some(true),
+                    _ => None,
+                };
                 #[cfg(feature = "remote-control")]
                 handle_remote_control_sync_event(
                     &sync_event,
@@ -390,6 +408,9 @@ fn main() -> anyhow::Result<()> {
                     &control,
                     &mut remote_sessions,
                 );
+                if let Some(changed) = tray_line {
+                    refresh_tray_transfers(&control, &menu, &transfer_item, &tray_icon, &remote_sessions, &mut tray_transfers, changed);
+                }
             }
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             tao::event::Event::UserEvent(AppEvent::Settings(message)) => {
@@ -422,7 +443,7 @@ fn main() -> anyhow::Result<()> {
         }
 
         if let Ok(event) = MenuEvent::receiver().try_recv() {
-            if event.id == open_item_id {
+            if event.id == open_item_id || event.id == transfer_item_id {
                 open_window = true;
             } else if event.id == pause_item_id {
                 let currently_paused = *is_paused.lock().unwrap();
@@ -901,6 +922,54 @@ fn send_file_to(
     for peer_id in peers {
         let _ = commands.send(EngineCommand::SendFile { peer_crypto_id: peer_id, path: path.to_string() });
     }
+}
+
+/// The tray's line about files on their way (see `refresh_tray_transfers`).
+#[derive(Default)]
+struct TrayTransfers {
+    shown: bool,
+    text: String,
+    last: Option<std::time::Instant>,
+}
+
+/// Progress alone updates the tray's transfer line at most this often.
+const TRAY_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Keeps the tray in step with the files on their way: while there are
+/// any, a line heads its menu ("Sending 'talk.mov' · 45%", opening the
+/// window when clicked) and ends its tooltip, under any remote-control
+/// session's line. `changed` is false for a progress update alone, which
+/// only refreshes it once a second.
+fn refresh_tray_transfers(
+    control: &control::ControlState,
+    menu: &Menu,
+    item: &MenuItem,
+    tray_icon: &tray_icon::TrayIcon,
+    remote_sessions: &[(String, String)],
+    state: &mut TrayTransfers,
+    changed: bool,
+) {
+    if !changed && state.last.is_some_and(|last| last.elapsed() < TRAY_PROGRESS_INTERVAL) {
+        return;
+    }
+    state.last = Some(std::time::Instant::now());
+    let summary = control.transfer_summary();
+    match (&summary, state.shown) {
+        (Some(text), false) => {
+            item.set_text(text);
+            state.shown = menu.insert(item, 0).is_ok();
+        }
+        (Some(text), true) if *text != state.text => item.set_text(text),
+        (None, true) => {
+            let _ = menu.remove(item);
+            state.shown = false;
+        }
+        _ => {}
+    }
+    state.text = summary.unwrap_or_default();
+    let base = remote_sessions.last().map_or("Continuity", |(_, tooltip)| tooltip.as_str());
+    let tooltip = if state.text.is_empty() { base.to_string() } else { format!("{base}\n{}", state.text) };
+    let _ = tray_icon.set_tooltip(Some(tooltip));
 }
 
 /// The subset of `SyncEvent` handling specific to the viewer window —
