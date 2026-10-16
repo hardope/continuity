@@ -32,6 +32,7 @@
 //! compiling and passing review, pending a trusted binary to actually
 //! confirm clicks/keystrokes land where intended.
 
+use crate::frame_encoding::{self, LastFrame, MAX_ENCODED_WIDTH};
 use continuity_daemon::RemoteControlHost;
 use continuity_proto::{InputEventKind, MouseButton as ProtoMouseButton};
 use objc2::AnyThread;
@@ -121,19 +122,10 @@ fn ensure_screen_recording_trust() {
     });
 }
 
-/// Frames per second for the capture loop — deliberately modest. This is
-/// JPEG-over-TCP, not a hardware-encoded video codec (see the crate-level
-/// doc comment in `continuity-net::framing` for why frames go out as
-/// whole raw-bytes messages rather than a real codec's delta frames), so
-/// every frame is a full, independent screenshot; a higher rate multiplies
-/// both CPU cost and bandwidth for a "low latency" feature where the
-/// bigger win is *responsiveness of input*, not silky-smooth video.
-const CAPTURE_FPS: u64 = 10;
-/// JPEG quality, 0.0–1.0 — well below "nice photo" quality on purpose:
-/// this is re-encoded and sent many times a second, not saved once, so
-/// file size (and the encode time that scales with it) matters far more
-/// than per-frame fidelity.
-const JPEG_QUALITY: f64 = 0.4;
+/// JPEG quality for `NSBitmapImageRep`, 0.0–1.0 — the shared
+/// `frame_encoding::JPEG_QUALITY`, which is out of 100. Frame rate and
+/// size limits are shared the same way (`frame_encoding`).
+const JPEG_QUALITY: f64 = frame_encoding::JPEG_QUALITY as f64 / 100.0;
 
 pub struct MacRemoteControlHost {
     capturing: Arc<AtomicBool>,
@@ -246,7 +238,8 @@ impl RemoteControlHost for MacRemoteControlHost {
         // `false` (`stop_capture`) or `tx.try_send` starts failing
         // because `rx` was dropped (the receiving end gave up).
         std::thread::spawn(move || {
-            let target_interval = Duration::from_millis(1000 / CAPTURE_FPS);
+            let target_interval = Duration::from_millis(1000 / frame_encoding::FRAMES_PER_SECOND);
+            let mut last = LastFrame::default();
             while capturing.load(Ordering::Relaxed) {
                 let started_at = std::time::Instant::now();
                 let cursor = *last_cursor.lock().unwrap();
@@ -256,8 +249,11 @@ impl RemoteControlHost for MacRemoteControlHost {
                     // this frame and trying again next tick keeps
                     // capture itself running at a steady rate instead of
                     // backing up, and an old frame wouldn't have been
-                    // worth delivering late regardless.
-                    let _ = tx.try_send(jpeg);
+                    // worth delivering late regardless. An unchanged
+                    // screen isn't sent again (`LastFrame`).
+                    if last.is_new(&jpeg) && tx.try_send(jpeg.clone()).is_ok() {
+                        last.sent(jpeg);
+                    }
                 } else {
                     tracing::debug!("a capture attempt failed mid-session (permission revoked, or display changed?)");
                 }
@@ -332,13 +328,6 @@ fn capture_jpeg(display_id: u32, cursor_norm: Option<(f64, f64)>) -> Option<Vec<
     let data = unsafe { bitmap.representationUsingType_properties(NSBitmapImageFileType::JPEG, &properties) }?;
     Some(data.to_vec())
 }
-
-/// Frames wider than this are scaled down by a whole factor before JPEG
-/// encoding, as on Linux: a Retina screen captures at twice its size in
-/// points (2880 or more across), far more than a viewer shows, and
-/// encoding — and the other side decoding — that ten times a second made
-/// the remote view lag.
-const MAX_ENCODED_WIDTH: usize = 1920;
 
 /// The size `width` × `height` is encoded at: divided by the smallest whole
 /// factor that brings it within `MAX_ENCODED_WIDTH` (2880 → 1440, 5120 →

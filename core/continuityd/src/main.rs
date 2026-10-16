@@ -38,6 +38,8 @@ mod remote_control_linux;
 // just the two that can be captured/injected into (see that module's own
 // doc comment) — so it's gated only on the feature, not target_os.
 #[cfg(feature = "remote-control")]
+mod frame_encoding;
+#[cfg(feature = "remote-control")]
 mod remote_viewer;
 #[cfg(target_os = "linux")]
 mod screen_lock_linux;

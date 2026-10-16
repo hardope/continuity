@@ -38,7 +38,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DrawIconEx, GetCursorInfo, GetIconInfo, GetSystemMetrics, CURSORINFO, CURSOR_SHOWING, DI_NORMAL, ICONINFO, SM_CXSCREEN, SM_CYSCREEN,
 };
 
-const CAPTURE_FPS: u64 = 10;
+use crate::frame_encoding::{self, LastFrame};
 
 pub struct WindowsRemoteControlHost {
     capturing: Arc<AtomicBool>,
@@ -130,11 +130,14 @@ impl RemoteControlHost for WindowsRemoteControlHost {
         let capturing = self.capturing.clone();
         let (tx, rx) = mpsc::channel(2);
         std::thread::spawn(move || {
-            let target_interval = Duration::from_millis(1000 / CAPTURE_FPS);
+            let target_interval = Duration::from_millis(1000 / frame_encoding::FRAMES_PER_SECOND);
+            let mut last = LastFrame::default();
             while capturing.load(Ordering::Relaxed) {
                 let started_at = std::time::Instant::now();
                 if let Some(jpeg) = capture_jpeg() {
-                    let _ = tx.try_send(jpeg);
+                    if last.is_new(&jpeg) && tx.try_send(jpeg.clone()).is_ok() {
+                        last.sent(jpeg);
+                    }
                 } else {
                     tracing::debug!("a capture attempt failed mid-session");
                 }
@@ -247,27 +250,13 @@ fn capture_jpeg() -> Option<Vec<u8>> {
         // channel for you (confirmed the hard way: this was the actual,
         // entire reason screen capture always failed on real Windows
         // hardware, unrelated to every earlier permission/address/DPI
-        // theory). Converts straight to a packed RGB buffer here — no
-        // point routing through `image::RgbaImage` first just to have it
-        // reject the very shape it was given.
-        let mut rgb_pixels = Vec::with_capacity(pixels.len() / 4 * 3);
-        for px in pixels.chunks_exact(4) {
-            rgb_pixels.push(px[2]); // R (was B)
-            rgb_pixels.push(px[1]); // G
-            rgb_pixels.push(px[0]); // B (was R)
-        }
-
-        let Some(image_buffer) = image::RgbImage::from_raw(width as u32, height as u32, rgb_pixels) else {
-            tracing::debug!("capture_jpeg: RgbImage::from_raw failed — buffer/dimension mismatch ({width}x{height})");
-            return None;
-        };
-        let mut jpeg_bytes = Vec::new();
-        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_bytes, 40);
-        if let Err(e) = encoder.encode(image_buffer.as_raw(), image_buffer.width(), image_buffer.height(), image::ExtendedColorType::Rgb8) {
-            tracing::debug!("capture_jpeg: JPEG encode failed: {e}");
-            return None;
-        }
-        Some(jpeg_bytes)
+        // theory). So it's packed into RGB first — scaled down by a whole
+        // factor on the way when wider than `MAX_ENCODED_WIDTH`, as on
+        // Linux. **Real complaint fixed here**: every frame was encoded at
+        // the screen's full size, which on a 4K screen alone took longer
+        // than a frame at 30 a second may.
+        let (rgb, out_width, out_height) = frame_encoding::to_rgb(&pixels, width as usize, height as usize, 0, [2, 1, 0])?;
+        frame_encoding::encode_jpeg(&rgb, out_width, out_height)
     }
 }
 

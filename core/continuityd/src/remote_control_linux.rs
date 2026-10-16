@@ -17,6 +17,7 @@
 
 mod portal;
 
+use crate::frame_encoding::{self, LastFrame};
 use continuity_daemon::RemoteControlHost;
 use continuity_proto::{InputEventKind, MouseButton as ProtoMouseButton};
 use pipewire as pw;
@@ -41,14 +42,7 @@ const BTN_MIDDLE: i32 = 0x112;
 /// compositor as the stream's *maximum* framerate, so it throttles at the
 /// source — GNOME then sends a follow-up frame for any change it held
 /// back, where dropping frames here could lose the last one.
-const MAX_FRAMES_PER_SECOND: u32 = 10;
-
-/// Frames wider than this are scaled down by a whole factor before
-/// encoding. A phone can't show more than this across anyway, and
-/// JPEG-encoding a 4K frame ten times a second would keep a core busy.
-const MAX_ENCODED_WIDTH: usize = 1920;
-
-const JPEG_QUALITY: u8 = 40;
+const MAX_FRAMES_PER_SECOND: u32 = frame_encoding::FRAMES_PER_SECOND as u32;
 
 /// A stream that has connected but produced no picture in this long is
 /// treated as broken, rather than leaving the other device on a spinner.
@@ -316,6 +310,8 @@ struct CaptureState {
     frame_size: Arc<AtomicU64>,
     progress: Rc<CaptureProgress>,
     warned_unreadable: bool,
+    /// The last frame sent — an identical one isn't sent again.
+    last: LastFrame,
 }
 
 /// What the callbacks report back to the loop driving them.
@@ -357,6 +353,7 @@ fn run_pipewire_capture(pipewire_fd: OwnedFd, capture: Capture) -> Result<(), St
         frame_size: capture.frame_size,
         progress: progress.clone(),
         warned_unreadable: false,
+        last: LastFrame::default(),
     };
     let _listener = stream
         .add_local_listener_with_user_data(state)
@@ -431,8 +428,14 @@ fn run_pipewire_capture(pipewire_fd: OwnedFd, capture: Capture) -> Result<(), St
             let Some(jpeg) = encode_frame(pixels, size.width as usize, size.height as usize, stride, state.format.format()) else {
                 return;
             };
-            match state.frames.try_send(jpeg) {
-                Ok(()) => state.progress.frames_sent.set(state.progress.frames_sent.get() + 1),
+            if !state.last.is_new(&jpeg) {
+                return;
+            }
+            match state.frames.try_send(jpeg.clone()) {
+                Ok(()) => {
+                    state.last.sent(jpeg);
+                    state.progress.frames_sent.set(state.progress.frames_sent.get() + 1);
+                }
                 // Still sending the previous frame; this one would be
                 // stale by the time it could go.
                 Err(mpsc::error::TrySendError::Full(_)) => {}
@@ -528,8 +531,8 @@ fn run_pipewire_capture(pipewire_fd: OwnedFd, capture: Capture) -> Result<(), St
 
 /// Turns one raw frame into a JPEG: honors the row `stride` (compositors
 /// pad rows, so it can exceed `width * 4`) and scales down by a whole
-/// factor when the frame is wider than `MAX_ENCODED_WIDTH`. Only the
-/// 32-bit layouts offered in `run_pipewire_capture` are handled.
+/// factor when the frame is wider than `frame_encoding::MAX_ENCODED_WIDTH`.
+/// Only the 32-bit layouts offered in `run_pipewire_capture` are handled.
 fn encode_frame(pixels: &[u8], width: usize, height: usize, stride: i32, format: spa::param::video::VideoFormat) -> Option<Vec<u8>> {
     use spa::param::video::VideoFormat;
     let channels = if format == VideoFormat::BGRx || format == VideoFormat::BGRA {
@@ -540,78 +543,13 @@ fn encode_frame(pixels: &[u8], width: usize, height: usize, stride: i32, format:
         tracing::debug!("unsupported PipeWire video format {format:?}");
         return None;
     };
-    let (rgb, out_width, out_height) = to_rgb(pixels, width, height, stride, channels)?;
-    let mut jpeg = Vec::new();
-    if let Err(e) = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, JPEG_QUALITY).encode(
-        &rgb,
-        out_width as u32,
-        out_height as u32,
-        image::ExtendedColorType::Rgb8,
-    ) {
-        tracing::debug!("JPEG encode failed for a PipeWire frame: {e}");
-        return None;
-    }
-    Some(jpeg)
-}
-
-/// The pixel-shuffling half of `encode_frame`: picks the R, G and B bytes
-/// (at `channels`) out of each 4-byte pixel, sampling every `factor`th
-/// pixel and row when downscaling. A buffer shorter than the frame it
-/// claims to hold is skipped rather than drawn half-finished.
-fn to_rgb(pixels: &[u8], width: usize, height: usize, stride: i32, channels: [usize; 3]) -> Option<(Vec<u8>, usize, usize)> {
-    let row_bytes = width.checked_mul(4)?;
-    let stride = if stride > 0 { stride as usize } else { row_bytes };
-    if stride < row_bytes {
-        return None;
-    }
-    let factor = width.div_ceil(MAX_ENCODED_WIDTH).max(1);
-    let (out_width, out_height) = (width / factor, height / factor);
-    if out_width == 0 || out_height == 0 {
-        return None;
-    }
-    let mut rgb = Vec::with_capacity(out_width * out_height * 3);
-    for row in 0..out_height {
-        let start = row * factor * stride;
-        let line = pixels.get(start..start + out_width * factor * 4)?;
-        for pixel in line.chunks_exact(4 * factor) {
-            rgb.extend_from_slice(&[pixel[channels[0]], pixel[channels[1]], pixel[channels[2]]]);
-        }
-    }
-    Some((rgb, out_width, out_height))
+    let (rgb, out_width, out_height) = frame_encoding::to_rgb(pixels, width, height, stride, channels)?;
+    frame_encoding::encode_jpeg(&rgb, out_width, out_height)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const BGR: [usize; 3] = [2, 1, 0];
-
-    #[test]
-    fn to_rgb_reorders_channels_and_skips_row_padding() {
-        // 2x2 BGRx frame, each row padded to 12 bytes.
-        let pixels = [
-            1, 2, 3, 0, 4, 5, 6, 0, 0xEE, 0xEE, 0xEE, 0xEE, //
-            7, 8, 9, 0, 10, 11, 12, 0, 0xEE, 0xEE, 0xEE, 0xEE,
-        ];
-        let (rgb, width, height) = to_rgb(&pixels, 2, 2, 12, BGR).expect("converts");
-        assert_eq!((width, height), (2, 2));
-        assert_eq!(rgb, vec![3, 2, 1, 6, 5, 4, 9, 8, 7, 12, 11, 10]);
-    }
-
-    #[test]
-    fn to_rgb_downscales_frames_wider_than_the_limit() {
-        let (width, height) = (MAX_ENCODED_WIDTH * 2, 4);
-        let pixels = vec![9u8; width * height * 4];
-        let (rgb, out_width, out_height) = to_rgb(&pixels, width, height, 0, BGR).expect("converts");
-        assert_eq!((out_width, out_height), (MAX_ENCODED_WIDTH, 2));
-        assert_eq!(rgb.len(), out_width * out_height * 3);
-    }
-
-    #[test]
-    fn to_rgb_skips_a_buffer_shorter_than_its_frame() {
-        let pixels = vec![0u8; 2 * 2 * 4 - 1];
-        assert!(to_rgb(&pixels, 2, 2, 8, BGR).is_none());
-    }
 
     #[test]
     fn encode_frame_produces_a_jpeg() {
