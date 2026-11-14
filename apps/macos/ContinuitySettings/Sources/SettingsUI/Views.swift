@@ -298,6 +298,17 @@ struct DeviceView: View {
         }
     }
 
+    /// What the Keyboard and Mouse row says about this device.
+    private var sharedEdgeDetail: String {
+        guard let edge = device.sharedEdge else {
+            return "Place \(device.name) at an edge of this screen to drive it with this Mac's mouse and keyboard, without seeing its screen."
+        }
+        if status.sharingInputWith == device.id {
+            return "Your mouse and keyboard are on \(device.name) right now. Double-tap Control to bring them back."
+        }
+        return "Move the cursor off the \(edge.rawValue) edge of this screen to use \(device.name); move it back off \(device.name)'s facing edge to return."
+    }
+
     var body: some View {
         Page {
             PageSection {
@@ -358,6 +369,30 @@ struct DeviceView: View {
                     )
                     if !status.missingPermissions.isEmpty {
                         PermissionNotice(missing: status.missingPermissions)
+                    }
+                }
+            }
+            if status.canShareInput(with: device) {
+                PageSection(title: "Keyboard and Mouse") {
+                    HStack(alignment: .firstTextBaseline) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Share with \(device.name)")
+                            Text(sharedEdgeDetail)
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Picker("", selection: Binding(
+                            get: { device.sharedEdge },
+                            set: { edge in model.setSharedEdge(device, edge) }
+                        )) {
+                            Text("Not placed").tag(ScreenEdge?.none)
+                            ForEach(ScreenEdge.allCases, id: \.self) { edge in
+                                Text(edge.displayName).tag(ScreenEdge?.some(edge))
+                            }
+                        }
+                        .labelsHidden()
+                        .frame(width: 150)
                     }
                 }
             }

@@ -109,7 +109,9 @@ fn failed(step: &'static str, error: impl std::fmt::Display) -> PortalError {
 pub struct PortalSession {
     connection: Connection,
     handle: OwnedObjectPath,
-    /// The PipeWire node of the monitor stream the person picked.
+    /// The PipeWire node of the monitor stream the person picked — 0 for an
+    /// input-only session, which has no stream (and so can't place the
+    /// pointer absolutely, only move it).
     pub node_id: u32,
     /// That stream's size in the compositor's logical coordinate space, if
     /// the portal reported one.
@@ -118,8 +120,9 @@ pub struct PortalSession {
 
 pub struct Negotiated {
     pub session: PortalSession,
-    /// A PipeWire remote that only exposes this session's stream.
-    pub pipewire_fd: OwnedFd,
+    /// A PipeWire remote that only exposes this session's stream; `None` for
+    /// an input-only session.
+    pub pipewire_fd: Option<OwnedFd>,
     /// What to pass as `restore_token` next time. A token, once used, is
     /// spent — so when persistence was requested and this is `None`, any
     /// stored token should be discarded.
@@ -132,11 +135,11 @@ pub struct Negotiated {
 /// Runs the whole setup on the session bus. On success the person at this
 /// computer has approved (or a stored approval was restored) and the
 /// stream is ready to connect to.
-pub async fn negotiate(restore_token: Option<&str>, pointer: bool, stop: &watch::Receiver<bool>) -> Result<Negotiated, PortalError> {
+pub async fn negotiate(restore_token: Option<&str>, pointer: bool, screen: bool, stop: &watch::Receiver<bool>) -> Result<Negotiated, PortalError> {
     let connection = Connection::session()
         .await
         .map_err(|e| PortalError::new(ErrorKind::Unavailable, "connect", format!("couldn't reach this desktop's session bus: {e}")))?;
-    negotiate_with(connection, restore_token, pointer, stop, APPROVAL_TIMEOUT).await
+    negotiate_with(connection, restore_token, pointer, screen, stop, APPROVAL_TIMEOUT).await
 }
 
 /// `negotiate_with`, pointer drawn into the frames — what most tests want.
@@ -147,7 +150,7 @@ pub async fn negotiate_on(
     stop: &watch::Receiver<bool>,
     approval_timeout: Duration,
 ) -> Result<Negotiated, PortalError> {
-    negotiate_with(connection, restore_token, true, stop, approval_timeout).await
+    negotiate_with(connection, restore_token, true, true, stop, approval_timeout).await
 }
 
 /// `negotiate` on an already-open bus connection, with the approval
@@ -155,11 +158,15 @@ pub async fn negotiate_on(
 /// portal without waiting a minute and a half. `pointer`: whether the
 /// frames should show this computer's pointer (see
 /// `RemoteControlHost::set_pointer_in_frames`); without it the cursor mode
-/// is left at the portal's default, hidden.
+/// is left at the portal's default, hidden. `screen`: whether to share a
+/// monitor at all — `false` is keyboard-and-mouse sharing, a `RemoteDesktop`
+/// session with no `ScreenCast` source, which the desktop's dialog then only
+/// asks about input for.
 pub async fn negotiate_with(
     connection: Connection,
     restore_token: Option<&str>,
     pointer: bool,
+    screen: bool,
     stop: &watch::Receiver<bool>,
     approval_timeout: Duration,
 ) -> Result<Negotiated, PortalError> {
@@ -182,20 +189,21 @@ pub async fn negotiate_with(
     // Embedded = the compositor draws the real cursor into the frames.
     // GNOME and KDE both support it; without it the cursor is just absent.
     let embedded_cursor = pointer
+        && screen
         && property_u32(&connection, SCREEN_CAST_IFACE, "AvailableCursorModes")
             .await
             .map(|modes| modes & CURSOR_MODE_EMBEDDED != 0)
             .unwrap_or(true);
     tracing::debug!("RemoteDesktop portal v{version}, persistence {persist}, embedded cursor {embedded_cursor}");
 
-    match start_session(&connection, persist, restore_token, embedded_cursor, stop, approval_timeout).await {
+    match start_session(&connection, persist, restore_token, embedded_cursor, screen, stop, approval_timeout).await {
         // Asking to persist is new in v2, and a portal could refuse a
         // session for it (a restore token it no longer recognizes is
         // supposed to be ignored, but that's the portal's call). Not worth
         // failing over — the session works fine without it.
         Err(e) if persist && e.step == "SelectDevices" && e.kind == ErrorKind::Failed => {
             tracing::info!("portal rejected a persistent session ({e}); retrying without persistence");
-            start_session(&connection, false, None, embedded_cursor, stop, approval_timeout).await
+            start_session(&connection, false, None, embedded_cursor, screen, stop, approval_timeout).await
         }
         other => other,
     }
@@ -206,6 +214,7 @@ async fn start_session(
     persist: bool,
     restore_token: Option<&str>,
     embedded_cursor: bool,
+    screen: bool,
     stop: &watch::Receiver<bool>,
     approval_timeout: Duration,
 ) -> Result<Negotiated, PortalError> {
@@ -226,7 +235,7 @@ async fn start_session(
         }
     };
 
-    let result = configure_and_start(connection, &handle, persist, restore_token, embedded_cursor, stop, approval_timeout).await;
+    let result = configure_and_start(connection, &handle, persist, restore_token, embedded_cursor, screen, stop, approval_timeout).await;
     if result.is_err() {
         // Also takes down anything still on screen for this session.
         close_object(connection, handle.as_str(), SESSION_IFACE).await;
@@ -240,6 +249,7 @@ async fn configure_and_start(
     persist: bool,
     restore_token: Option<&str>,
     embedded_cursor: bool,
+    screen: bool,
     stop: &watch::Receiver<bool>,
     approval_timeout: Duration,
 ) -> Result<Negotiated, PortalError> {
@@ -256,16 +266,18 @@ async fn configure_and_start(
     let _: HashMap<String, OwnedValue> =
         request(connection, REMOTE_DESKTOP_IFACE, "SelectDevices", &token, &(session, options), SETUP_TIMEOUT, stop).await?;
 
-    let token = new_token("sources");
-    let mut options: HashMap<&str, Value> = HashMap::new();
-    options.insert("handle_token", Value::from(token.as_str()));
-    options.insert("types", Value::from(SOURCE_MONITOR));
-    options.insert("multiple", Value::from(false));
-    if embedded_cursor {
-        options.insert("cursor_mode", Value::from(CURSOR_MODE_EMBEDDED));
+    if screen {
+        let token = new_token("sources");
+        let mut options: HashMap<&str, Value> = HashMap::new();
+        options.insert("handle_token", Value::from(token.as_str()));
+        options.insert("types", Value::from(SOURCE_MONITOR));
+        options.insert("multiple", Value::from(false));
+        if embedded_cursor {
+            options.insert("cursor_mode", Value::from(CURSOR_MODE_EMBEDDED));
+        }
+        let _: HashMap<String, OwnedValue> =
+            request(connection, SCREEN_CAST_IFACE, "SelectSources", &token, &(session, options), SETUP_TIMEOUT, stop).await?;
     }
-    let _: HashMap<String, OwnedValue> =
-        request(connection, SCREEN_CAST_IFACE, "SelectSources", &token, &(session, options), SETUP_TIMEOUT, stop).await?;
 
     // The step that shows the person here the system's own dialog (unless
     // `restore_token` restored an earlier approval).
@@ -278,6 +290,15 @@ async fn configure_and_start(
     let devices = started.devices.unwrap_or(0);
     if devices & (DEVICE_KEYBOARD | DEVICE_POINTER) != DEVICE_KEYBOARD | DEVICE_POINTER {
         tracing::warn!("portal granted input devices {devices:#x} rather than keyboard + pointer; some input won't work");
+    }
+    if !screen {
+        tracing::debug!("portal session {session} started for input only");
+        return Ok(Negotiated {
+            session: PortalSession { connection: connection.clone(), handle: session.clone(), node_id: 0, logical_size: None },
+            pipewire_fd: None,
+            restore_token: started.restore_token,
+            persistence_requested: persist,
+        });
     }
     let StartedStream(node_id, properties) = started
         .streams
@@ -296,7 +317,7 @@ async fn configure_and_start(
     tracing::debug!("portal session {session} started: node {node_id}, logical size {:?}", properties.size);
     Ok(Negotiated {
         session: PortalSession { connection: connection.clone(), handle: session.clone(), node_id, logical_size: properties.size },
-        pipewire_fd: pipewire_fd.into(),
+        pipewire_fd: Some(pipewire_fd.into()),
         restore_token: started.restore_token,
         persistence_requested: persist,
     })
@@ -456,6 +477,11 @@ impl PortalSession {
 
     /// `(x, y)` in the stream's own coordinate space — see
     /// `LinuxRemoteControlHost`'s input forwarding for which size that is.
+    /// `NotifyPointerMotion`: a relative move, in the desktop's logical pixels.
+    pub async fn notify_pointer_motion(&self, dx: f64, dy: f64) -> zbus::Result<()> {
+        self.notify("NotifyPointerMotion", &(&self.handle, no_options(), dx, dy)).await
+    }
+
     pub async fn notify_pointer_motion_absolute(&self, x: f64, y: f64) -> zbus::Result<()> {
         self.notify("NotifyPointerMotionAbsolute", &(&self.handle, no_options(), self.node_id, x, y)).await
     }

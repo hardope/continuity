@@ -25,12 +25,18 @@ public struct Status: Decodable, Equatable {
     public var activity: Activity?
     /// macOS privacy permissions, as continuityd itself has them.
     public var permissions: Permissions?
+    /// Whether this Mac can share its own keyboard and mouse with a computer
+    /// placed at an edge of its screen.
+    public var canShareInput: Bool?
+    /// The computer this Mac's mouse and keyboard are over at right now.
+    public var sharingInputWith: String?
 
     public init(
         device: ThisDevice, paused: Bool, devices: [PairedDevice], nearby: [NearbyDevice],
         receivedFilesDir: String, canBeControlled: Bool, canBeUnlocked: Bool,
         canControlOthers: Bool? = nil, controllingDevice: String? = nil, transfers: [Transfer]? = nil,
-        about: About? = nil, activity: Activity? = nil, permissions: Permissions? = nil
+        about: About? = nil, activity: Activity? = nil, permissions: Permissions? = nil,
+        canShareInput: Bool? = nil, sharingInputWith: String? = nil
     ) {
         self.device = device
         self.paused = paused
@@ -45,6 +51,15 @@ public struct Status: Decodable, Equatable {
         self.about = about
         self.activity = activity
         self.permissions = permissions
+        self.canShareInput = canShareInput
+        self.sharingInputWith = sharingInputWith
+    }
+
+    /// Whether a device's page offers to place it at an edge of this screen
+    /// for keyboard-and-mouse sharing: this Mac can, and it's a computer.
+    public func canShareInput(with device: PairedDevice) -> Bool {
+        guard canShareInput == true, let platform = device.platform else { return false }
+        return [Platform.macOS, .windows, .linux].contains(platform)
     }
 
     /// The permissions remote control of this Mac still needs, in the
@@ -239,10 +254,13 @@ public struct PairedDevice: Decodable, Equatable, Identifiable {
     public var pairedAtUnix: UInt64
     public var remoteControlAllowed: Bool
     public var unlockAllowed: Bool
+    /// The edge of this screen the device is placed at for
+    /// keyboard-and-mouse sharing, if any.
+    public var sharedEdge: ScreenEdge?
 
     public init(
         id: String, name: String, platform: Platform?, connected: Bool, pairedAtUnix: UInt64,
-        remoteControlAllowed: Bool, unlockAllowed: Bool
+        remoteControlAllowed: Bool, unlockAllowed: Bool, sharedEdge: ScreenEdge? = nil
     ) {
         self.id = id
         self.name = name
@@ -251,6 +269,21 @@ public struct PairedDevice: Decodable, Equatable, Identifiable {
         self.pairedAtUnix = pairedAtUnix
         self.remoteControlAllowed = remoteControlAllowed
         self.unlockAllowed = unlockAllowed
+        self.sharedEdge = sharedEdge
+    }
+}
+
+/// One edge of this screen (`ScreenEdge` in continuity-proto).
+public enum ScreenEdge: String, Codable, Equatable, CaseIterable {
+    case left, right, top, bottom
+
+    public var displayName: String {
+        switch self {
+        case .left: "Left edge"
+        case .right: "Right edge"
+        case .top: "Top edge"
+        case .bottom: "Bottom edge"
+        }
     }
 }
 

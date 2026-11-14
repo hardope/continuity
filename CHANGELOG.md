@@ -2,6 +2,21 @@
 
 All notable user-facing changes to Continuity are documented here.
 
+## [0.1.8-beta.2] - 2026-11-14
+
+### Added
+
+- **Use one keyboard and mouse across two computers.** On a Mac, place a
+  paired computer at an edge of your screen (its page in the Continuity
+  window → Keyboard and Mouse). Move the cursor off that edge and it appears
+  on the other computer, which your mouse and keyboard now drive — no window,
+  no picture of its screen, and no screen-recording permission there. Move it
+  back off the facing edge to return, or double-tap Control to come back at
+  once from anywhere. Works with a Mac, Windows PC or Linux computer on the
+  other side (a Linux computer asks once to allow remote input, with no
+  screen sharing); Windows and Linux can't yet be the computer whose mouse
+  crosses over.
+
 ## [0.1.8-beta.1] - 2026-11-14
 
 ### Fixed

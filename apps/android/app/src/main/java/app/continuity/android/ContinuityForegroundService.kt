@@ -245,6 +245,7 @@ class ContinuityForegroundService : Service() {
             is FfiSyncEvent.RemoteControlRequested,
             is FfiSyncEvent.RemoteControlSessionStarted,
             is FfiSyncEvent.RemoteControlSessionEnded,
+            is FfiSyncEvent.PointerReachedEdge,
             is FfiSyncEvent.ScreenFrameReceived,
             // The answer to a lock/unlock tapped in the app a moment ago —
             // shown in-app (see ContinuityStore). The other two are only

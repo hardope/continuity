@@ -34,7 +34,7 @@
 
 use crate::frame_encoding::{self, LastFrame, MAX_ENCODED_WIDTH};
 use continuity_daemon::RemoteControlHost;
-use continuity_proto::{InputEventKind, MouseButton as ProtoMouseButton};
+use continuity_proto::{InputEventKind, MouseButton as ProtoMouseButton, ScreenEdge};
 use objc2::AnyThread;
 use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep, NSEvent};
 use objc2_core_foundation::{CFRetained, CGPoint, CGRect, CGSize};
@@ -269,6 +269,17 @@ impl RemoteControlHost for MacRemoteControlHost {
         self.pointer_in_frames.store(include, Ordering::Relaxed);
     }
 
+    fn screen_size(&self) -> Option<(u32, u32)> {
+        let display_id = CGMainDisplayID();
+        let (width, height) = (CGDisplayPixelsWide(display_id), CGDisplayPixelsHigh(display_id));
+        (width > 0 && height > 0).then(|| (width as u32, height as u32))
+    }
+
+    fn pointer_at_edge(&self) -> Option<(ScreenEdge, f64)> {
+        let bounds = CGDisplayBounds(CGMainDisplayID());
+        edge_of(current_mouse_location(), bounds)
+    }
+
     fn stop_capture(&self) {
         self.capturing.store(false, Ordering::Relaxed);
         self.release_held_input();
@@ -441,6 +452,18 @@ fn inject_event(event: InputEventKind, held: &mut HeldInput) {
         },
         InputEventKind::MouseMove { x, y } => {
             let point = CGPoint { x: bounds.origin.x + x * width, y: bounds.origin.y + y * height };
+            let (event_type, cg_button) = mouse.move_event();
+            post(CGEvent::new_mouse_event(None, event_type, point, cg_button), flags);
+        }
+        // The controlling computer's own mouse: moved from wherever the
+        // pointer is, kept on the screen. The last point on the screen is
+        // one pixel in, so the pointer stays where it can be read back.
+        InputEventKind::MouseMoveRelative { dx, dy } => {
+            let current = current_mouse_location();
+            let point = CGPoint {
+                x: (current.x + dx).clamp(bounds.origin.x, bounds.origin.x + width - 1.0),
+                y: (current.y + dy).clamp(bounds.origin.y, bounds.origin.y + height - 1.0),
+            };
             let (event_type, cg_button) = mouse.move_event();
             post(CGEvent::new_mouse_event(None, event_type, point, cg_button), flags);
         }
@@ -728,6 +751,31 @@ impl MouseState {
     }
 }
 
+/// Which edge of `bounds` `point` is pressed against, if any, and how far
+/// along it (0.0 at the top or left). Within a pixel counts: the pointer is
+/// clamped one pixel in (`MouseMoveRelative`), and a real display's edge
+/// pixel is where a pushed pointer stops.
+pub(crate) fn edge_of(point: CGPoint, bounds: CGRect) -> Option<(ScreenEdge, f64)> {
+    let (left, top) = (bounds.origin.x, bounds.origin.y);
+    let (right, bottom) = (left + bounds.size.width - 1.0, top + bounds.size.height - 1.0);
+    if bounds.size.width <= 1.0 || bounds.size.height <= 1.0 {
+        return None;
+    }
+    let along_y = ((point.y - top) / (bottom - top)).clamp(0.0, 1.0);
+    let along_x = ((point.x - left) / (right - left)).clamp(0.0, 1.0);
+    if point.x <= left + 1.0 {
+        Some((ScreenEdge::Left, along_y))
+    } else if point.x >= right - 1.0 {
+        Some((ScreenEdge::Right, along_y))
+    } else if point.y <= top + 1.0 {
+        Some((ScreenEdge::Top, along_x))
+    } else if point.y >= bottom - 1.0 {
+        Some((ScreenEdge::Bottom, along_x))
+    } else {
+        None
+    }
+}
+
 /// `CGEventCreateMouseEvent` needs a position even for a button-only
 /// (not move) event — reads the cursor's actual current location so a
 /// click lands wherever the most recent `MouseMove` already put it,
@@ -867,6 +915,20 @@ mod tests {
 
     fn modifier(code: u16, down: bool, flags: u64) -> Option<KeyPost> {
         Some(KeyPost { code, down, kind: KeyPostKind::FlagsChanged, flags })
+    }
+
+    #[test]
+    fn the_pointer_is_at_an_edge_only_when_pressed_against_one() {
+        let bounds = CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: CGSize { width: 1920.0, height: 1080.0 } };
+        assert_eq!(edge_of(CGPoint { x: 960.0, y: 540.0 }, bounds), None);
+        assert_eq!(edge_of(CGPoint { x: 0.0, y: 270.0 }, bounds), Some((ScreenEdge::Left, 270.0 / 1079.0)));
+        assert_eq!(edge_of(CGPoint { x: 1919.0, y: 1079.0 }, bounds).map(|(e, _)| e), Some(ScreenEdge::Right), "a corner counts as a side");
+        assert_eq!(edge_of(CGPoint { x: 500.0, y: 0.5 }, bounds).map(|(e, _)| e), Some(ScreenEdge::Top));
+        assert_eq!(edge_of(CGPoint { x: 500.0, y: 1078.5 }, bounds).map(|(e, _)| e), Some(ScreenEdge::Bottom));
+        // A second display's bounds start elsewhere.
+        let second = CGRect { origin: CGPoint { x: 1920.0, y: 0.0 }, size: CGSize { width: 1000.0, height: 1000.0 } };
+        assert_eq!(edge_of(CGPoint { x: 1920.0, y: 500.0 }, second).map(|(e, _)| e), Some(ScreenEdge::Left));
+        assert_eq!(edge_of(CGPoint { x: 2400.0, y: 500.0 }, second), None);
     }
 
     #[test]

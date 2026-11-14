@@ -19,7 +19,7 @@ mod portal;
 
 use crate::frame_encoding::{self, LastFrame};
 use continuity_daemon::RemoteControlHost;
-use continuity_proto::{InputEventKind, MouseButton as ProtoMouseButton};
+use continuity_proto::{InputEventKind, MouseButton as ProtoMouseButton, ScreenEdge};
 use pipewire as pw;
 use pw::spa;
 use std::cell::{Cell, RefCell};
@@ -59,6 +59,59 @@ pub struct LinuxRemoteControlHost {
     /// `RemoteControlHost::set_pointer_in_frames`. Chosen with the portal
     /// when a session starts.
     pointer_in_frames: AtomicBool,
+    /// Where the pointer is thought to be, during keyboard-and-mouse sharing
+    /// — see `PointerTrack`.
+    pointer: Mutex<PointerTrack>,
+}
+
+/// A guess at the pointer's position for `pointer_at_edge`, from the
+/// relative moves injected: the portal gives no way to read the pointer
+/// back, and an input-only session has no stream to learn the screen's size
+/// from. The controlling computer puts the pointer at an edge with one move
+/// far longer than any screen (`PIN`), which pins it there; from then on the
+/// moves away from that edge are summed, and the pointer is back at it when
+/// the sum returns to nothing. How far along the edge it is stays unknown
+/// (reported as the middle), and the compositor's own acceleration of the
+/// injected moves, if any, isn't accounted for — so this is best effort,
+/// and the escape chord on the controlling computer is the sure way back.
+#[derive(Default)]
+struct PointerTrack {
+    edge: Option<ScreenEdge>,
+    /// Distance from `edge` into the screen, in the moves' own units.
+    inward: f64,
+}
+
+/// A relative move at least this long is a pin to an edge.
+const PIN: f64 = 100_000.0;
+
+impl PointerTrack {
+    fn moved(&mut self, dx: f64, dy: f64) {
+        if dx <= -PIN {
+            self.edge = Some(ScreenEdge::Left);
+            self.inward = 0.0;
+        } else if dx >= PIN {
+            self.edge = Some(ScreenEdge::Right);
+            self.inward = 0.0;
+        } else if dy <= -PIN {
+            self.edge = Some(ScreenEdge::Top);
+            self.inward = 0.0;
+        } else if dy >= PIN {
+            self.edge = Some(ScreenEdge::Bottom);
+            self.inward = 0.0;
+        } else if let Some(edge) = self.edge {
+            let inward = match edge {
+                ScreenEdge::Left => dx,
+                ScreenEdge::Right => -dx,
+                ScreenEdge::Top => dy,
+                ScreenEdge::Bottom => -dy,
+            };
+            self.inward = (self.inward + inward).max(0.0);
+        }
+    }
+
+    fn at_edge(&self) -> Option<(ScreenEdge, f64)> {
+        self.edge.filter(|_| self.inward <= 0.0).map(|edge| (edge, 0.5))
+    }
 }
 
 /// One `start_capture`'s worth of state, so a session that's still winding
@@ -77,7 +130,42 @@ impl LinuxRemoteControlHost {
             current: Mutex::new(None),
             failure: Arc::new(Mutex::new(None)),
             pointer_in_frames: AtomicBool::new(true),
+            pointer: Mutex::new(PointerTrack::default()),
         }
+    }
+
+    /// Starts a portal session — with a monitor's stream for the screen
+    /// (`start_capture`), or input only — on a thread of its own, since
+    /// portal setup is async D-Bus traffic that can wait minutes on a
+    /// person. Returns the frame channel, which stays empty for input only.
+    fn start_run(&self, screen: bool) -> Option<mpsc::Receiver<Vec<u8>>> {
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let run = Arc::new(CaptureRun { stop: stop_tx, input: Mutex::new(None) });
+        if let Some(previous) = self.current.lock().unwrap().replace(run.clone()) {
+            let _ = previous.stop.send(true);
+        }
+        *self.failure.lock().unwrap() = None;
+        *self.pointer.lock().unwrap() = PointerTrack::default();
+
+        let (frames_tx, frames_rx) = mpsc::channel(2);
+        let failure = self.failure.clone();
+        let token_path = self.restore_token_path.clone();
+        let pointer = self.pointer_in_frames.load(Ordering::Relaxed);
+        let spawned = std::thread::Builder::new().name("remote-desktop".to_string()).spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                Ok(runtime) => runtime,
+                Err(e) => {
+                    *failure.lock().unwrap() = Some(format!("couldn't start screen sharing: {e}"));
+                    return;
+                }
+            };
+            runtime.block_on(run_session(run, stop_rx, frames_tx, failure, token_path, pointer, screen));
+        });
+        if let Err(e) = spawned {
+            tracing::warn!("couldn't start the remote-desktop thread: {e}");
+            return None;
+        }
+        Some(frames_rx)
     }
 }
 
@@ -90,6 +178,9 @@ pub fn restore_token_path(profile: &str) -> Option<PathBuf> {
 
 impl RemoteControlHost for LinuxRemoteControlHost {
     fn inject(&self, event: InputEventKind) {
+        if let InputEventKind::MouseMoveRelative { dx, dy } = event {
+            self.pointer.lock().unwrap().moved(dx, dy);
+        }
         let Some(run) = self.current.lock().unwrap().clone() else {
             return;
         };
@@ -100,35 +191,23 @@ impl RemoteControlHost for LinuxRemoteControlHost {
     }
 
     fn start_capture(&self) -> Option<mpsc::Receiver<Vec<u8>>> {
-        let (stop_tx, stop_rx) = watch::channel(false);
-        let run = Arc::new(CaptureRun { stop: stop_tx, input: Mutex::new(None) });
-        if let Some(previous) = self.current.lock().unwrap().replace(run.clone()) {
-            let _ = previous.stop.send(true);
-        }
-        *self.failure.lock().unwrap() = None;
+        self.start_run(true)
+    }
 
-        let (frames_tx, frames_rx) = mpsc::channel(2);
-        let failure = self.failure.clone();
-        let token_path = self.restore_token_path.clone();
-        let pointer = self.pointer_in_frames.load(Ordering::Relaxed);
-        // Portal setup is async D-Bus traffic that can wait minutes on a
-        // person, so it gets its own thread and runtime instead of
-        // borrowing the engine's.
-        let spawned = std::thread::Builder::new().name("remote-desktop".to_string()).spawn(move || {
-            let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-                Ok(runtime) => runtime,
-                Err(e) => {
-                    *failure.lock().unwrap() = Some(format!("couldn't start screen sharing: {e}"));
-                    return;
-                }
-            };
-            runtime.block_on(run_session(run, stop_rx, frames_tx, failure, token_path, pointer));
-        });
-        if let Err(e) = spawned {
-            tracing::warn!("couldn't start the remote-desktop thread: {e}");
-            return None;
+    /// A `RemoteDesktop` session with no screen source: the desktop's dialog
+    /// asks about input only (or a stored approval restores it), and input
+    /// is injected once it's up. Setup is asynchronous, so this can't say
+    /// whether the person here approves; until they do, injected input is
+    /// dropped, and a refusal is logged.
+    fn start_input_only(&self) -> Result<(), String> {
+        match self.start_run(false) {
+            Some(_frames) => Ok(()),
+            None => Err("couldn't start the desktop's remote-desktop session".to_string()),
         }
-        Some(frames_rx)
+    }
+
+    fn pointer_at_edge(&self) -> Option<(ScreenEdge, f64)> {
+        self.pointer.lock().unwrap().at_edge()
     }
 
     fn stop_capture(&self) {
@@ -158,9 +237,10 @@ async fn run_session(
     failure: Arc<Mutex<Option<String>>>,
     token_path: Option<PathBuf>,
     pointer: bool,
+    screen: bool,
 ) {
     let restore_token = token_path.as_deref().and_then(read_restore_token);
-    let negotiated = match portal::negotiate(restore_token.as_deref(), pointer, &stop).await {
+    let negotiated = match portal::negotiate(restore_token.as_deref(), pointer, screen, &stop).await {
         Ok(negotiated) => negotiated,
         Err(e) => {
             if e.kind == portal::ErrorKind::Cancelled {
@@ -202,25 +282,42 @@ async fn run_session(
         }
     });
 
-    // PipeWire runs its own (non-tokio) loop, so it gets its own thread;
-    // this runtime stays free to deliver input in the meantime.
-    let (done_tx, done_rx) = oneshot::channel();
-    let capture = Capture {
-        node_id: session.node_id,
-        stop: stop.clone(),
-        portal_closed,
-        frames: frames.clone(),
-        frame_size,
-    };
-    let pipewire_fd = negotiated.pipewire_fd;
-    let spawned = std::thread::Builder::new()
-        .name("remote-desktop-capture".to_string())
-        .spawn(move || {
-            let _ = done_tx.send(run_pipewire_capture(pipewire_fd, capture));
-        });
-    let outcome = match spawned {
-        Ok(_) => done_rx.await.unwrap_or_else(|_| Err("screen capture stopped unexpectedly".to_string())),
-        Err(e) => Err(format!("couldn't start screen capture: {e}")),
+    let outcome = match negotiated.pipewire_fd {
+        // PipeWire runs its own (non-tokio) loop, so it gets its own
+        // thread; this runtime stays free to deliver input in the meantime.
+        Some(pipewire_fd) => {
+            let (done_tx, done_rx) = oneshot::channel();
+            let capture = Capture {
+                node_id: session.node_id,
+                stop: stop.clone(),
+                portal_closed: portal_closed.clone(),
+                frames: frames.clone(),
+                frame_size,
+            };
+            let spawned = std::thread::Builder::new()
+                .name("remote-desktop-capture".to_string())
+                .spawn(move || {
+                    let _ = done_tx.send(run_pipewire_capture(pipewire_fd, capture));
+                });
+            match spawned {
+                Ok(_) => done_rx.await.unwrap_or_else(|_| Err("screen capture stopped unexpectedly".to_string())),
+                Err(e) => Err(format!("couldn't start screen capture: {e}")),
+            }
+        }
+        // Input only: nothing to capture; the session lasts until it's
+        // stopped from either side.
+        None => {
+            let mut stop = stop.clone();
+            loop {
+                if *stop.borrow_and_update() || portal_closed.load(Ordering::Relaxed) {
+                    break Ok(());
+                }
+                tokio::select! {
+                    changed = stop.changed() => if changed.is_err() { break Ok(()) },
+                    _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                }
+            }
+        }
     };
     if let Err(reason) = outcome {
         if !*stop.borrow() {
@@ -258,6 +355,7 @@ async fn forward_input(session: Arc<portal::PortalSession>, mut events: mpsc::Un
                 };
                 session.notify_pointer_motion_absolute(x.clamp(0.0, 1.0) * width, y.clamp(0.0, 1.0) * height).await
             }
+            InputEventKind::MouseMoveRelative { dx, dy } => session.notify_pointer_motion(dx, dy).await,
             InputEventKind::MouseButton { button, down } => {
                 let button = match button {
                     ProtoMouseButton::Left => BTN_LEFT,
@@ -565,6 +663,26 @@ fn encode_frame(pixels: &[u8], width: usize, height: usize, stride: i32, format:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_pointer_is_back_at_its_arrival_edge_when_the_moves_away_add_up_to_nothing() {
+        let mut track = PointerTrack::default();
+        assert_eq!(track.at_edge(), None, "nothing known yet");
+        // The controller's arrival: a pin to the top, then to the left edge.
+        track.moved(0.0, -PIN);
+        track.moved(-PIN, 0.0);
+        assert_eq!(track.at_edge().map(|(e, _)| e), Some(ScreenEdge::Left), "the last pin is the edge it's at");
+        track.moved(0.0, 500.0);
+        assert_eq!(track.at_edge().map(|(e, _)| e), Some(ScreenEdge::Left), "along the edge is still at it");
+        track.moved(30.0, 0.0);
+        assert_eq!(track.at_edge(), None, "moved into the screen");
+        track.moved(-20.0, 0.0);
+        assert_eq!(track.at_edge(), None);
+        track.moved(-15.0, 0.0);
+        assert_eq!(track.at_edge(), Some((ScreenEdge::Left, 0.5)), "back at the edge; how far along it is unknown");
+        track.moved(5.0, 0.0);
+        assert_eq!(track.at_edge(), None);
+    }
 
     #[test]
     fn encode_frame_produces_a_jpeg() {

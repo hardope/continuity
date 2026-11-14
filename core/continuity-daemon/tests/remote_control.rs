@@ -18,7 +18,7 @@ use continuity_daemon::{
     ClipboardBackend, EngineCommand, EngineConfig, EngineHandle, MediaController, NoopMediaController, RemoteControlHost,
     RemoteControlRole, SyncEvent,
 };
-use continuity_proto::InputEventKind;
+use continuity_proto::{InputEventKind, ScreenEdge, ScreenSize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -43,6 +43,9 @@ struct FakeRemoteControlHost {
     capturing: Arc<AtomicBool>,
     /// What the engine last said about drawing the pointer into frames.
     pointer_in_frames: Arc<Mutex<Option<bool>>>,
+    /// Where the fake screen's pointer is pressed against an edge, as the
+    /// keyboard-and-mouse sharing test sets it.
+    at_edge: Arc<Mutex<Option<(ScreenEdge, f64)>>>,
 }
 
 impl RemoteControlHost for FakeRemoteControlHost {
@@ -82,6 +85,14 @@ impl RemoteControlHost for FakeRemoteControlHost {
 
     fn set_pointer_in_frames(&self, include: bool) {
         *self.pointer_in_frames.lock().unwrap() = Some(include);
+    }
+
+    fn screen_size(&self) -> Option<(u32, u32)> {
+        Some((1920, 1080))
+    }
+
+    fn pointer_at_edge(&self) -> Option<(ScreenEdge, f64)> {
+        *self.at_edge.lock().unwrap()
     }
 }
 
@@ -139,7 +150,7 @@ async fn full_remote_control_session_lifecycle() {
         }
     }
 
-    a.command_sender().send(EngineCommand::RequestRemoteControl { peer_crypto_id: b_id.clone() }).expect("send request");
+    a.command_sender().send(EngineCommand::RequestRemoteControl { peer_crypto_id: b_id.clone(), screen: true }).expect("send request");
 
     let mut b_saw_request = false;
     let mut a_saw_started_controlling = false;
@@ -335,7 +346,7 @@ async fn a_capture_that_never_starts_tells_the_controlling_side_why() {
         }
     }
 
-    a.command_sender().send(EngineCommand::RequestRemoteControl { peer_crypto_id: b_id.clone() }).expect("send request");
+    a.command_sender().send(EngineCommand::RequestRemoteControl { peer_crypto_id: b_id.clone(), screen: true }).expect("send request");
 
     let mut a_started = false;
     let mut a_declined = false;
@@ -409,7 +420,7 @@ async fn a_host_that_reports_unavailable_auto_declines_without_bothering_the_use
         }
     }
 
-    a.command_sender().send(EngineCommand::RequestRemoteControl { peer_crypto_id: b_id.clone() }).expect("send request");
+    a.command_sender().send(EngineCommand::RequestRemoteControl { peer_crypto_id: b_id.clone(), screen: true }).expect("send request");
 
     let mut a_saw_declined = false;
     let mut b_saw_request = false;
@@ -486,9 +497,9 @@ async fn a_screen_stream_arriving_after_a_data_connection_still_delivers_frames(
     assert!(matches!(next(&mut mesh).await, Message::FileAccept { accepted: true, data_channel: true, .. }));
 
     // A asks to control B, and B accepts.
-    a.send_command(EngineCommand::RequestRemoteControl { peer_crypto_id: b_id.clone() });
-    let Message::RemoteControlRequest { session_id } = next(&mut mesh).await else { panic!("expected RemoteControlRequest") };
-    continuity_net::write_message(&mut mesh, &Message::RemoteControlResponse { session_id: session_id.clone(), accepted: true })
+    a.send_command(EngineCommand::RequestRemoteControl { peer_crypto_id: b_id.clone(), screen: true });
+    let Message::RemoteControlRequest { session_id, .. } = next(&mut mesh).await else { panic!("expected RemoteControlRequest") };
+    continuity_net::write_message(&mut mesh, &Message::RemoteControlResponse { session_id: session_id.clone(), accepted: true, screen_size: None })
         .await
         .unwrap();
     loop {
@@ -521,4 +532,119 @@ async fn a_screen_stream_arriving_after_a_data_connection_still_delivers_frames(
 
     drop((mesh, data, screen));
     a.shutdown();
+}
+
+/// Keyboard-and-mouse sharing: a session without the screen. B never
+/// captures, A learns B's screen size, A's relative moves are injected, and
+/// when B's pointer reaches an edge A hears which one — once, not once per
+/// move while it stays there.
+#[tokio::test]
+async fn an_input_only_session_relays_moves_and_reports_edges_without_capturing() {
+    let a_identity = Identity::generate();
+    let b_identity = Identity::generate();
+    let a_id = a_identity.device_id();
+    let b_id = b_identity.device_id();
+
+    let b_host = FakeRemoteControlHost::default();
+    let mut a = make_engine("InputA", a_identity, &b_id, "InputB", Arc::new(continuity_daemon::NoopRemoteControlHost))
+        .await
+        .expect("start engine A");
+    let mut b = make_engine("InputB", b_identity, &a_id, "InputA", Arc::new(b_host.clone())).await.expect("start engine B");
+
+    let connect_deadline = tokio::time::sleep(Duration::from_secs(15));
+    tokio::pin!(connect_deadline);
+    loop {
+        tokio::select! {
+            _ = &mut connect_deadline => panic!("A and B never connected"),
+            Some(ev) = a.events.recv() => if matches!(ev, SyncEvent::Connected { .. }) { break },
+            Some(_) = b.events.recv() => {}
+        }
+    }
+
+    a.send_command(EngineCommand::RequestRemoteControl { peer_crypto_id: b_id.clone(), screen: false });
+
+    let mut a_started = None;
+    let mut b_started = false;
+    let session_deadline = tokio::time::sleep(Duration::from_secs(20));
+    tokio::pin!(session_deadline);
+    while a_started.is_none() || !b_started {
+        tokio::select! {
+            _ = &mut session_deadline => break,
+            Some(ev) = a.events.recv() => match ev {
+                SyncEvent::RemoteControlSessionStarted { peer_id, role, screen, screen_size, .. } => {
+                    assert_eq!((peer_id, role, screen), (b_id.clone(), RemoteControlRole::Controlling, false));
+                    a_started = Some(screen_size);
+                }
+                SyncEvent::RemoteControlDeclined { .. } => panic!("B should accept, not decline"),
+                SyncEvent::RemoteControlSessionEnded { reason, .. } => panic!("A's session ended: {reason:?}"),
+                _ => {}
+            },
+            Some(ev) = b.events.recv() => match ev {
+                SyncEvent::RemoteControlRequested { peer_id, .. } => {
+                    assert_eq!(peer_id, a_id);
+                    b.send_command(EngineCommand::RespondToRemoteControlRequest { peer_crypto_id: a_id.clone(), accept: true });
+                }
+                SyncEvent::RemoteControlSessionStarted { role, screen, .. } => {
+                    assert_eq!((role, screen), (RemoteControlRole::Controlled, false));
+                    b_started = true;
+                }
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(a_started, Some(Some(ScreenSize { width: 1920, height: 1080 })), "A learns B's screen size");
+    assert!(b_started);
+    assert!(!b_host.capturing.load(Ordering::Relaxed), "no screen was asked for, so nothing is captured");
+
+    // Moves are injected; nothing is said about edges while the pointer
+    // isn't at one.
+    a.send_command(EngineCommand::SendInputEvent { peer_crypto_id: b_id.clone(), event: InputEventKind::MouseMoveRelative { dx: 10.0, dy: -4.0 } });
+    let deadline = tokio::time::sleep(Duration::from_secs(5));
+    tokio::pin!(deadline);
+    while b_host.injected.lock().unwrap().is_empty() {
+        tokio::select! {
+            _ = &mut deadline => panic!("B never injected the move"),
+            // The injection isn't an event on either side: look again soon.
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            Some(ev) = a.events.recv() => assert!(!matches!(ev, SyncEvent::PointerReachedEdge { .. }), "not at an edge yet"),
+            Some(_) = b.events.recv() => {}
+        }
+    }
+    assert!(matches!(b_host.injected.lock().unwrap()[0], InputEventKind::MouseMoveRelative { dx, dy } if dx == 10.0 && dy == -4.0));
+
+    // Now the pointer is against the right edge: the next move reports it,
+    // and a further move while it stays there doesn't.
+    *b_host.at_edge.lock().unwrap() = Some((ScreenEdge::Right, 0.4));
+    for _ in 0..2 {
+        a.send_command(EngineCommand::SendInputEvent { peer_crypto_id: b_id.clone(), event: InputEventKind::MouseMoveRelative { dx: 5.0, dy: 0.0 } });
+    }
+    let mut edges = Vec::new();
+    let deadline = tokio::time::sleep(Duration::from_secs(4));
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            _ = &mut deadline => break,
+            Some(ev) = a.events.recv() => if let SyncEvent::PointerReachedEdge { peer_id, edge, position } = ev {
+                assert_eq!(peer_id, b_id);
+                edges.push((edge, position));
+            },
+            Some(_) = b.events.recv() => {}
+        }
+    }
+    assert_eq!(edges, vec![(ScreenEdge::Right, 0.4)], "reported once, on arrival");
+    assert_eq!(b_host.injected.lock().unwrap().len(), 3);
+
+    a.send_command(EngineCommand::EndRemoteControlSession { peer_crypto_id: b_id.clone() });
+    let deadline = tokio::time::sleep(Duration::from_secs(5));
+    tokio::pin!(deadline);
+    let mut b_ended = false;
+    while !b_ended {
+        tokio::select! {
+            _ = &mut deadline => panic!("B never saw the session end"),
+            Some(_) = a.events.recv() => {}
+            Some(ev) = b.events.recv() => if matches!(ev, SyncEvent::RemoteControlSessionEnded { .. }) { b_ended = true },
+        }
+    }
+    a.shutdown();
+    b.shutdown();
 }

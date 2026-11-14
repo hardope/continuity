@@ -18,7 +18,7 @@
 //! anything that misbehaves.
 
 use continuity_daemon::RemoteControlHost;
-use continuity_proto::{InputEventKind, MouseButton as ProtoMouseButton};
+use continuity_proto::{InputEventKind, MouseButton as ProtoMouseButton, ScreenEdge};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -115,6 +115,18 @@ impl RemoteControlHost for WindowsRemoteControlHost {
             _ => {}
         }
         inject_event(event);
+    }
+
+    fn screen_size(&self) -> Option<(u32, u32)> {
+        let (width, height) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+        (width > 0 && height > 0).then(|| (width as u32, height as u32))
+    }
+
+    fn pointer_at_edge(&self) -> Option<(ScreenEdge, f64)> {
+        let mut point = windows::Win32::Foundation::POINT::default();
+        unsafe { windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut point) }.ok()?;
+        let (width, height) = self.screen_size()?;
+        edge_of(point.x, point.y, width as i32, height as i32)
     }
 
     fn start_capture(&self) -> Option<mpsc::Receiver<Vec<u8>>> {
@@ -329,6 +341,29 @@ fn draw_cursor_onto(mem_dc: windows::Win32::Graphics::Gdi::HDC) {
 /// `media_windows.rs`'s `send_key` already uses for media keys, just
 /// building `KEYBDINPUT`/`MOUSEINPUT` for arbitrary codes and full mouse
 /// events instead of the fixed `VK_MEDIA_*`/`VK_VOLUME_*` set.
+/// Which edge of a `width` × `height` primary screen the pointer at (`x`,
+/// `y`) is pressed against, if any, and how far along it (0.0 at the top or
+/// left). Windows keeps the pointer within the screen itself, so the edge
+/// pixel is where a pushed pointer stops.
+fn edge_of(x: i32, y: i32, width: i32, height: i32) -> Option<(ScreenEdge, f64)> {
+    if width <= 1 || height <= 1 {
+        return None;
+    }
+    let along_y = (f64::from(y) / f64::from(height - 1)).clamp(0.0, 1.0);
+    let along_x = (f64::from(x) / f64::from(width - 1)).clamp(0.0, 1.0);
+    if x <= 0 {
+        Some((ScreenEdge::Left, along_y))
+    } else if x >= width - 1 {
+        Some((ScreenEdge::Right, along_y))
+    } else if y <= 0 {
+        Some((ScreenEdge::Top, along_x))
+    } else if y >= height - 1 {
+        Some((ScreenEdge::Bottom, along_x))
+    } else {
+        None
+    }
+}
+
 fn inject_event(event: InputEventKind) {
     match event {
         InputEventKind::KeyDown { code } => send_key_event(code as u16, false),
@@ -345,6 +380,16 @@ fn inject_event(event: InputEventKind) {
             dy: (y * 65535.0) as i32,
             mouseData: 0,
             dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
+            time: 0,
+            dwExtraInfo: 0,
+        }),
+        // The controlling computer's own mouse: a plain relative move, which
+        // Windows applies with its own acceleration and keeps on screen.
+        InputEventKind::MouseMoveRelative { dx, dy } => send_mouse_input(MOUSEINPUT {
+            dx: dx.round() as i32,
+            dy: dy.round() as i32,
+            mouseData: 0,
+            dwFlags: MOUSEEVENTF_MOVE,
             time: 0,
             dwExtraInfo: 0,
         }),
@@ -461,6 +506,15 @@ mod tests {
     use super::*;
 
     /// Set-1 scan codes, the same on every layout for these keys.
+    #[test]
+    fn the_pointer_is_at_an_edge_only_when_pressed_against_one() {
+        assert_eq!(edge_of(960, 540, 1920, 1080), None);
+        assert_eq!(edge_of(0, 0, 1920, 1080).map(|(e, _)| e), Some(ScreenEdge::Left));
+        assert_eq!(edge_of(1919, 300, 1920, 1080).map(|(e, _)| e), Some(ScreenEdge::Right));
+        assert_eq!(edge_of(300, 0, 1920, 1080).map(|(e, _)| e), Some(ScreenEdge::Top));
+        assert_eq!(edge_of(300, 1079, 1920, 1080), Some((ScreenEdge::Bottom, 300.0 / 1919.0)));
+    }
+
     #[test]
     fn injected_keys_carry_their_scan_codes() {
         assert_eq!(scan_code(0x41), 0x1E, "A");

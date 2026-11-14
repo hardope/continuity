@@ -31,6 +31,8 @@ mod notifications_mac;
 mod permissions_mac;
 #[cfg(all(target_os = "macos", feature = "remote-control"))]
 mod remote_control_mac;
+#[cfg(all(target_os = "macos", feature = "remote-control"))]
+mod input_share_mac;
 #[cfg(all(target_os = "windows", feature = "remote-control"))]
 mod remote_control_windows;
 #[cfg(all(target_os = "linux", feature = "remote-control"))]
@@ -87,6 +89,12 @@ enum AppEvent {
     /// Screen frames themselves never come through here.
     #[cfg(feature = "remote-control")]
     ViewerFrameReady,
+    /// A device's shared edge changed in the window (see
+    /// `ControlState::set_on_shared_edges_changed`), or the mouse crossed
+    /// over or came back (see input_share_mac.rs) — the sharing state is
+    /// read again.
+    #[cfg(all(target_os = "macos", feature = "remote-control"))]
+    InputShareChanged,
 }
 
 /// Where the engine thread sends screen frames instead of the event loop
@@ -276,6 +284,25 @@ fn main() -> anyhow::Result<()> {
     );
     control.spawn_trust_watcher();
     control.spawn_received_dir_watcher(received_files_dir(&profile()), commands.clone());
+    // Keyboard-and-mouse sharing with the computers placed at this screen's
+    // edges (see input_share_mac.rs). The window changes the placements
+    // through the control socket; the sharing itself reports back here.
+    #[cfg(all(target_os = "macos", feature = "remote-control"))]
+    let input_share = {
+        let wake = Mutex::new(event_loop.create_proxy());
+        let share = input_share_mac::InputShare::new(
+            commands.clone(),
+            Arc::new(move || {
+                let _ = wake.lock().unwrap().send_event(AppEvent::InputShareChanged);
+            }),
+        );
+        share.set_placements(control.shared_edges());
+        let changed = Mutex::new(event_loop.create_proxy());
+        control.set_on_shared_edges_changed(move || {
+            let _ = changed.lock().unwrap().send_event(AppEvent::InputShareChanged);
+        });
+        share
+    };
     // Entries left behind by a previous run that didn't quit cleanly would
     // point at devices that may not be connected now — start from none and
     // let `Connected` events add them back.
@@ -380,6 +407,8 @@ fn main() -> anyhow::Result<()> {
         match event {
             tao::event::Event::UserEvent(AppEvent::Engine(sync_event)) => {
                 control.observe(&sync_event);
+                #[cfg(all(target_os = "macos", feature = "remote-control"))]
+                input_share.observe(&sync_event);
                 let tray_line = match &sync_event {
                     SyncEvent::FileTransferProgress { .. } => Some(false),
                     SyncEvent::FileSending { .. }
@@ -445,6 +474,11 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             tao::event::Event::UserEvent(AppEvent::OpenWindow) => open_window = true,
+            #[cfg(all(target_os = "macos", feature = "remote-control"))]
+            tao::event::Event::UserEvent(AppEvent::InputShareChanged) => {
+                input_share.set_placements(control.shared_edges());
+                control.set_input_sharing(input_share.sharing_with());
+            }
             _ => {}
         }
 
@@ -707,6 +741,8 @@ fn handle_sync_event(
                 }
             }
         }
+        // Keyboard-and-mouse sharing: handled where the mouse is grabbed.
+        SyncEvent::PointerReachedEdge { .. } => {}
         // Never arrives here: `start_engine_thread` sends screen frames
         // straight to the viewer's decoder (see `route_screen_frame`)
         // instead of through the event loop.
@@ -995,8 +1031,9 @@ fn handle_remote_control_sync_event(
         SyncEvent::WasReset => {
             connected_peer_platforms.lock().unwrap().clear();
         }
-        SyncEvent::RemoteControlSessionStarted { peer_id, peer_name, session_id, role } => {
-            if *role != continuity_daemon::RemoteControlRole::Controlling {
+        SyncEvent::RemoteControlSessionStarted { peer_id, peer_name, session_id, role, screen, .. } => {
+            // Keyboard-and-mouse sharing has no picture to show.
+            if *role != continuity_daemon::RemoteControlRole::Controlling || !screen {
                 return;
             }
             let platform = connected_peer_platforms.lock().unwrap().get(peer_id).copied().unwrap_or_else(|| {

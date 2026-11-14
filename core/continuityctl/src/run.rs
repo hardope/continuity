@@ -145,6 +145,7 @@ fn handle_event(event: SyncEvent, cli_state: &CliState) {
             println!("'{peer_name}' requested remote control (this CLI can't grant it)");
         }
         SyncEvent::RemoteControlDeclined { peer_name, .. } => println!("'{peer_name}' declined remote control"),
+        SyncEvent::PointerReachedEdge { edge, position, .. } => tracing::debug!("pointer reached the {edge:?} edge at {position:.2}"),
         SyncEvent::RemoteControlSessionStarted { peer_name, role, .. } => {
             println!("remote control session with '{peer_name}' started ({role:?})");
         }

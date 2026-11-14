@@ -50,6 +50,33 @@ pub trait RemoteControlHost: Send + Sync {
     /// started (e.g. `start_capture` already returned `None`).
     fn stop_capture(&self);
 
+    /// Gets ready to take input without capturing the screen — a
+    /// keyboard-and-mouse sharing session (`RemoteControlRequest { screen:
+    /// false }`). macOS and Windows inject with nothing to set up; Linux
+    /// opens a portal session without a screen source. `Err` is a reason
+    /// the engine ends the request with. `stop_capture` ends it, as for a
+    /// session with the screen.
+    fn start_input_only(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// This screen's size in pixels, for a controller forwarding its own
+    /// mouse (`InputEventKind::MouseMoveRelative` is in these pixels, and
+    /// the controller needs to know where the edges are). `None` if the
+    /// host can't say.
+    fn screen_size(&self) -> Option<(u32, u32)> {
+        None
+    }
+
+    /// Where the pointer is pressed against an edge of the screen right
+    /// now, and how far along it (`0.0..=1.0` from the top or the left) —
+    /// asked after each `MouseMoveRelative` the engine injects, so the
+    /// controlling computer can take its cursor back when it reaches the
+    /// far side. `None` when it isn't at an edge, or the host can't tell.
+    fn pointer_at_edge(&self) -> Option<(continuity_proto::ScreenEdge, f64)> {
+        None
+    }
+
     /// Why the channel from the latest `start_capture` closed, if the host
     /// knows — the engine asks when that happens and passes the answer on
     /// to the controlling device, instead of the session just ending

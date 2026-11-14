@@ -19,7 +19,7 @@
 
 use continuity_crypto::TrustStore;
 use continuity_daemon::{EngineCommand, RemoteControlRole, SyncEvent};
-use continuity_proto::{Platform, ScreenLockOutcome, PROTOCOL_VERSION};
+use continuity_proto::{Platform, ScreenEdge, ScreenLockOutcome, PROTOCOL_VERSION};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -76,6 +76,11 @@ pub enum ControlOp {
     SetRemoteControlAllowed { device: String, allowed: bool },
     /// Linux only — the one platform that can be unlocked remotely.
     SetUnlockAllowed { device: String, allowed: bool },
+    /// Places a paired computer at an edge of this screen for
+    /// keyboard-and-mouse sharing (`None` takes it away): moving the cursor
+    /// off that edge then drives that computer until it comes back. Refused
+    /// where this computer can't share its input (`Status::can_share_input`).
+    SetSharedEdge { device: String, edge: Option<ScreenEdge> },
     /// Pairs with a nearby device, or reconnects a paired one.
     Connect { device: String },
     Disconnect { device: String },
@@ -143,6 +148,11 @@ pub struct Status {
     /// a time: there's one viewer window, and the windows don't offer
     /// Control while this is set.
     pub controlling_device: Option<String>,
+    /// Whether this computer can share its own keyboard and mouse with a
+    /// computer placed at an edge of its screen (macOS so far).
+    pub can_share_input: bool,
+    /// The computer this one's mouse and keyboard are over at right now.
+    pub sharing_input_with: Option<String>,
     /// Every transfer under way and the most recently finished ones, newest
     /// first.
     pub transfers: Vec<Transfer>,
@@ -251,6 +261,9 @@ pub struct PairedDevice {
     pub paired_at_unix: u64,
     pub remote_control_allowed: bool,
     pub unlock_allowed: bool,
+    /// The edge of this screen the device is placed at for
+    /// keyboard-and-mouse sharing, if any.
+    pub shared_edge: Option<ScreenEdge>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -273,6 +286,10 @@ pub struct AppSettings {
     /// look like nothing happened.
     #[serde(default)]
     pub window_shown_once: bool,
+    /// Which edge of this screen each paired computer is placed at for
+    /// keyboard-and-mouse sharing, by device id.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub shared_edges: HashMap<String, ScreenEdge>,
     /// Whatever a newer version wrote that this one doesn't know, kept as
     /// it was rather than dropped the next time this version saves.
     #[serde(flatten)]
@@ -394,6 +411,9 @@ struct Live {
     /// except for the moment between a second session starting and the
     /// tray ending the first (see `handle_remote_control_sync_event`).
     controlling: HashMap<String, String>,
+    /// The computer this one's mouse and keyboard are over at (see
+    /// `set_input_sharing`).
+    sharing_input_with: Option<String>,
     received_files_dir: PathBuf,
     /// Bumped on every change a watcher should hear about straight away.
     generation: u64,
@@ -460,6 +480,9 @@ pub struct ControlState {
     settings: Mutex<AppSettings>,
     live: Mutex<Live>,
     changed: Condvar,
+    /// Told when a device's shared edge changes — the tray's event loop,
+    /// which owns the input sharing (see `set_on_shared_edges_changed`).
+    shared_edges_changed: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 impl ControlState {
@@ -489,7 +512,72 @@ impl ControlState {
             settings: Mutex::new(settings),
             live: Mutex::new(live),
             changed: Condvar::new(),
+            shared_edges_changed: Mutex::new(None),
         })
+    }
+
+    /// Whether this computer can share its keyboard and mouse at all —
+    /// the controlling side exists on macOS with the remote-control feature.
+    pub fn can_share_input() -> bool {
+        cfg!(all(target_os = "macos", feature = "remote-control"))
+    }
+
+    /// Which edge each paired computer is placed at.
+    pub fn shared_edges(&self) -> HashMap<String, ScreenEdge> {
+        self.settings.lock().unwrap().shared_edges.clone()
+    }
+
+    /// Called after every change to the shared edges.
+    pub fn set_on_shared_edges_changed(&self, callback: impl Fn() + Send + Sync + 'static) {
+        *self.shared_edges_changed.lock().unwrap() = Some(Box::new(callback));
+    }
+
+    /// The input sharing reporting who the mouse and keyboard are over at
+    /// right now (`None`: here).
+    pub fn set_input_sharing(&self, peer_id: Option<String>) {
+        let mut live = self.live.lock().unwrap();
+        if live.sharing_input_with == peer_id {
+            return;
+        }
+        live.sharing_input_with = peer_id;
+        live.generation += 1;
+        drop(live);
+        self.changed.notify_all();
+    }
+
+    /// Places `device` at `edge` (or takes it away) and saves it. Only a
+    /// paired device, and only where sharing is possible at all.
+    fn set_shared_edge(&self, device: &str, edge: Option<ScreenEdge>) -> Result<(), String> {
+        if !Self::can_share_input() {
+            return Err("This computer can't share its keyboard and mouse yet.".to_string());
+        }
+        let trust = TrustStore::load(self.trust_path.clone()).map_err(|e| format!("couldn't read the paired devices: {e}"))?;
+        if !trust.is_trusted(device) {
+            return Err("That device isn't paired.".to_string());
+        }
+        {
+            let mut settings = self.settings.lock().unwrap();
+            let mut changed = settings.clone();
+            match edge {
+                Some(edge) => {
+                    // One computer per edge.
+                    changed.shared_edges.retain(|_, placed| *placed != edge);
+                    changed.shared_edges.insert(device.to_string(), edge);
+                }
+                None => {
+                    changed.shared_edges.remove(device);
+                }
+            }
+            if let Some(settings_path) = &self.settings_path {
+                changed.save(settings_path).map_err(|e| format!("Couldn't save the change: {e}"))?;
+            }
+            *settings = changed;
+        }
+        if let Some(callback) = self.shared_edges_changed.lock().unwrap().as_ref() {
+            callback();
+        }
+        self.bump();
+        Ok(())
     }
 
     /// Mirrors the parts of an engine event a Continuity window shows.
@@ -717,6 +805,7 @@ impl ControlState {
         let trust = TrustStore::load(self.trust_path.clone())
             .map_err(|e| tracing::warn!("couldn't read the trust store for the Continuity window: {e}"))
             .ok();
+        let shared_edges = self.shared_edges();
         let live = self.live.lock().unwrap();
         let mut devices: Vec<PairedDevice> = trust
             .as_ref()
@@ -731,6 +820,7 @@ impl ControlState {
                         paired_at_unix: d.paired_at_unix,
                         remote_control_allowed: trust.is_remote_control_allowed(&d.id),
                         unlock_allowed: trust.is_unlock_allowed(&d.id),
+                        shared_edge: shared_edges.get(&d.id).copied(),
                     })
                     .collect()
             })
@@ -753,6 +843,8 @@ impl ControlState {
             can_be_unlocked: cfg!(target_os = "linux"),
             can_control_others: cfg!(feature = "remote-control"),
             controlling_device: live.controlling.keys().min().cloned(),
+            can_share_input: Self::can_share_input(),
+            sharing_input_with: live.sharing_input_with.clone(),
             transfers: live.transfers.iter().rev().cloned().collect(),
             about: self.about.clone(),
             activity: live.activity.clone(),
@@ -818,6 +910,7 @@ impl ControlState {
                 paired(&device)?;
                 EngineCommand::SetUnlockAllowed { peer_crypto_id: device, allowed }
             }
+            ControlOp::SetSharedEdge { device, edge } => return self.set_shared_edge(&device, edge),
             ControlOp::Connect { device } => EngineCommand::ReconnectPeer { peer_crypto_id: device },
             ControlOp::Disconnect { device } => EngineCommand::DisconnectPeer { peer_crypto_id: device },
             ControlOp::Forget { device } => {
@@ -862,7 +955,7 @@ impl ControlState {
                 if matches!(platform, Some(Platform::Android | Platform::Ios)) {
                     return Err(format!("{name} can't be controlled — only computers can."));
                 }
-                EngineCommand::RequestRemoteControl { peer_crypto_id: device }
+                EngineCommand::RequestRemoteControl { peer_crypto_id: device, screen: true }
             }
             ControlOp::SetReceivedFilesDir { path } => return self.set_received_files_dir(path, commands),
             ControlOp::OpenReceivedFilesDir => {
@@ -1090,6 +1183,7 @@ mod tests {
                     paired_at_unix: 1_756_000_000,
                     remote_control_allowed: true,
                     unlock_allowed: false,
+                    shared_edge: Some(ScreenEdge::Right),
                 },
                 PairedDevice {
                     id: "office".into(),
@@ -1099,6 +1193,7 @@ mod tests {
                     paired_at_unix: 1_757_500_000,
                     remote_control_allowed: false,
                     unlock_allowed: false,
+                    shared_edge: None,
                 },
             ],
             nearby: vec![NearbyDevice { id: "tab".into(), name: "Galaxy Tab S9".into(), platform: Platform::Android }],
@@ -1107,6 +1202,8 @@ mod tests {
             can_be_unlocked: false,
             can_control_others: true,
             controlling_device: None,
+            can_share_input: false,
+            sharing_input_with: None,
             transfers,
             about: About {
                 protocol_version: 2,
@@ -1497,7 +1594,7 @@ mod tests {
         state.observe(&SyncEvent::Connected { peer: info("mac", "MacBook", Platform::MacOs) });
         assert_eq!(request("mac").is_ok(), cfg!(feature = "remote-control"));
         if cfg!(feature = "remote-control") {
-            assert!(matches!(rx.try_recv(), Ok(EngineCommand::RequestRemoteControl { peer_crypto_id }) if peer_crypto_id == "mac"));
+            assert!(matches!(rx.try_recv(), Ok(EngineCommand::RequestRemoteControl { peer_crypto_id, screen: true }) if peer_crypto_id == "mac"));
         }
     }
 
@@ -1515,6 +1612,8 @@ mod tests {
             peer_name: name.into(),
             session_id: session.into(),
             role,
+            screen: true,
+            screen_size: None,
         };
         let ended = |peer: &str, name: &str, session: &str| SyncEvent::RemoteControlSessionEnded {
             peer_id: peer.into(),

@@ -3634,10 +3634,25 @@ sealed class FfiSyncEvent {
         companion object
     }
     
+    /**
+     * `screen` is false for a keyboard-and-mouse sharing session, which a
+     * phone never has (it always asks for the screen).
+     */
     data class RemoteControlSessionStarted(
         val `peerId`: kotlin.String, 
         val `peerName`: kotlin.String, 
-        val `role`: FfiRemoteControlRole) : FfiSyncEvent() {
+        val `role`: FfiRemoteControlRole, 
+        val `screen`: kotlin.Boolean) : FfiSyncEvent() {
+        companion object
+    }
+    
+    /**
+     * Keyboard-and-mouse sharing only (see `screen` above): never on a phone.
+     */
+    data class PointerReachedEdge(
+        val `peerId`: kotlin.String, 
+        val `edge`: kotlin.String, 
+        val `position`: kotlin.Double) : FfiSyncEvent() {
         companion object
     }
     
@@ -3792,29 +3807,35 @@ public object FfiConverterTypeFfiSyncEvent : FfiConverterRustBuffer<FfiSyncEvent
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 FfiConverterTypeFfiRemoteControlRole.read(buf),
+                FfiConverterBoolean.read(buf),
                 )
-            28 -> FfiSyncEvent.RemoteControlSessionEnded(
+            28 -> FfiSyncEvent.PointerReachedEdge(
+                FfiConverterString.read(buf),
+                FfiConverterString.read(buf),
+                FfiConverterDouble.read(buf),
+                )
+            29 -> FfiSyncEvent.RemoteControlSessionEnded(
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 FfiConverterOptionalString.read(buf),
                 )
-            29 -> FfiSyncEvent.ScreenFrameReceived(
+            30 -> FfiSyncEvent.ScreenFrameReceived(
                 FfiConverterString.read(buf),
                 FfiConverterByteArray.read(buf),
                 )
-            30 -> FfiSyncEvent.ScreenLockResult(
+            31 -> FfiSyncEvent.ScreenLockResult(
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 FfiConverterTypeFfiScreenLockAction.read(buf),
                 FfiConverterTypeFfiScreenLockOutcome.read(buf),
                 )
-            31 -> FfiSyncEvent.ScreenLockRequested(
+            32 -> FfiSyncEvent.ScreenLockRequested(
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 FfiConverterTypeFfiScreenLockAction.read(buf),
                 FfiConverterTypeFfiScreenLockOutcome.read(buf),
                 )
-            32 -> FfiSyncEvent.UnlockPermissionChanged(
+            33 -> FfiSyncEvent.UnlockPermissionChanged(
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 FfiConverterBoolean.read(buf),
@@ -4036,6 +4057,16 @@ public object FfiConverterTypeFfiSyncEvent : FfiConverterRustBuffer<FfiSyncEvent
                 + FfiConverterString.allocationSize(value.`peerId`)
                 + FfiConverterString.allocationSize(value.`peerName`)
                 + FfiConverterTypeFfiRemoteControlRole.allocationSize(value.`role`)
+                + FfiConverterBoolean.allocationSize(value.`screen`)
+            )
+        }
+        is FfiSyncEvent.PointerReachedEdge -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`peerId`)
+                + FfiConverterString.allocationSize(value.`edge`)
+                + FfiConverterDouble.allocationSize(value.`position`)
             )
         }
         is FfiSyncEvent.RemoteControlSessionEnded -> {
@@ -4246,30 +4277,30 @@ public object FfiConverterTypeFfiSyncEvent : FfiConverterRustBuffer<FfiSyncEvent
                 FfiConverterString.write(value.`peerId`, buf)
                 FfiConverterString.write(value.`peerName`, buf)
                 FfiConverterTypeFfiRemoteControlRole.write(value.`role`, buf)
+                FfiConverterBoolean.write(value.`screen`, buf)
+                Unit
+            }
+            is FfiSyncEvent.PointerReachedEdge -> {
+                buf.putInt(28)
+                FfiConverterString.write(value.`peerId`, buf)
+                FfiConverterString.write(value.`edge`, buf)
+                FfiConverterDouble.write(value.`position`, buf)
                 Unit
             }
             is FfiSyncEvent.RemoteControlSessionEnded -> {
-                buf.putInt(28)
+                buf.putInt(29)
                 FfiConverterString.write(value.`peerId`, buf)
                 FfiConverterString.write(value.`peerName`, buf)
                 FfiConverterOptionalString.write(value.`reason`, buf)
                 Unit
             }
             is FfiSyncEvent.ScreenFrameReceived -> {
-                buf.putInt(29)
+                buf.putInt(30)
                 FfiConverterString.write(value.`peerId`, buf)
                 FfiConverterByteArray.write(value.`frame`, buf)
                 Unit
             }
             is FfiSyncEvent.ScreenLockResult -> {
-                buf.putInt(30)
-                FfiConverterString.write(value.`peerId`, buf)
-                FfiConverterString.write(value.`peerName`, buf)
-                FfiConverterTypeFfiScreenLockAction.write(value.`action`, buf)
-                FfiConverterTypeFfiScreenLockOutcome.write(value.`outcome`, buf)
-                Unit
-            }
-            is FfiSyncEvent.ScreenLockRequested -> {
                 buf.putInt(31)
                 FfiConverterString.write(value.`peerId`, buf)
                 FfiConverterString.write(value.`peerName`, buf)
@@ -4277,8 +4308,16 @@ public object FfiConverterTypeFfiSyncEvent : FfiConverterRustBuffer<FfiSyncEvent
                 FfiConverterTypeFfiScreenLockOutcome.write(value.`outcome`, buf)
                 Unit
             }
-            is FfiSyncEvent.UnlockPermissionChanged -> {
+            is FfiSyncEvent.ScreenLockRequested -> {
                 buf.putInt(32)
+                FfiConverterString.write(value.`peerId`, buf)
+                FfiConverterString.write(value.`peerName`, buf)
+                FfiConverterTypeFfiScreenLockAction.write(value.`action`, buf)
+                FfiConverterTypeFfiScreenLockOutcome.write(value.`outcome`, buf)
+                Unit
+            }
+            is FfiSyncEvent.UnlockPermissionChanged -> {
+                buf.putInt(33)
                 FfiConverterString.write(value.`peerId`, buf)
                 FfiConverterString.write(value.`peerName`, buf)
                 FfiConverterBoolean.write(value.`allowed`, buf)

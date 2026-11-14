@@ -1,4 +1,4 @@
-use continuity_proto::{DeviceInfo, InputEventKind, MediaCommand, NowPlayingInfo, ScreenLockAction, ScreenLockOutcome};
+use continuity_proto::{DeviceInfo, InputEventKind, MediaCommand, NowPlayingInfo, ScreenEdge, ScreenLockAction, ScreenLockOutcome, ScreenSize};
 
 /// Which side of an active remote-control session this device is on —
 /// tells a shell which UI to show: `Controlling` gets the live screen
@@ -130,7 +130,24 @@ pub enum SyncEvent {
     /// started, unlike the controlling side). A shell keys its remote-
     /// control UI off this event, not off the click/accept that led to
     /// it.
-    RemoteControlSessionStarted { peer_id: String, peer_name: String, session_id: String, role: RemoteControlRole },
+    /// `screen` is false for a keyboard-and-mouse sharing session (see
+    /// `EngineCommand::RequestRemoteControl`): no frames will come, the
+    /// controlling shell forwards its own mouse and keyboard instead.
+    /// `screen_size` is the controlled screen's size in pixels when that
+    /// side said (v4), on the controlling side only.
+    RemoteControlSessionStarted {
+        peer_id: String,
+        peer_name: String,
+        session_id: String,
+        role: RemoteControlRole,
+        screen: bool,
+        screen_size: Option<ScreenSize>,
+    },
+    /// Controlling side: the pointer on `peer_id`'s screen has been pushed
+    /// against `edge` of it by this device's `MouseMoveRelative`s, at
+    /// `position` along it. For a shell that took its user's mouse when the
+    /// cursor left this screen, this is where the cursor comes back.
+    PointerReachedEdge { peer_id: String, edge: ScreenEdge, position: f64 },
     /// A session ended — the peer explicitly ended it, this side ended
     /// it, the connection dropped mid-session, or (controlled side only)
     /// screen capture failed to start right after accepting. `reason` is
@@ -254,7 +271,15 @@ pub enum EngineCommand {
     /// command below too. Emits `SyncEvent::RemoteControlDeclined` if the
     /// peer says no (or can't at all); `SyncEvent::
     /// RemoteControlSessionStarted` once accepted.
-    RequestRemoteControl { peer_crypto_id: String },
+    ///
+    /// `screen: false` asks for keyboard-and-mouse sharing only: the peer
+    /// injects what this device sends but never captures or streams its
+    /// screen (and so needs no screen-recording permission). The shell then
+    /// forwards its own mouse as `InputEventKind::MouseMoveRelative` and
+    /// takes the cursor back on `SyncEvent::PointerReachedEdge`. Only
+    /// meaningful with a v4 peer; an older one takes it as a request for
+    /// the screen.
+    RequestRemoteControl { peer_crypto_id: String, screen: bool },
     /// Answers an inbound `SyncEvent::RemoteControlRequested` from
     /// `peer_crypto_id`. Accepting starts local screen capture
     /// immediately (via this device's `RemoteControlHost`) and dials the

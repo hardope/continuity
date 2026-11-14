@@ -914,13 +914,13 @@ fn paint(buffer: &mut [u32], window: (u32, u32), frame: Option<(&ReadyFrame, Pla
 /// it is. Since both directions are the same exchange, a key that crosses
 /// over and back comes home unchanged.
 #[derive(Clone, Copy, Debug)]
-struct KeyTranslator {
+pub(crate) struct KeyTranslator {
     peer: Platform,
     swap_command_and_control: bool,
 }
 
 impl KeyTranslator {
-    fn new(this_is_mac: bool, peer: Platform) -> Self {
+    pub(crate) fn new(this_is_mac: bool, peer: Platform) -> Self {
         Self { peer, swap_command_and_control: this_is_mac != (peer == Platform::MacOs) }
     }
 
@@ -969,13 +969,13 @@ fn is_modifier(key: KeyCode) -> bool {
 
 /// Which keys are down on the peer because of this viewer — the codes
 /// sent a `KeyDown` and no `KeyUp` yet, in press order.
-struct KeyboardForwarder {
+pub(crate) struct KeyboardForwarder {
     translator: KeyTranslator,
     held: Vec<u32>,
 }
 
 impl KeyboardForwarder {
-    fn new(translator: KeyTranslator) -> Self {
+    pub(crate) fn new(translator: KeyTranslator) -> Self {
         Self { translator, held: Vec::new() }
     }
 
@@ -990,7 +990,7 @@ impl KeyboardForwarder {
     /// could let go of it. Only keys this viewer pressed get released, so a
     /// key already down when the window got focus doesn't send a stray
     /// `KeyUp`.
-    fn key(&mut self, key: KeyCode, pressed: bool) -> Option<InputEventKind> {
+    pub(crate) fn key(&mut self, key: KeyCode, pressed: bool) -> Option<InputEventKind> {
         let code = self.translator.code(key)?;
         let held = self.held.iter().position(|&c| c == code);
         if pressed {
@@ -1020,7 +1020,7 @@ impl KeyboardForwarder {
     /// Windows key let go of on its own opens a PC's Start menu, and a
     /// Mac's Control arrives there as one — so with one held, an unassigned
     /// key (`VK_UNASSIGNED_E8`, the usual trick) is tapped first.
-    fn release_all(&mut self) -> Vec<InputEventKind> {
+    pub(crate) fn release_all(&mut self) -> Vec<InputEventKind> {
         let windows_key_held =
             self.translator.peer == Platform::Windows && self.held.iter().any(|&code| code == VK_LWIN || code == VK_RWIN);
         let tap = windows_key_held.then_some([InputEventKind::KeyDown { code: VK_UNASSIGNED_E8 }, InputEventKind::KeyUp { code: VK_UNASSIGNED_E8 }]);
@@ -1099,6 +1099,14 @@ fn is_fullscreen_shortcut(key: KeyCode, modifiers: ModifiersState, mac: bool) ->
 /// what `remote_control_linux.rs`'s `NotifyKeyboardKeycode` expects).
 /// `None` for keys outside `KEY_CODES` and for Android/iOS, which can't be
 /// controlled.
+/// The physical key a macOS virtual key code (`kVK_*`, what an event tap
+/// reports) stands for — the reverse of `native_key_code` for this Mac's
+/// own keyboard, for forwarding it (keyboard-and-mouse sharing).
+#[cfg(target_os = "macos")]
+pub(crate) fn key_from_mac_code(code: u16) -> Option<KeyCode> {
+    KEY_CODES.iter().find(|row| row.1 == Some(code)).map(|row| row.0)
+}
+
 fn native_key_code(key: KeyCode, platform: Platform) -> Option<u16> {
     let row = KEY_CODES.iter().find(|row| row.0 == key)?;
     match platform {

@@ -255,10 +255,37 @@ pub enum Message {
     /// from an already-ended session is unambiguous and can be dropped
     /// rather than misapplied to whatever session happens to be active
     /// now.
-    RemoteControlRequest { session_id: String },
+    ///
+    /// `screen` (v4): whether the requester wants to see the screen. `false`
+    /// is keyboard-and-mouse sharing: the controlled device injects input
+    /// as usual but never captures or streams its screen, so it needs no
+    /// Screen Recording permission, and the controlling computer's own
+    /// mouse and keyboard are what's forwarded, as when its cursor crosses
+    /// an edge of its screen onto the other computer's. Absent from older
+    /// peers, which always mean the screen.
+    RemoteControlRequest {
+        session_id: String,
+        #[serde(default = "default_true", skip_serializing_if = "Clone::clone")]
+        screen: bool,
+    },
     /// The controlled device's answer, after the local user responds to
-    /// the on-screen prompt raised by `RemoteControlRequest`.
-    RemoteControlResponse { session_id: String, accepted: bool },
+    /// the on-screen prompt raised by `RemoteControlRequest`. `screen_size`
+    /// (v4) is the controlled screen's size in pixels, which a controller
+    /// forwarding its own mouse needs to know where that screen's edges are
+    /// (`MouseMoveRelative` is in those pixels).
+    RemoteControlResponse {
+        session_id: String,
+        accepted: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        screen_size: Option<ScreenSize>,
+    },
+    /// v4: the controlled device's pointer has been pushed against `edge`
+    /// of its screen by the controlling device's `MouseMoveRelative`s —
+    /// sent once each time it arrives there, not while it stays. `position`
+    /// is how far along that edge, `0.0..=1.0` from the top or the left.
+    /// For a controller that took its user's mouse when the cursor left its
+    /// own screen, this is the cursor coming back.
+    PointerReachedEdge { session_id: String, edge: ScreenEdge, position: f64 },
     /// Ends an active remote-control session. Either side can send this
     /// at any time — the controlling side to stop cleanly, the controlled
     /// side to immediately revoke access (the local equivalent of pulling
@@ -342,6 +369,41 @@ pub enum Message {
     ScreenLockResult { action: ScreenLockAction, outcome: ScreenLockOutcome },
 }
 
+fn default_true() -> bool {
+    true
+}
+
+/// A screen's size in pixels (`RemoteControlResponse::screen_size`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScreenSize {
+    pub width: u32,
+    pub height: u32,
+}
+
+/// One edge of a screen (`PointerReachedEdge`, and where a computer places
+/// another one next to its own screen).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScreenEdge {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+impl ScreenEdge {
+    /// The edge facing this one on the next screen over: a cursor leaving
+    /// through the right edge arrives through the left.
+    pub fn opposite(self) -> Self {
+        match self {
+            ScreenEdge::Left => ScreenEdge::Right,
+            ScreenEdge::Right => ScreenEdge::Left,
+            ScreenEdge::Top => ScreenEdge::Bottom,
+            ScreenEdge::Bottom => ScreenEdge::Top,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScreenLockAction {
@@ -383,6 +445,12 @@ pub enum InputEventKind {
     KeyDown { code: u32 },
     KeyUp { code: u32 },
     MouseMove { x: f64, y: f64 },
+    /// v4: move the pointer by this much, in the controlled screen's own
+    /// pixels — what a real mouse produces, for a controller forwarding its
+    /// own mouse rather than a tap on a picture of the screen. The
+    /// controlled side clamps to its screen and reports the edge it ends up
+    /// against (`Message::PointerReachedEdge`). Only sent to a v4 peer.
+    MouseMoveRelative { dx: f64, dy: f64 },
     MouseButton { button: MouseButton, down: bool },
     /// Scroll delta in the same normalized-per-axis spirit as
     /// `MouseMove`, not raw platform scroll units (which vary wildly in
@@ -585,6 +653,32 @@ mod tests {
         let reveal = Message::PairReveal { nonce: vec![9u8; 32] };
         let back: Message = serde_json::from_str(&serde_json::to_string(&reveal).unwrap()).unwrap();
         assert!(matches!(back, Message::PairReveal { nonce } if nonce == vec![9u8; 32]));
+    }
+
+    /// Keyboard-and-mouse sharing's additions read as before to a v3 peer
+    /// and look like a v3 peer's when at their defaults.
+    #[test]
+    fn input_only_control_fields_are_optional_on_the_wire() {
+        let old: Message = serde_json::from_str(r#"{"type":"remote_control_request","session_id":"s"}"#).unwrap();
+        assert!(matches!(old, Message::RemoteControlRequest { screen: true, .. }), "an older peer always means the screen");
+        let with_screen = serde_json::to_string(&Message::RemoteControlRequest { session_id: "s".into(), screen: true }).unwrap();
+        assert_eq!(with_screen, r#"{"type":"remote_control_request","session_id":"s"}"#);
+        let without = serde_json::to_string(&Message::RemoteControlRequest { session_id: "s".into(), screen: false }).unwrap();
+        assert!(without.contains(r#""screen":false"#));
+
+        let old: Message = serde_json::from_str(r#"{"type":"remote_control_response","session_id":"s","accepted":true}"#).unwrap();
+        assert!(matches!(old, Message::RemoteControlResponse { screen_size: None, .. }));
+        let sized = Message::RemoteControlResponse { session_id: "s".into(), accepted: true, screen_size: Some(ScreenSize { width: 2560, height: 1440 }) };
+        let back: Message = serde_json::from_str(&serde_json::to_string(&sized).unwrap()).unwrap();
+        assert!(matches!(back, Message::RemoteControlResponse { screen_size: Some(ScreenSize { width: 2560, height: 1440 }), .. }));
+
+        let edge = Message::PointerReachedEdge { session_id: "s".into(), edge: ScreenEdge::Right, position: 0.25 };
+        assert_eq!(serde_json::to_string(&edge).unwrap(), r#"{"type":"pointer_reached_edge","session_id":"s","edge":"right","position":0.25}"#);
+        let moved = Message::InputEvent { session_id: "s".into(), event: InputEventKind::MouseMoveRelative { dx: -3.0, dy: 2.5 } };
+        let back: Message = serde_json::from_str(&serde_json::to_string(&moved).unwrap()).unwrap();
+        assert!(matches!(back, Message::InputEvent { event: InputEventKind::MouseMoveRelative { dx, dy }, .. } if dx == -3.0 && dy == 2.5));
+        assert_eq!(ScreenEdge::Left.opposite(), ScreenEdge::Right);
+        assert_eq!(ScreenEdge::Top.opposite(), ScreenEdge::Bottom);
     }
 
     /// `RemoteControlEnded.reason` was added without a protocol version

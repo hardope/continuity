@@ -632,6 +632,21 @@ function devicePage(status, device) {
       : `This ${HERE} asks you first each time ${device.name} wants to control it.`;
     html += section("Remote control", switchRow(`Control this ${HERE} without asking`, detail, device.remote_control_allowed, "remote-control", `data-id="${esc(device.id)}"`));
   }
+  if (status.can_share_input && COMPUTERS.includes(device.platform)) {
+    const edges = [["", "Not placed"], ["left", "Left edge"], ["right", "Right edge"], ["top", "Top edge"], ["bottom", "Bottom edge"]];
+    const options = edges.map(([value, label]) => `<option value="${value}" ${(device.shared_edge || "") === value ? "selected" : ""}>${label}</option>`).join("");
+    const over = status.sharing_input_with === device.id;
+    const detail = device.shared_edge
+      ? over
+        ? `Your mouse and keyboard are on ${device.name} right now. Double-tap Control to bring them back.`
+        : `Move the cursor off the ${device.shared_edge} edge of this screen to use ${device.name} with this ${HERE}'s mouse and keyboard; move it back off ${device.name}'s facing edge to return.`
+      : `Place ${device.name} at an edge of this screen to drive it with this ${HERE}'s mouse and keyboard, without seeing its screen.`;
+    html += section(
+      "Keyboard and mouse",
+      `<div class="row"><span class="text"><span class="title">Share with ${esc(device.name)}</span><span class="detail">${esc(detail)}</span></span>
+        <select data-action="shared-edge" data-id="${esc(device.id)}" ${device.connected ? "" : ""}>${options}</select></div>`
+    );
+  }
   if (status.can_be_unlocked) {
     html += section(
       "Remote unlock",
@@ -996,12 +1011,13 @@ document.addEventListener("click", (event) => {
 });
 
 document.addEventListener("change", (event) => {
-  const input = event.target.closest("input[data-action]");
+  const input = event.target.closest("input[data-action], select[data-action]");
   if (!input) return;
   const { action, id } = input.dataset;
   const status = state.status;
   const device = status.devices.find((d) => d.id === id);
   const on = input.checked;
+  const target = input;
   switch (action) {
     case "pause":
       status.paused = on;
@@ -1024,6 +1040,11 @@ document.addEventListener("change", (event) => {
           send("set_remote_control_allowed", { device: id, allowed: true });
         }
       );
+      break;
+    case "shared-edge":
+      send("set_shared_edge", { device: target.dataset.id, edge: target.value || null }, (answer) => {
+        if (!answer.ok) toast(answer.message);
+      });
       break;
     case "unlock":
       if (!on) {

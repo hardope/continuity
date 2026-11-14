@@ -80,6 +80,14 @@ public final class SettingsModel: ObservableObject {
         perform(["op": "set_unlock_allowed", "device": device.id, "allowed": allowed])
     }
 
+    /// Places a computer at an edge of this screen for keyboard-and-mouse
+    /// sharing, or takes it away (`nil`). One computer per edge: continuityd
+    /// moves any other off it, and the next status shows that.
+    public func setSharedEdge(_ device: PairedDevice, _ edge: ScreenEdge?) {
+        update(device.id) { $0.sharedEdge = edge }
+        perform(["op": "set_shared_edge", "device": device.id, "edge": edge?.rawValue as Any? ?? NSNull()])
+    }
+
     /// Pairs with a nearby device (both sides then show a code to compare),
     /// or reconnects a paired one.
     public func connect(_ id: String) {

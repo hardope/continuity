@@ -230,7 +230,11 @@ pub enum FfiSyncEvent {
     RevokedByPeer { peer_id: String, peer_name: String },
     RemoteControlRequested { peer_id: String, peer_name: String },
     RemoteControlDeclined { peer_id: String, peer_name: String },
-    RemoteControlSessionStarted { peer_id: String, peer_name: String, role: FfiRemoteControlRole },
+    /// `screen` is false for a keyboard-and-mouse sharing session, which a
+    /// phone never has (it always asks for the screen).
+    RemoteControlSessionStarted { peer_id: String, peer_name: String, role: FfiRemoteControlRole, screen: bool },
+    /// Keyboard-and-mouse sharing only (see `screen` above): never on a phone.
+    PointerReachedEdge { peer_id: String, edge: String, position: f64 },
     RemoteControlSessionEnded { peer_id: String, peer_name: String, reason: Option<String> },
     ScreenFrameReceived { peer_id: String, frame: Vec<u8> },
     ScreenLockResult { peer_id: String, peer_name: String, action: FfiScreenLockAction, outcome: FfiScreenLockOutcome },
@@ -356,8 +360,17 @@ impl From<continuity_daemon::SyncEvent> for FfiSyncEvent {
             E::RevokedByPeer { peer_id, peer_name } => FfiSyncEvent::RevokedByPeer { peer_id, peer_name },
             E::RemoteControlRequested { peer_id, peer_name, .. } => FfiSyncEvent::RemoteControlRequested { peer_id, peer_name },
             E::RemoteControlDeclined { peer_id, peer_name } => FfiSyncEvent::RemoteControlDeclined { peer_id, peer_name },
-            E::RemoteControlSessionStarted { peer_id, peer_name, role, .. } => {
-                FfiSyncEvent::RemoteControlSessionStarted { peer_id, peer_name, role: role.into() }
+            E::RemoteControlSessionStarted { peer_id, peer_name, role, screen, .. } => {
+                FfiSyncEvent::RemoteControlSessionStarted { peer_id, peer_name, role: role.into(), screen }
+            }
+            E::PointerReachedEdge { peer_id, edge, position } => {
+                let edge = match edge {
+                    continuity_proto::ScreenEdge::Left => "left",
+                    continuity_proto::ScreenEdge::Right => "right",
+                    continuity_proto::ScreenEdge::Top => "top",
+                    continuity_proto::ScreenEdge::Bottom => "bottom",
+                };
+                FfiSyncEvent::PointerReachedEdge { peer_id, edge: edge.to_string(), position }
             }
             E::RemoteControlSessionEnded { peer_id, peer_name, reason, .. } => {
                 FfiSyncEvent::RemoteControlSessionEnded { peer_id, peer_name, reason }
@@ -596,7 +609,9 @@ impl ContinuityEngine {
     /// which `FfiSyncEvent::ScreenFrameReceived` starts arriving and
     /// `send_input_event` starts having an effect.
     pub fn request_remote_control(&self, peer_id: String) {
-        let _ = self.commands.send(EngineCommand::RequestRemoteControl { peer_crypto_id: peer_id });
+        // A phone always wants the picture; keyboard-and-mouse sharing is a
+        // desktop's (it has a mouse to share).
+        let _ = self.commands.send(EngineCommand::RequestRemoteControl { peer_crypto_id: peer_id, screen: true });
     }
 
     /// Answers an inbound `FfiSyncEvent::RemoteControlRequested` from

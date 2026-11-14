@@ -11,7 +11,8 @@
         "connected": true,
         "paired_at_unix": 1756000000,
         "remote_control_allowed": true,
-        "unlock_allowed": false
+        "unlock_allowed": false,
+        "shared_edge": "right"
       },
       {
         "id": "office",
@@ -20,7 +21,8 @@
         "connected": false,
         "paired_at_unix": 1757500000,
         "remote_control_allowed": false,
-        "unlock_allowed": false
+        "unlock_allowed": false,
+        "shared_edge": null
       }
     ],
     "nearby": [{ "id": "tab", "name": "Galaxy Tab S9", "platform": "android" }],
@@ -29,6 +31,8 @@
     "can_be_unlocked": false,
     "can_control_others": true,
     "controlling_device": null,
+    "can_share_input": false,
+    "sharing_input_with": null,
     "transfers": [
       {
         "id": "t4",
