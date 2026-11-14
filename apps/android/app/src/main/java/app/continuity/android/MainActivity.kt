@@ -610,7 +610,9 @@ private fun RemoteControlScreen(
                 @Composable
                 fun VideoArea(modifier: Modifier) {
                     Box(modifier = modifier) {
-                        if (bitmap != null) {
+                        // A delegated property can't be smart-cast; a local can.
+                        val decoded = bitmap
+                        if (decoded != null) {
                             Box(
                                 modifier = Modifier
                                     .fillMaxSize()
@@ -638,7 +640,7 @@ private fun RemoteControlScreen(
                                     },
                             ) {
                                 Image(
-                                    bitmap = bitmap,
+                                    bitmap = decoded,
                                     contentDescription = null,
                                     contentScale = ContentScale.Fit,
                                     modifier = Modifier

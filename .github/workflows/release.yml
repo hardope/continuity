@@ -54,9 +54,14 @@ env:
 jobs:
   # ─── Tests ──────────────────────────────────────────────────────────────
 
+  # ubuntu-24.04, not ubuntu-latest: that label moved to Ubuntu 26, whose
+  # libspa headers no longer match the `libspa` crate pipewire 0.8 binds
+  # (`spa_pod_builder` lost its `data`/`size` fields), so the remote-control
+  # capture didn't compile there. 24.04 is also the oldest release the .deb
+  # supports, so building on it keeps the binary's glibc requirement there.
   test-linux:
     name: Test (Linux)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
@@ -110,7 +115,7 @@ jobs:
     # connection races, revocation, remote-control sessions and their end
     # reasons, remote lock (core/continuity-daemon/tests/). Gates the
     # Android build, which is this engine behind an FFI layer.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
@@ -137,7 +142,7 @@ jobs:
   build-linux:
     name: Build (Linux)
     needs: test-linux
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -304,7 +309,7 @@ jobs:
   build-android:
     name: Build (Android)
     needs: test-engine
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -368,7 +373,7 @@ jobs:
     # Each build already waits for its own lane's tests, so this waits for
     # everything.
     needs: [build-linux, build-macos, build-windows, build-android]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # The default GITHUB_TOKEN is read-only unless a job explicitly asks
     # for more — softprops/action-gh-release needs contents: write to
     # actually create the release, or it 403s with "Resource not
