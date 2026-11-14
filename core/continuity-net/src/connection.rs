@@ -124,20 +124,24 @@ impl tokio::io::AsyncWrite for Connection {
     }
 }
 
+/// The device id a peer's certificate proves: the hex of its Ed25519 public
+/// key. Only an Ed25519 key counts — a device id *is* such a key, so a
+/// certificate carrying any other kind of key can't be a device, and
+/// taking some 32 bytes out of it (as this used to, from the end of the
+/// whole SubjectPublicKeyInfo) would only have manufactured an id nothing
+/// signed for.
 fn device_id_from_cert(cert: &CertificateDer<'_>) -> Result<String, ConnectionError> {
     let (_, parsed) = x509_parser::parse_x509_certificate(cert.as_ref())
         .map_err(|e| ConnectionError::BadCertificate(e.to_string()))?;
-    let raw_key = parsed.public_key().raw;
-    // Ed25519 SubjectPublicKeyInfo is a 1-byte-aligned BIT STRING, so `raw`
-    // is either the bare 32-byte key or that plus a leading 0x00
-    // "unused bits" byte depending on the parser — normalize by taking the
-    // last 32 bytes rather than assuming which.
-    let key_bytes = if raw_key.len() >= 32 {
-        &raw_key[raw_key.len() - 32..]
-    } else {
-        raw_key
-    };
-    Ok(hex::encode(key_bytes))
+    let spki = parsed.public_key();
+    if spki.algorithm.algorithm != x509_parser::oid_registry::OID_SIG_ED25519 {
+        return Err(ConnectionError::BadCertificate(format!("key algorithm {} is not Ed25519", spki.algorithm.algorithm)));
+    }
+    let key = &spki.subject_public_key.data;
+    if key.len() != 32 {
+        return Err(ConnectionError::BadCertificate(format!("Ed25519 key is {} bytes, not 32", key.len())));
+    }
+    Ok(hex::encode(key))
 }
 
 #[cfg(test)]
@@ -151,6 +155,16 @@ mod tests {
         let tls = generate_self_signed(&identity).expect("generate cert");
         let from_cert = device_id_from_cert(&tls.cert_der).expect("parse cert");
         assert_eq!(from_cert, identity.device_id());
+    }
+
+    /// A certificate whose key isn't Ed25519 can't be a device: it has no
+    /// id to be read from it, rather than 32 bytes of something else.
+    #[test]
+    fn a_certificate_with_another_kind_of_key_has_no_device_id() {
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["x".to_string()]).unwrap().self_signed(&key_pair).unwrap();
+        let err = device_id_from_cert(cert.der()).expect_err("an ECDSA key is not a device id");
+        assert!(matches!(err, ConnectionError::BadCertificate(ref why) if why.contains("not Ed25519")), "{err}");
     }
 }
 

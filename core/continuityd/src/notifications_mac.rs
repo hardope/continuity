@@ -85,6 +85,45 @@ pub fn show_with_actions(title: &str, body: &str, actions: &[(&str, &str)], on_a
     });
 }
 
+/// How a `prompt` ended.
+pub enum PromptOutcome {
+    /// A button's id, or `"default"` for a click on the notification itself.
+    Clicked(String),
+    /// Dismissed, cleared, or gone from Notification Center unanswered.
+    Dismissed,
+    /// Couldn't be shown at all (an unbundled build, or notifications
+    /// turned off for Continuity) — the caller should ask another way.
+    Unavailable(String),
+}
+
+/// A question as a notification with buttons, answered through `on_outcome`
+/// on a thread of its own — for the questions a peer's arrival raises
+/// (pairing, remote control), which must not block the tray's event loop
+/// the way a modal dialog on that thread did: while one was up, nothing
+/// else in the app moved, and anyone on the network could put one up.
+pub fn prompt(title: &str, body: &str, actions: &[(&str, &str)], on_outcome: impl FnOnce(PromptOutcome) + Send + 'static) {
+    let mut notification = Notification::new().title(title).message(body);
+    for (id, label) in actions {
+        notification = notification.action(Action::button(*id, *label));
+    }
+    std::thread::spawn(move || {
+        let response = future::block_on(async {
+            let handle = notification.send().await?;
+            let id = handle.notification_id().to_string();
+            Ok::<_, mac_usernotifications::Error>(future::or(async { handle.response().await.ok() }, gone_from_notification_center(id)).await)
+        });
+        let outcome = match response {
+            Ok(Some(response)) => match clicked(&response) {
+                Some(action) => PromptOutcome::Clicked(action.to_string()),
+                None => PromptOutcome::Dismissed,
+            },
+            Ok(None) => PromptOutcome::Dismissed,
+            Err(e) => PromptOutcome::Unavailable(e.to_string()),
+        };
+        on_outcome(outcome);
+    });
+}
+
 /// What was clicked, if anything: a button's id, or `"default"` for the
 /// notification itself.
 fn clicked(response: &NotificationResponse) -> Option<&str> {

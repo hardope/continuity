@@ -461,7 +461,7 @@ async fn a_misbehaving_v3_sender_is_held_to_the_limits() {
     let tls = continuity_crypto::generate_self_signed(&sender_identity).unwrap();
     let mut conn = continuity_net::connect(addr, &tls).await.unwrap();
     let device = DeviceInfo { id: sender_id.clone(), name: "Flooder".into(), platform: Platform::Linux, protocol_version: 3 };
-    continuity_net::announce_and_identify(&mut conn, &device).await.unwrap();
+    continuity_net::announce_and_identify(&mut conn, &device, true).await.unwrap();
 
     for i in 0..17 {
         let offer = Message::FileOffer {
@@ -794,7 +794,7 @@ async fn an_old_format_offer_from_a_v2_sender_is_received_in_band() {
     let tls = continuity_crypto::generate_self_signed(&old_identity).unwrap();
     let mut conn = continuity_net::connect(format!("127.0.0.1:{port}").parse().unwrap(), &tls).await.unwrap();
     let old_device = DeviceInfo { id: old_id.clone(), name: "OldSender".into(), platform: Platform::Linux, protocol_version: 2 };
-    let engine_device = continuity_net::announce_and_identify(&mut conn, &old_device).await.unwrap();
+    let engine_device = continuity_net::announce_and_identify(&mut conn, &old_device, true).await.unwrap().peer;
     assert_eq!(engine_device.id, engine_id);
 
     let content: Vec<u8> = (0..200_000u32).flat_map(|i| i.to_le_bytes()).collect();

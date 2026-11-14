@@ -26,3 +26,10 @@ x509-parser = "0.16"
 # essentially no extra compile time or binary size, just a direct API to
 # what's already being built.
 socket2 = "0.5"
+# The pairing nonce (see pairing.rs). Already in the tree.
+rand = "0.8"
+
+[dev-dependencies]
+# A certificate with a non-Ed25519 key, for connection.rs's test that such
+# a certificate is refused.
+rcgen = "0.13"

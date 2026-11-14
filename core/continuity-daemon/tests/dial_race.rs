@@ -149,7 +149,7 @@ async fn an_idle_connection_does_not_hold_up_the_listener() {
     let device = DeviceInfo { id: peer_id.clone(), name: "HandPeer".into(), platform: Platform::Linux, protocol_version: 3 };
     let connected = tokio::time::timeout(Duration::from_secs(5), async {
         let mut conn = continuity_net::connect(addr, &tls).await?;
-        continuity_net::announce_and_identify(&mut conn, &device).await?;
+        continuity_net::announce_and_identify(&mut conn, &device, true).await?;
         anyhow::Ok(conn)
     })
     .await;

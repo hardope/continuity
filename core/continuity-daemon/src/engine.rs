@@ -9,8 +9,8 @@ use continuity_crypto::{
 };
 use continuity_net::{
     announce_and_identify, announce_and_identify_after, connect, peer_from_service_info, read_frame, read_message,
-    start_pairing, start_pairing_after, write_frame, write_message, Connection, Discovery, FramingError, Listener,
-    ServiceEvent,
+    read_message_up_to, start_pairing, write_frame, write_message, Connection, Discovery, FramingError, Listener, ServiceEvent,
+    HANDSHAKE_MAX_MESSAGE_BYTES,
 };
 use continuity_proto::{
     DeviceInfo, Message, NowPlayingInfo, Platform, ScreenLockAction, ScreenLockOutcome, PROTOCOL_VERSION,
@@ -18,12 +18,12 @@ use continuity_proto::{
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, Notify};
-use tokio::task::JoinHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 
 /// The v3 file data connection: dialing it, streaming over it, receiving
 /// from it, and the resume state that outlives it — see that module's own
@@ -108,6 +108,44 @@ const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 /// process's file descriptors.
 const MAX_PENDING_HANDSHAKES: usize = 64;
 
+/// How long a connection's TCP connect and TLS handshake may take together,
+/// for every connection this device dials: the mesh, a file's data
+/// connection and the screen stream. **Real bug fixed here**: the mesh
+/// dials had no limit, so a stale address (a device that moved networks)
+/// held the peer's dial claim for the OS's own connect timeout, minutes on
+/// some systems, during which the redial ticker and the user's own Connect
+/// were skipped as "already dialing".
+const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a connection has, once its TLS handshake is done, to identify
+/// itself (`DeviceAnnounce`) and, if it isn't paired, to finish the pairing
+/// exchange up to the point where the users are asked. Anyone on the
+/// network can open a connection, so one that then says nothing mustn't
+/// hold a task and a socket for good.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a pairing request waits for the users' answer before it's
+/// declined on their behalf. Long enough to walk to the other device;
+/// bounded, so an unanswered prompt doesn't hold its connection forever.
+const PAIRING_ANSWER_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Pairing requests allowed to wait for an answer at once. Anyone on the
+/// network can present a fresh identity per connection, so without a cap
+/// the prompts, and the connections behind them, were unbounded.
+const MAX_PENDING_PAIRINGS: usize = 4;
+
+/// Connections from devices that aren't paired allowed past the TLS
+/// handshake at once — identifying themselves, or waiting on a pairing
+/// prompt. Each costs a task and a socket for up to `HANDSHAKE_TIMEOUT` or
+/// `PAIRING_ANSWER_TIMEOUT`.
+const MAX_UNTRUSTED_CONNECTIONS: usize = 8;
+
+/// The most clipboard text that's synced, in bytes, either direction. The
+/// clipboard can hold a whole file's worth of text, which would go to every
+/// device as a message a third larger again (base64 in JSON), and arrive at
+/// a phone with a few hundred megabytes of memory to its name.
+pub const MAX_CLIPBOARD_BYTES: usize = 4 * 1024 * 1024;
+
 pub struct EngineConfig {
     pub identity: Identity,
     pub device_name: String,
@@ -175,6 +213,14 @@ impl EngineHandle {
         }
         self.state.connected.lock().unwrap().remove(peer_crypto_id);
         self.state.peer_senders.lock().unwrap().remove(peer_crypto_id);
+    }
+
+    /// Plants `addr` as the address `peer_crypto_id` is dialed at, as a
+    /// forged mDNS announcement would — for this crate's own integration
+    /// tests of what happens when the device that answers there isn't it.
+    #[doc(hidden)]
+    pub fn set_known_address_for_test(&self, peer_crypto_id: &str, addr: SocketAddr) {
+        self.state.known_addresses.lock().unwrap().insert(peer_crypto_id.to_string(), addr);
     }
 }
 
@@ -250,6 +296,7 @@ impl Drop for EngineHandle {
         for handle in self.state.connection_handles.lock().unwrap().values() {
             handle.abort();
         }
+        abort_dials(&self.state, None);
         // Same gap, for v3 file transfers: each one runs in its own task
         // (and its data connection in another), tracked in the transfer
         // maps rather than `tasks` or `connection_handles`.
@@ -311,13 +358,45 @@ struct SharedState {
     /// read as an immediate, inexplicable disconnect with no relation to
     /// file transfers or the keepalive timeout — a "connections are
     /// randomly dropping" report even at total idle, right after pairing.
-    dialing: Mutex<HashSet<String>>,
+    ///
+    /// The value is the dial task's abort handle once it's spawned, so a
+    /// dial still under way can be aborted along with the connections
+    /// (`abort_dials`): `Reset`, `DisconnectPeer`, `RevokeDevice` and
+    /// shutdown.
+    dialing: Mutex<HashMap<String, Option<AbortHandle>>>,
     /// Abort handles for each active connection's task, keyed by peer
     /// crypto id — the only way to forcibly drop a connection from outside
-    /// its own task, since it's normally just blocked reading. Populated
-    /// at spawn time (both inbound accept and outbound dial), removed in
-    /// `handle_connection`'s cleanup. `Reset` aborts everything in here.
-    connection_handles: Mutex<HashMap<String, tokio::task::AbortHandle>>,
+    /// its own task, since it's normally just blocked reading. Registered by
+    /// `handle_connection` in the same critical section that makes the
+    /// connection *the* connection for its peer (`connected`), and removed
+    /// by that connection's own cleanup only if it's still the registered
+    /// one. **Real bug fixed here**: every dial and accept path used to
+    /// register its task's handle the moment it spawned it, so a second
+    /// connection for a peer that was already connected overwrote the live
+    /// connection's handle with its own and then bailed out as "already
+    /// connected" — leaving the map pointing at a finished task. Disconnect,
+    /// Forget, Reset and shutdown then aborted that dead task and the real
+    /// connection stayed up. `Reset` aborts everything in here.
+    connection_handles: Mutex<HashMap<String, AbortHandle>>,
+    /// Peers that forgot *this* device — they said so with `Message::Revoked`,
+    /// or their `DeviceAnnounce` said they don't trust it — and that this
+    /// device therefore doesn't dial on its own any more, though it still
+    /// trusts them. **Real bug fixed here**: a device that had been forgotten
+    /// kept redialing the one that forgot it every `RECONNECT_RETRY_INTERVAL`,
+    /// and each dial put a pairing prompt up over there. Cleared for a peer
+    /// by `ReconnectPeer` (someone asked), by a connection that completes
+    /// (the peer trusts this device again), and by `Reset`.
+    revoked_by: Mutex<HashSet<String>>,
+    /// Connections from unpaired devices past the TLS handshake right now —
+    /// see `MAX_UNTRUSTED_CONNECTIONS`.
+    untrusted_connections: AtomicUsize,
+    /// This device's current now-playing artwork and its hash, for the
+    /// connection writers to fill in where the watcher left it out (see
+    /// `Message::NowPlayingUpdate::artwork_omitted` and `now_playing_for_peer`).
+    now_playing_artwork: Mutex<Option<(String, Vec<u8>)>>,
+    /// The artwork each peer last sent in full, to put back into its updates
+    /// that leave it out as unchanged.
+    peer_artwork: Mutex<HashMap<String, Vec<u8>>>,
     /// Peers the user explicitly disconnected via `EngineCommand::DisconnectPeer`
     /// — checked by the accept loop (reject their inbound reconnect attempts
     /// too, not just our own outbound dialing) and the mDNS dial loop, so a
@@ -566,10 +645,14 @@ fn end_remote_control_session(state: &Arc<SharedState>, peer_crypto_id: &str, re
 /// the screen stream, a file's data connection, or the mesh — by who it
 /// is (and, where that isn't enough, by its first message).
 fn route_accepted(state: &Arc<SharedState>, conn: Connection, addr: SocketAddr) {
-    if state.paused.load(Ordering::Relaxed) {
-        tracing::debug!("dropping inbound connection from {addr}: paused");
-        return;
-    }
+    // Paused is checked in `handle_connection`, for mesh connections only.
+    // **Real bug fixed here**: every inbound connection used to be dropped
+    // here while paused, a file's data connection included — while the
+    // offer for that file, on the mesh connection that stays up through a
+    // pause, was still accepted. The receiver showed the file arriving and
+    // the sender's every attempt to connect died. Offers are refused while
+    // paused now, and a data connection for a file accepted before the
+    // pause is taken.
     let peer_crypto_id = match conn.peer_device_id() {
         Ok(id) => id,
         Err(e) => {
@@ -650,18 +733,105 @@ fn route_accepted(state: &Arc<SharedState>, conn: Connection, addr: SocketAddr) 
         });
         return;
     }
+    if let Err(e) = handle_connection(conn, state, peer_crypto_id, None, Origin::Inbound) {
+        tracing::debug!("inbound connection from {addr} not taken: {e}");
+    }
+}
+
+/// How a connection came about — what `handle_connection_inner` needs to
+/// know to do the right thing with a peer that turns out to have forgotten
+/// this device (see `revoked_by`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    /// The peer dialed this device.
+    Inbound,
+    /// This device dialed on its own: mDNS discovery or the redial ticker.
+    AutoDial,
+    /// This device dialed because someone asked (`ReconnectPeer`).
+    ManualDial,
+}
+
+/// Dials `addr` expecting `peer_id` to answer: the TCP connect and TLS
+/// handshake within `DIAL_TIMEOUT`, and the certificate the other end
+/// presents has to be `peer_id`'s own. **Real bug fixed here**: nothing
+/// compared the two. The address came from an mDNS record, which anyone on
+/// the network can send with any `id` in it, and the handshake only checked
+/// that the device at the other end announced the same id as its own
+/// certificate — so a device that advertised a paired peer's id at its own
+/// address was dialed by the redial ticker while that peer was away and
+/// treated as it from then on: every clipboard copy went to it, its files
+/// were taken, and it could lock the screen. The screen stream was dialed
+/// the same way, so a session's frames could be sent to an impostor. Every
+/// connection this device dials goes through here now.
+async fn dial_peer(tls_identity: &TlsIdentity, peer_id: &str, addr: SocketAddr) -> Result<Connection, String> {
+    let conn = match tokio::time::timeout(DIAL_TIMEOUT, connect(addr, tls_identity)).await {
+        Ok(Ok(conn)) => conn,
+        Ok(Err(e)) => return Err(format!("couldn't connect to {addr}: {e}")),
+        Err(_) => return Err(format!("timed out connecting to {addr}")),
+    };
+    match conn.peer_device_id() {
+        Ok(id) if id == peer_id => Ok(conn),
+        Ok(id) => Err(format!("a different device ({}…) answered at {addr}", &id[..id.len().min(12)])),
+        Err(e) => Err(format!("the device at {addr} presented an unusable certificate: {e}")),
+    }
+}
+
+/// Dials `peer_id` at `addr` under a dial claim the caller already holds
+/// (`try_claim_dial`), and hands a connection that answers correctly to
+/// `handle_connection`. The task is recorded against the claim so it can be
+/// aborted while still dialing (`abort_dials`).
+fn spawn_dial(state: &Arc<SharedState>, peer_id: String, addr: SocketAddr, origin: Origin) {
     let conn_state = state.clone();
-    let id_for_registry = peer_crypto_id.clone();
+    let id = peer_id.clone();
     let join = tokio::spawn(async move {
-        if let Err(e) = handle_connection(conn, conn_state, peer_crypto_id, None).await {
-            tracing::debug!("inbound connection from {addr} ended: {e}");
+        match dial_peer(&conn_state.tls_identity, &id, addr).await {
+            Ok(conn) => {
+                if let Err(e) = handle_connection(conn, &conn_state, id, None, origin) {
+                    tracing::debug!("connection to {addr} not taken: {e}");
+                }
+            }
+            Err(e) => {
+                tracing::debug!("dialing '{id}' failed: {e}");
+                release_dial_claim(&conn_state, &id);
+            }
         }
     });
-    state
-        .connection_handles
-        .lock()
-        .unwrap()
-        .insert(id_for_registry, join.abort_handle());
+    // A dial that already finished has released its claim; nothing to record.
+    if let Some(slot) = state.dialing.lock().unwrap().get_mut(&peer_id) {
+        *slot = Some(join.abort_handle());
+    }
+}
+
+/// Aborts the dial still under way to `peer_id` (every dial, for `None`) and
+/// releases its claim — the dial-phase half of what `connection_handles`
+/// does for established connections.
+fn abort_dials(state: &SharedState, peer_id: Option<&str>) {
+    let mut dialing = state.dialing.lock().unwrap();
+    let handles: Vec<Option<AbortHandle>> = match peer_id {
+        Some(peer_id) => dialing.remove(peer_id).into_iter().collect(),
+        None => dialing.drain().map(|(_, handle)| handle).collect(),
+    };
+    for handle in handles.into_iter().flatten() {
+        handle.abort();
+    }
+}
+
+/// Records that `peer` has forgotten this device (see `revoked_by`) and
+/// tells the shell, once.
+fn note_revoked_by(state: &Arc<SharedState>, peer: &DeviceInfo) {
+    if state.revoked_by.lock().unwrap().insert(peer.id.clone()) {
+        state.emit(SyncEvent::RevokedByPeer { peer_id: peer.id.clone(), peer_name: peer.name.clone() });
+    }
+}
+
+/// Decrements `untrusted_connections` when a connection from an unpaired
+/// device ends, however it ends — dropped with its task.
+struct UntrustedSlot(Arc<SharedState>);
+
+impl Drop for UntrustedSlot {
+    fn drop(&mut self) {
+        self.0.untrusted_connections.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Runs `handle_screen_stream_connection` in its own task, registered so
@@ -697,7 +867,7 @@ async fn handle_screen_stream_connection(
 ) -> anyhow::Result<()> {
     let first = match first {
         Some(message) => message,
-        None => read_message(&mut conn).await?,
+        None => read_message_up_to(&mut conn, HANDSHAKE_MAX_MESSAGE_BYTES).await?,
     };
     let Message::ScreenStreamHandshake { session_id } = first else {
         anyhow::bail!("expected ScreenStreamHandshake as the first message on a screen-stream connection");
@@ -942,10 +1112,12 @@ async fn push_screen_stream(
         return;
     };
 
-    let mut conn = match connect(addr, &state.tls_identity).await {
+    // Through `dial_peer`: the frames are for the device that asked, not for
+    // whoever an mDNS record says is at its address.
+    let mut conn = match dial_peer(&state.tls_identity, &peer_crypto_id, addr).await {
         Ok(c) => c,
         Err(e) => {
-            tracing::debug!("couldn't dial screen-stream connection to {addr}: {e}");
+            tracing::debug!("couldn't dial screen-stream connection: {e}");
             end_remote_control_session(&state, &peer_crypto_id, Some(format!("couldn't open screen stream: {e}")), true);
             return;
         }
@@ -987,7 +1159,12 @@ fn try_claim_dial(state: &Arc<SharedState>, peer_id: &str) -> bool {
     if state.connected.lock().unwrap().contains(peer_id) {
         return false;
     }
-    state.dialing.lock().unwrap().insert(peer_id.to_string())
+    let mut dialing = state.dialing.lock().unwrap();
+    if dialing.contains_key(peer_id) {
+        return false;
+    }
+    dialing.insert(peer_id.to_string(), None);
+    true
 }
 
 fn release_dial_claim(state: &Arc<SharedState>, peer_id: &str) {
@@ -1031,8 +1208,12 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
         discovery_recreate: Notify::new(),
         trust_store: Mutex::new(config.trust_store),
         connected: Mutex::new(HashSet::new()),
-        dialing: Mutex::new(HashSet::new()),
+        dialing: Mutex::new(HashMap::new()),
         connection_handles: Mutex::new(HashMap::new()),
+        revoked_by: Mutex::new(HashSet::new()),
+        untrusted_connections: AtomicUsize::new(0),
+        now_playing_artwork: Mutex::new(None),
+        peer_artwork: Mutex::new(HashMap::new()),
         manually_disconnected: Mutex::new(HashSet::new()),
         known_addresses: Mutex::new(HashMap::new()),
         peer_senders: Mutex::new(HashMap::new()),
@@ -1204,32 +1385,15 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                 if state.manually_disconnected.lock().unwrap().contains(&peer.device.id) {
                     continue;
                 }
+                // A peer that forgot this device isn't dialed on its own
+                // again — someone has to ask (see `revoked_by`).
+                if state.revoked_by.lock().unwrap().contains(&peer.device.id) {
+                    continue;
+                }
                 if !try_claim_dial(&state, &peer.device.id) {
                     continue;
                 }
-
-                let conn_state = state.clone();
-                let peer_id = peer.device.id.clone();
-                let id_for_registry = peer_id.clone();
-                let peer_addr = peer.addr;
-                let join = tokio::spawn(async move {
-                    match connect(peer_addr, &conn_state.tls_identity).await {
-                        Ok(conn) => {
-                            if let Err(e) = handle_connection(conn, conn_state, peer_id, None).await {
-                                tracing::debug!("outbound connection to {peer_addr} ended: {e}");
-                            }
-                        }
-                        Err(e) => {
-                            tracing::debug!("failed to dial {peer_addr}: {e}");
-                            release_dial_claim(&conn_state, &peer_id);
-                        }
-                    }
-                });
-                state
-                    .connection_handles
-                    .lock()
-                    .unwrap()
-                    .insert(id_for_registry, join.abort_handle());
+                spawn_dial(&state, peer.device.id.clone(), peer.addr, Origin::AutoDial);
             }
             // Got here either because `recv_async` returned `Err` (mdns-sd's
             // daemon thread shut its sending half down for good — a crash
@@ -1323,14 +1487,11 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                             handle.abort();
                         }
                         state.connected.lock().unwrap().clear();
-                        // A dial aborted mid-flight (its task dropped by
-                        // the `handle.abort()` calls just above, before it
-                        // could reach either `handle_connection` or its own
-                        // `Err` branch) never gets to release its own
-                        // claim — same reasoning as the `connected`/
-                        // `peer_senders` clears right here, just for
-                        // `dialing`.
-                        state.dialing.lock().unwrap().clear();
+                        // Dials still under way are aborted too — they'd
+                        // otherwise connect to a device this one has just
+                        // forgotten — and their claims go with them.
+                        abort_dials(&state, None);
+                        state.revoked_by.lock().unwrap().clear();
                         state.peer_senders.lock().unwrap().clear();
                         // Same "abort skips the normal cleanup tail"
                         // reasoning as everywhere else here — every
@@ -1371,11 +1532,9 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                             handle.abort();
                         }
                         state.connected.lock().unwrap().remove(&peer_crypto_id);
-                        // Same reasoning as `Reset`'s clear — if `peer_crypto_id`
-                        // happened to be mid-dial (not yet connected) at the
-                        // moment of the abort above, its task never got to
-                        // release its own claim.
-                        release_dial_claim(&state, &peer_crypto_id);
+                        // A dial under way to it is stopped too, or it
+                        // would connect a moment after the disconnect.
+                        abort_dials(&state, Some(&peer_crypto_id));
                         state.peer_senders.lock().unwrap().remove(&peer_crypto_id);
                         end_remote_control_session(&state, &peer_crypto_id, None, false);
                         // Same reasoning as `Reset`'s cancel: a v3
@@ -1461,13 +1620,16 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                                 handle.abort();
                             }
                             state.connected.lock().unwrap().remove(&peer_crypto_id);
-                            release_dial_claim(&state, &peer_crypto_id);
+                            abort_dials(&state, Some(&peer_crypto_id));
                             state.peer_senders.lock().unwrap().remove(&peer_crypto_id);
                             end_remote_control_session(&state, &peer_crypto_id, None, false);
                         });
                     }
                     EngineCommand::ReconnectPeer { peer_crypto_id } => {
                         state.manually_disconnected.lock().unwrap().remove(&peer_crypto_id);
+                        // Someone asked: a peer that forgot this device may
+                        // be approached again (which means pairing again).
+                        state.revoked_by.lock().unwrap().remove(&peer_crypto_id);
                         let Some(addr) = state.known_addresses.lock().unwrap().get(&peer_crypto_id).copied() else {
                             state.emit(SyncEvent::ReconnectFailed { peer_id: peer_crypto_id });
                             continue;
@@ -1475,23 +1637,7 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                         if !try_claim_dial(&state, &peer_crypto_id) {
                             continue;
                         }
-
-                        let conn_state = state.clone();
-                        let id_for_registry = peer_crypto_id.clone();
-                        let join = tokio::spawn(async move {
-                            match connect(addr, &conn_state.tls_identity).await {
-                                Ok(conn) => {
-                                    if let Err(e) = handle_connection(conn, conn_state, peer_crypto_id, None).await {
-                                        tracing::debug!("reconnect to {addr} ended: {e}");
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::debug!("failed to reconnect to {addr}: {e}");
-                                    release_dial_claim(&conn_state, &peer_crypto_id);
-                                }
-                            }
-                        });
-                        state.connection_handles.lock().unwrap().insert(id_for_registry, join.abort_handle());
+                        spawn_dial(&state, peer_crypto_id, addr, Origin::ManualDial);
                     }
                     EngineCommand::SendMediaCommand { peer_crypto_id, command } => {
                         if let Some(tx) = state.peer_senders.lock().unwrap().get(&peer_crypto_id) {
@@ -1606,6 +1752,10 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                         if text.is_empty() {
                             continue;
                         }
+                        if text.len() > MAX_CLIPBOARD_BYTES {
+                            state.emit(SyncEvent::Error(format!("That text is too long to send to a clipboard (over {} MB)", MAX_CLIPBOARD_BYTES / (1024 * 1024))));
+                            continue;
+                        }
                         if let Some(tx) = state.peer_senders.lock().unwrap().get(&peer_crypto_id) {
                             let _ = tx.send(Message::ClipboardUpdate {
                                 origin_device: state.my_device.id.clone(),
@@ -1701,47 +1851,93 @@ fn finish_screen_lock_request(state: &Arc<SharedState>, peer: &DeviceInfo, actio
     state.emit(SyncEvent::ScreenLockRequested { peer_id: peer.id.clone(), peer_name: peer.name.clone(), action, outcome });
 }
 
-/// `first` is the connection's first message when the accept loop already
-/// had to read it to tell this connection from a v3 file data connection
-/// (see `transfer::route_inbound`) — `None` everywhere else.
-async fn handle_connection(
+/// Takes a freshly established connection with `peer_crypto_id` — the id its
+/// certificate proves, which every caller has already checked — and makes
+/// it the peer's one connection: claims the peer's slot in `connected`,
+/// registers the task that runs it in `connection_handles`, and spawns that
+/// task. Refuses (and drops the connection) if the peer is already
+/// connected, was manually disconnected, or is an unpaired device over the
+/// `MAX_UNTRUSTED_CONNECTIONS` cap. `first` is the connection's first
+/// message when the accept loop already had to read it to tell this
+/// connection from a v3 file data connection (see `transfer::route_inbound`)
+/// — `None` everywhere else.
+fn handle_connection(
     conn: Connection,
-    state: Arc<SharedState>,
+    state: &Arc<SharedState>,
     peer_crypto_id: String,
     first: Option<Message>,
+    origin: Origin,
 ) -> anyhow::Result<()> {
     // No-op for an inbound connection (never claimed a dial in the first
-    // place — `remove` on an absent key just returns `false`). For an
-    // outbound one, the dial phase this claim was guarding is over now
-    // that a `Connection` exists — release it before, not after, the
-    // `connected` check right below so a peer whose connection later
-    // drops can be freely redialed without waiting on this one.
-    release_dial_claim(&state, &peer_crypto_id);
-    {
-        let mut connected = state.connected.lock().unwrap();
-        if connected.contains(&peer_crypto_id) {
-            anyhow::bail!("already connected to {peer_crypto_id}");
-        }
-        connected.insert(peer_crypto_id.clone());
+    // place). For an outbound one, the dial phase this claim was guarding
+    // is over now that a `Connection` exists — release it before, not
+    // after, the `connected` check right below so a peer whose connection
+    // later drops can be freely redialed without waiting on this one.
+    release_dial_claim(state, &peer_crypto_id);
+    // The accept loop checks this for inbound connections; a dial that was
+    // under way when the user disconnected the peer gets here too.
+    if state.manually_disconnected.lock().unwrap().contains(&peer_crypto_id) {
+        anyhow::bail!("{peer_crypto_id} was manually disconnected");
     }
+    // Paused: no new mesh connections from peers (see `EngineCommand::SetPaused`).
+    // A dial this device's user asked for is theirs to make.
+    if origin == Origin::Inbound && state.paused.load(Ordering::Relaxed) {
+        anyhow::bail!("not taking a connection from {peer_crypto_id}: paused");
+    }
+    let is_trusted = state.trust_store.lock().unwrap().is_trusted(&peer_crypto_id);
+    let untrusted_slot = if is_trusted {
+        None
+    } else {
+        if state.untrusted_connections.fetch_add(1, Ordering::SeqCst) >= MAX_UNTRUSTED_CONNECTIONS {
+            state.untrusted_connections.fetch_sub(1, Ordering::SeqCst);
+            anyhow::bail!("already handling {MAX_UNTRUSTED_CONNECTIONS} connections from unpaired devices");
+        }
+        Some(UntrustedSlot(state.clone()))
+    };
 
-    let result = handle_connection_inner(conn, &state, &peer_crypto_id, first).await;
+    // Everything that makes this *the* connection for the peer happens
+    // under the one lock, so two connections for the same peer can't both
+    // win, and the one that wins is the one whose handle is registered.
+    let mut connected = state.connected.lock().unwrap();
+    if connected.contains(&peer_crypto_id) {
+        anyhow::bail!("already connected to {peer_crypto_id}");
+    }
+    connected.insert(peer_crypto_id.clone());
+    let task_state = state.clone();
+    let peer_id = peer_crypto_id.clone();
+    let join = tokio::spawn(async move {
+        let _slot = untrusted_slot;
+        if let Err(e) = handle_connection_inner(conn, &task_state, &peer_id, first, origin).await {
+            tracing::debug!("connection with {peer_id} ended: {e}");
+        }
+        finish_connection(&task_state, &peer_id);
+    });
+    state.connection_handles.lock().unwrap().insert(peer_crypto_id, join.abort_handle());
+    drop(connected);
+    Ok(())
+}
 
-    state.connected.lock().unwrap().remove(&peer_crypto_id);
-    state.peer_senders.lock().unwrap().remove(&peer_crypto_id);
-    // Not removed on the `Reset` path — that drains the whole map itself
-    // and aborts every handle, so there's nothing left here to remove by
-    // the time this cleanup runs (aborting a task doesn't let it finish
-    // this line).
-    state.connection_handles.lock().unwrap().remove(&peer_crypto_id);
+/// A connection task's cleanup, run when `handle_connection_inner` returns
+/// (not when the task is aborted — the paths that abort do their own, see
+/// `Reset`, `DisconnectPeer` and `RevokeDevice`). Only this task's own
+/// registration is removed: a connection that already replaced this one
+/// keeps its handle.
+fn finish_connection(state: &Arc<SharedState>, peer_crypto_id: &str) {
+    state.connected.lock().unwrap().remove(peer_crypto_id);
+    state.peer_senders.lock().unwrap().remove(peer_crypto_id);
+    {
+        let mut handles = state.connection_handles.lock().unwrap();
+        if handles.get(peer_crypto_id).is_some_and(|handle| handle.id() == tokio::task::id()) {
+            handles.remove(peer_crypto_id);
+        }
+    }
     // A remote-control session has no reason to survive the mesh
     // connection that authorized it — input events and the screen stream
     // both depend on this same peer relationship staying intact.
     // `notify_peer: false` since there's no live connection left to send
     // `RemoteControlEnded` over anyway (idempotent either way if some
     // other path already cleaned this up).
-    end_remote_control_session(&state, &peer_crypto_id, Some("connection ended".to_string()), false);
-    result
+    end_remote_control_session(state, peer_crypto_id, Some("connection ended".to_string()), false);
 }
 
 async fn handle_connection_inner(
@@ -1749,26 +1945,70 @@ async fn handle_connection_inner(
     state: &Arc<SharedState>,
     peer_crypto_id: &str,
     first: Option<Message>,
+    origin: Origin,
 ) -> anyhow::Result<()> {
     let is_trusted = state.trust_store.lock().unwrap().is_trusted(peer_crypto_id);
 
-    tracing::debug!("handle_connection_inner: peer={peer_crypto_id} is_trusted={is_trusted}");
+    tracing::debug!("handle_connection_inner: peer={peer_crypto_id} is_trusted={is_trusted} origin={origin:?}");
 
     let mut my_device = state.my_device.clone();
     match state.test_hooks.announce_protocol_version.load(Ordering::Relaxed) {
         0 => {}
         version => my_device.protocol_version = version,
     }
-    let peer = if is_trusted {
+    // Bounded: anyone on the network can open a connection and then say
+    // nothing, and it mustn't hold a task and a socket for good.
+    let handshake = async {
         match first {
-            Some(first) => announce_and_identify_after(&mut conn, &my_device, first).await?,
-            None => announce_and_identify(&mut conn, &my_device).await?,
+            Some(first) => announce_and_identify_after(&mut conn, &my_device, is_trusted, first).await,
+            None => announce_and_identify(&mut conn, &my_device, is_trusted).await,
         }
+    };
+    let announcement = match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake).await {
+        Ok(announcement) => announcement?,
+        Err(_) => anyhow::bail!("{peer_crypto_id} didn't identify itself within {HANDSHAKE_TIMEOUT:?}"),
+    };
+    // Belt and braces: the handshake checks the announced id against the
+    // certificate, and every dial checks the certificate against the id it
+    // meant to reach (`dial_peer`) — so this can't fail, and if it ever
+    // does, the connection is for someone else.
+    if announcement.peer.id != peer_crypto_id {
+        anyhow::bail!("the device identified itself as {} on a connection meant for {peer_crypto_id}", announcement.peer.id);
+    }
+    let peer = announcement.peer;
+
+    // Paired here, but the peer says it doesn't trust this device: it
+    // forgot this device while the two weren't connected (connected, it
+    // would have sent `Revoked`). Pairing again is a human's decision —
+    // when this device dialed on its own, the connection just ends, and
+    // it isn't dialed again until someone asks (`revoked_by`); when a
+    // human did ask, on either device, the two pair again.
+    let forgotten_by_peer = is_trusted && announcement.trusts_me == Some(false);
+    if forgotten_by_peer {
+        note_revoked_by(state, &peer);
+        if origin == Origin::AutoDial {
+            tracing::info!("'{}' has forgotten this device — not reconnecting to it until asked", peer.name);
+            return Ok(());
+        }
+    }
+
+    let peer = if is_trusted && !forgotten_by_peer {
+        peer
     } else {
+        {
+            let pending = state.pending_pairings.lock().unwrap();
+            if pending.len() >= MAX_PENDING_PAIRINGS && !pending.contains_key(peer_crypto_id) {
+                anyhow::bail!("{MAX_PENDING_PAIRINGS} pairing requests are already waiting for an answer");
+            }
+        }
         tracing::debug!("calling start_pairing for {peer_crypto_id}");
-        let pending = match first {
-            Some(first) => start_pairing_after(conn, &my_device, first).await?,
-            None => start_pairing(conn, &my_device).await?,
+        // Same bound as the handshake: with a v4 peer this exchanges the
+        // pairing nonces, and the peer may instead close the connection
+        // here (a trusted peer that learns it was forgotten, dialing on its
+        // own — see above), in which case nobody is prompted.
+        let pending = match tokio::time::timeout(HANDSHAKE_TIMEOUT, start_pairing(conn, &my_device, peer)).await {
+            Ok(pending) => pending?,
+            Err(_) => anyhow::bail!("{peer_crypto_id} didn't finish the pairing exchange within {HANDSHAKE_TIMEOUT:?}"),
         };
         tracing::debug!("start_pairing returned, code={}", pending.code);
         let peer_name = pending.peer.name.clone();
@@ -1784,7 +2024,17 @@ async fn handle_connection_inner(
             code: pending.code.clone(),
         });
         tracing::debug!("PairingRequested emitted, awaiting local confirmation");
-        let accepted = rx.await.unwrap_or(false);
+        let accepted = match tokio::time::timeout(PAIRING_ANSWER_TIMEOUT, rx).await {
+            Ok(answer) => answer.unwrap_or(false),
+            Err(_) => {
+                // Only this connection's own entry: a newer connection from
+                // the same peer may have replaced it, and that one's sender
+                // still has a receiver.
+                state.pending_pairings.lock().unwrap().retain(|id, tx| !(id == peer_crypto_id && tx.is_closed()));
+                tracing::info!("the pairing request from '{peer_name}' went unanswered for {PAIRING_ANSWER_TIMEOUT:?} — declining it");
+                false
+            }
+        };
         tracing::debug!("local confirmation resolved: accepted={accepted}");
 
         match pending.confirm(accepted).await? {
@@ -1805,6 +2055,8 @@ async fn handle_connection_inner(
         }
     };
 
+    // Trusted both ways from here on.
+    state.revoked_by.lock().unwrap().remove(&peer.id);
     state.emit(SyncEvent::Connected { peer: peer.clone() });
     if state.screen_lock.is_available() {
         let allowed = state.trust_store.lock().unwrap().is_unlock_allowed(&peer.id);
@@ -1913,10 +2165,24 @@ async fn handle_connection_inner(
                 Ok(Message::MediaCommand { command }) => {
                     state.media.handle(command);
                 }
-                Ok(Message::NowPlayingUpdate { info }) => {
+                Ok(Message::NowPlayingUpdate { mut info, artwork_omitted }) => {
                     if state.paused.load(Ordering::Relaxed) {
                         continue;
                     }
+                    // Unchanged artwork isn't resent (see the writer loop's
+                    // `now_playing_for_peer`): put back what this peer last
+                    // sent in full, and remember a full one.
+                    let mut cache = state.peer_artwork.lock().unwrap();
+                    if artwork_omitted {
+                        if let Some(artwork) = cache.get(&peer.id) {
+                            info.artwork = artwork.clone();
+                        }
+                    } else if info.artwork.is_empty() {
+                        cache.remove(&peer.id);
+                    } else {
+                        cache.insert(peer.id.clone(), info.artwork.clone());
+                    }
+                    drop(cache);
                     state.emit(SyncEvent::NowPlayingChanged {
                         peer_id: peer.id.clone(),
                         peer_name: peer.name.clone(),
@@ -1937,6 +2203,10 @@ async fn handle_connection_inner(
                         tracing::debug!("ignoring non-text clipboard update from {origin_device}");
                         continue;
                     }
+                    if data.len() > MAX_CLIPBOARD_BYTES {
+                        tracing::debug!("ignoring a {}-byte clipboard update from {origin_device}: over the {MAX_CLIPBOARD_BYTES}-byte limit", data.len());
+                        continue;
+                    }
                     if content_hash(&data) != hash {
                         tracing::warn!("clipboard update from {origin_device} failed its integrity check, ignoring");
                         continue;
@@ -1955,6 +2225,18 @@ async fn handle_connection_inner(
                     data_channel,
                     resume,
                 }) => {
+                    if state.paused.load(Ordering::Relaxed) {
+                        // Said so, rather than accepted into a transfer whose
+                        // data connection the pause would then refuse.
+                        let _ = tx.send(Message::FileAccept {
+                            transfer_id,
+                            accepted: false,
+                            data_channel: false,
+                            offset: 0,
+                            reason: Some(format!("Syncing is paused on {}", state.my_device.name)),
+                        });
+                        continue;
+                    }
                     // The name is the peer's to choose, so it's reduced to
                     // one plain file name before anything joins it onto the
                     // received-files folder — see `safe_received_file_name`.
@@ -1989,10 +2271,9 @@ async fn handle_connection_inner(
                     handle_file_complete(state, &mut receiving, &transfer_id, expected_hash).await;
                 }
                 Ok(Message::Revoked) => {
-                    state.emit(SyncEvent::RevokedByPeer {
-                        peer_id: peer.id.clone(),
-                        peer_name: peer.name.clone(),
-                    });
+                    // Also stops this device dialing the peer on its own
+                    // from now on (see `revoked_by`).
+                    note_revoked_by(state, &peer);
                     // The sender is about to close their side anyway, but
                     // don't wait on that — end the loop here so the
                     // `Disconnected` emit below (and this side's own
@@ -2142,8 +2423,18 @@ async fn handle_connection_inner(
     // rare one the receiver turns down in favour of in-band chunks.
     let mut data_channel_offers: HashMap<String, (u64, String)> = HashMap::new();
 
+    // The hash of the artwork this connection last carried in full — see
+    // `now_playing_for_peer`.
+    let mut artwork_sent: Option<String> = None;
     let writer = async {
         while let Some(msg) = rx.recv().await {
+            let msg = match msg {
+                Message::NowPlayingUpdate { info, artwork_omitted } => {
+                    let current = state.now_playing_artwork.lock().unwrap().clone();
+                    now_playing_for_peer(info, artwork_omitted, peer.protocol_version, &mut artwork_sent, current)
+                }
+                msg => msg,
+            };
             // `write_message` only borrows `msg`, so it's still available
             // afterward — inspecting it post-write (not pre-) matters
             // here: everything below reacts to what was *actually*
@@ -2342,9 +2633,16 @@ async fn handle_file_offer(
         }
     };
 
-    let path = unique_destination_path(&dir, &file_name);
-    let file = match tokio::fs::File::create(&path).await {
-        Ok(f) => f,
+    // `create_new`, like the v3 path's partial file: a name that's taken by
+    // the time the file is made is skipped, never truncated.
+    let created = {
+        let (dir, file_name) = (dir.clone(), file_name.clone());
+        tokio::task::spawn_blocking(move || transfer::create_unique_file(&dir, &file_name))
+            .await
+            .unwrap_or_else(|e| Err(std::io::Error::other(e)))
+    };
+    let (path, file) = match created {
+        Ok((path, file)) => (path, tokio::fs::File::from_std(file)),
         Err(e) => {
             state.emit(SyncEvent::FileTransferFailed {
                 transfer_id: transfer_id.clone(),
@@ -2537,9 +2835,13 @@ const MAX_RECEIVED_NAME_BYTES: usize = 200;
 /// empty becomes "file".
 pub(crate) fn safe_received_file_name(name: &str) -> String {
     let last = name.rsplit(['/', '\\']).find(|part| !part.is_empty()).unwrap_or("");
+    // Unicode's bidirectional controls aren't control characters to
+    // `is_control`, but a right-to-left override in a name makes
+    // "photo\u{202E}gpj.exe" read as "photoexe.jpg" wherever it's shown.
+    let is_bidi_control = |c: char| matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
     let mut cleaned: String = last
         .chars()
-        .map(|c| if c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*') { '_' } else { c })
+        .map(|c| if c.is_control() || is_bidi_control(c) || matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*') { '_' } else { c })
         .collect();
     cleaned = cleaned.trim().trim_end_matches(['.', ' ']).to_string();
     if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
@@ -2879,9 +3181,45 @@ async fn apply_remote_clipboard(state: &Arc<SharedState>, hash: String, data: Ve
     .await;
 }
 
+/// What one connection's writer sends for a now-playing update the watcher
+/// queued: an update whose artwork the watcher left out as unchanged gets it
+/// back if this connection hasn't carried the current artwork yet (it
+/// connected after the artwork last changed), or if the peer is older than
+/// v4 and wouldn't know to keep what it has. `artwork_sent` is the hash of
+/// the artwork this connection last carried in full, kept across calls.
+fn now_playing_for_peer(
+    mut info: NowPlayingInfo,
+    artwork_omitted: bool,
+    peer_version: u32,
+    artwork_sent: &mut Option<String>,
+    current: Option<(String, Vec<u8>)>,
+) -> Message {
+    if !artwork_omitted {
+        *artwork_sent = (!info.artwork.is_empty()).then(|| content_hash(&info.artwork));
+        return Message::NowPlayingUpdate { info, artwork_omitted: false };
+    }
+    match current {
+        Some((hash, _)) if peer_version >= continuity_net::COMMITTED_PAIRING_VERSION && artwork_sent.as_deref() == Some(hash.as_str()) => {
+            Message::NowPlayingUpdate { info, artwork_omitted: true }
+        }
+        Some((hash, artwork)) => {
+            info.artwork = artwork;
+            *artwork_sent = Some(hash);
+            Message::NowPlayingUpdate { info, artwork_omitted: false }
+        }
+        // Nothing current to leave out: send it as it is, artwork and all.
+        None => {
+            *artwork_sent = None;
+            Message::NowPlayingUpdate { info, artwork_omitted: false }
+        }
+    }
+}
+
 fn spawn_clipboard_watcher(state: Arc<SharedState>) -> JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
         let mut last_seen: Option<String> = None;
+        let mut last_token: Option<u64> = None;
+        let mut last_oversized: Option<usize> = None;
         loop {
             std::thread::sleep(Duration::from_millis(500));
 
@@ -2892,6 +3230,15 @@ fn spawn_clipboard_watcher(state: Arc<SharedState>) -> JoinHandle<()> {
             if state.paused.load(Ordering::Relaxed) {
                 continue;
             }
+
+            // Where the platform counts clipboard changes, an unchanged
+            // count means nothing to read, let alone hash: the clipboard
+            // can hold megabytes, and this ran twice a second.
+            let token = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| state.clipboard.change_token())).unwrap_or(None);
+            if token.is_some() && token == last_token {
+                continue;
+            }
+            last_token = token;
 
             // `get_text` crosses the FFI boundary into Kotlin/Swift on
             // mobile (desktop's `arboard` backend doesn't need this, but
@@ -2912,6 +3259,14 @@ fn spawn_clipboard_watcher(state: Arc<SharedState>) -> JoinHandle<()> {
             if text.is_empty() {
                 continue;
             }
+            if text.len() > MAX_CLIPBOARD_BYTES {
+                if last_oversized != Some(text.len()) {
+                    tracing::info!("not syncing {} bytes of clipboard text: over the {MAX_CLIPBOARD_BYTES}-byte limit", text.len());
+                    last_oversized = Some(text.len());
+                }
+                continue;
+            }
+            last_oversized = None;
 
             let hash = content_hash(text.as_bytes());
             if last_seen.as_deref() == Some(hash.as_str()) {
@@ -2984,7 +3339,29 @@ fn spawn_now_playing_watcher(state: Arc<SharedState>) -> JoinHandle<()> {
             // a default/empty snapshot — otherwise a peer's display would
             // keep showing whatever was playing last, forever, once
             // playback actually stops.
-            let msg = Message::NowPlayingUpdate { info: info.unwrap_or_default() };
+            let mut info = info.unwrap_or_default();
+            // The artwork goes out once per change, not with every update
+            // (the position changes on nearly all of them): here it's
+            // compared with the last one broadcast, and the connection
+            // writers fill it back in for a peer that hasn't had it yet
+            // (`now_playing_for_peer`).
+            let artwork_omitted = {
+                let mut current = state.now_playing_artwork.lock().unwrap();
+                if info.artwork.is_empty() {
+                    *current = None;
+                    false
+                } else {
+                    let hash = content_hash(&info.artwork);
+                    if current.as_ref().is_some_and(|(sent, _)| *sent == hash) {
+                        info.artwork = Vec::new();
+                        true
+                    } else {
+                        *current = Some((hash, info.artwork.clone()));
+                        false
+                    }
+                }
+            };
+            let msg = Message::NowPlayingUpdate { info, artwork_omitted };
             let senders: Vec<_> = state.peer_senders.lock().unwrap().values().cloned().collect();
             for tx in senders {
                 let _ = tx.send(msg.clone());
@@ -3019,10 +3396,16 @@ fn redial_disconnected_trusted_peers(state: &Arc<SharedState>) {
         let connected = state.connected.lock().unwrap();
         let dialing = state.dialing.lock().unwrap();
         let manually_disconnected = state.manually_disconnected.lock().unwrap();
+        let revoked_by = state.revoked_by.lock().unwrap();
         let known_addresses = state.known_addresses.lock().unwrap();
         trust_store
             .list()
-            .filter(|d| !connected.contains(&d.id) && !dialing.contains(&d.id) && !manually_disconnected.contains(&d.id))
+            .filter(|d| {
+                !connected.contains(&d.id)
+                    && !dialing.contains_key(&d.id)
+                    && !manually_disconnected.contains(&d.id)
+                    && !revoked_by.contains(&d.id)
+            })
             .filter_map(|d| known_addresses.get(&d.id).copied().map(|addr| (d.id.clone(), addr)))
             .collect()
     };
@@ -3035,22 +3418,7 @@ fn redial_disconnected_trusted_peers(state: &Arc<SharedState>) {
         if !try_claim_dial(state, &peer_crypto_id) {
             continue;
         }
-        let conn_state = state.clone();
-        let id_for_registry = peer_crypto_id.clone();
-        let join = tokio::spawn(async move {
-            match connect(addr, &conn_state.tls_identity).await {
-                Ok(conn) => {
-                    if let Err(e) = handle_connection(conn, conn_state, peer_crypto_id, None).await {
-                        tracing::debug!("reconnect to {addr} ended: {e}");
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!("reconnect to {addr} failed: {e}");
-                    release_dial_claim(&conn_state, &peer_crypto_id);
-                }
-            }
-        });
-        state.connection_handles.lock().unwrap().insert(id_for_registry, join.abort_handle());
+        spawn_dial(state, peer_crypto_id, addr, Origin::AutoDial);
     }
 }
 
@@ -3169,6 +3537,69 @@ mod tests {
         }
     }
 
+    /// A connection dialed for one device must be with that device: a
+    /// listener with another identity at the address — what a forged mDNS
+    /// record pointing a paired peer's id at an attacker's address leads
+    /// to — is refused after the handshake, before anything is sent to it.
+    #[tokio::test]
+    async fn dialing_refuses_a_device_other_than_the_one_expected() {
+        let me = Identity::generate();
+        let impostor = Identity::generate();
+        let impostor_tls = generate_self_signed(&impostor).unwrap();
+        let listener = Listener::bind("127.0.0.1:0".parse().unwrap(), &impostor_tls).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.map(|(conn, _)| conn) });
+
+        let tls_identity = generate_self_signed(&me).unwrap();
+        let expected = Identity::generate().device_id();
+        let refused = dial_peer(&tls_identity, &expected, addr).await.err().expect("another device answered: refused");
+        assert!(refused.contains("a different device"), "{refused}");
+        let _ = accept.await;
+
+        // The device it was for, at the address: accepted.
+        let listener = Listener::bind("127.0.0.1:0".parse().unwrap(), &impostor_tls).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.map(|(conn, _)| conn) });
+        let conn = dial_peer(&tls_identity, &impostor.device_id(), addr).await.expect("the right device");
+        assert_eq!(conn.peer_device_id().unwrap(), impostor.device_id());
+        let _ = accept.await;
+    }
+
+    #[test]
+    fn unchanged_artwork_goes_once_per_connection_and_always_to_an_older_peer() {
+        let artwork = vec![1u8, 2, 3];
+        let hash = content_hash(&artwork);
+        let current = Some((hash.clone(), artwork.clone()));
+        let omitted = NowPlayingInfo { title: Some("t".into()), ..NowPlayingInfo::default() };
+
+        // A v4 connection that hasn't carried this artwork gets it in full,
+        // then not again.
+        let mut sent = None;
+        let first = now_playing_for_peer(omitted.clone(), true, 4, &mut sent, current.clone());
+        assert!(matches!(&first, Message::NowPlayingUpdate { info, artwork_omitted: false } if info.artwork == artwork));
+        assert_eq!(sent.as_deref(), Some(hash.as_str()));
+        let second = now_playing_for_peer(omitted.clone(), true, 4, &mut sent, current.clone());
+        assert!(matches!(&second, Message::NowPlayingUpdate { info, artwork_omitted: true } if info.artwork.is_empty()));
+
+        // A v3 peer wouldn't know to keep what it has: full every time.
+        let mut old_sent = Some(hash.clone());
+        let to_old = now_playing_for_peer(omitted.clone(), true, 3, &mut old_sent, current.clone());
+        assert!(matches!(&to_old, Message::NowPlayingUpdate { info, artwork_omitted: false } if info.artwork == artwork));
+
+        // A full update from the watcher passes through and is remembered.
+        let mut sent = None;
+        let full = NowPlayingInfo { artwork: artwork.clone(), ..NowPlayingInfo::default() };
+        let passed = now_playing_for_peer(full, false, 4, &mut sent, current.clone());
+        assert!(matches!(&passed, Message::NowPlayingUpdate { info, artwork_omitted: false } if info.artwork == artwork));
+        assert_eq!(sent.as_deref(), Some(hash.as_str()));
+
+        // Nothing current (the artwork went away): sent as it is.
+        let mut sent = Some(hash);
+        let none = now_playing_for_peer(omitted, true, 4, &mut sent, None);
+        assert!(matches!(&none, Message::NowPlayingUpdate { info, artwork_omitted: false } if info.artwork.is_empty()));
+        assert_eq!(sent, None);
+    }
+
     #[test]
     fn received_names_cannot_leave_the_folder() {
         assert_eq!(safe_received_file_name("../../.config/autostart/x.desktop"), "x.desktop");
@@ -3190,6 +3621,8 @@ mod tests {
     fn received_names_lose_characters_other_systems_refuse() {
         assert_eq!(safe_received_file_name("Meeting: notes?.txt"), "Meeting_ notes_.txt");
         assert_eq!(safe_received_file_name("a\u{0}b\nc.txt"), "a_b_c.txt");
+        assert_eq!(safe_received_file_name("photo\u{202E}gpj.exe"), "photo_gpj.exe", "a right-to-left override can't disguise the extension");
+        assert_eq!(safe_received_file_name("\u{2066}x\u{2069}.txt"), "_x_.txt");
         assert_eq!(safe_received_file_name("notes.txt. . "), "notes.txt");
         assert_eq!(safe_received_file_name("con.txt"), "_con.txt");
         assert_eq!(safe_received_file_name("LPT1"), "_LPT1");

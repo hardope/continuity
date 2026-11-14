@@ -51,7 +51,20 @@ mod b64 {
 /// `#[serde(default)]`, so a v2 peer's `FileOffer`/`FileAccept` still
 /// parses (and simply means the in-band `FileChunk` path), and a v2 peer
 /// ignores the fields it doesn't know.
-pub const PROTOCOL_VERSION: u32 = 3;
+///
+/// **v4** hardens pairing and the handshake. The confirmation code is no
+/// longer a function of the two long-term keys alone (which an attacker in
+/// the middle could grind for, since both are public over mDNS and it
+/// chooses its own): when both peers announce v4 or newer, each commits to
+/// a fresh random nonce (`PairCommit`), reveals it (`PairReveal`) only once
+/// the other's commitment is in hand, and the code is derived from both
+/// keys and both nonces. `DeviceAnnounce` also carries `trusts_peer`, so a
+/// device that was forgotten while offline learns so at once instead of
+/// believing it's connected, and `NowPlayingUpdate` carries
+/// `artwork_omitted`, so unchanged artwork isn't resent on every update.
+/// Every new field is optional on the wire and the two new messages only
+/// go to a peer that announced v4, so v3 peers are unaffected.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Hex-encoded Ed25519 public key. This is the device's permanent identity.
 pub type DeviceId = String;
@@ -89,7 +102,17 @@ pub struct DeviceInfo {
 pub enum Message {
     /// Sent immediately after a raw TCP connection is established, before
     /// pairing is confirmed — lets each side identify who's on the wire.
-    DeviceAnnounce { device: DeviceInfo },
+    /// `trusts_peer` (v4) says whether the sender already has the receiver
+    /// in its trust store. Absent from older peers. A device that believes
+    /// it's paired but hears `false` was forgotten by the other side while
+    /// it was away (had it been connected, it would have been sent
+    /// `Revoked`) — see `continuity-daemon`'s connection handling for what
+    /// it does with that.
+    DeviceAnnounce {
+        device: DeviceInfo,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trusts_peer: Option<bool>,
+    },
 
     /// First message of the pairing handshake, sent by the initiating
     /// device. `fingerprint_material` is the initiator's long-term public
@@ -100,6 +123,26 @@ pub enum Message {
     /// Sent by the responder once the user has compared and confirmed (or
     /// rejected) the numeric code shown on both screens.
     PairConfirm { accepted: bool },
+
+    /// v4 pairing, step 1 (both sides, right after `DeviceAnnounce`): a
+    /// commitment to a fresh random nonce, `SHA-256(tag || sender's device
+    /// id || nonce)` (see `continuity_crypto::pairing_commitment`). Sent
+    /// before either side has seen the other's nonce, so neither can pick
+    /// its nonce to steer the code — which is what makes the code safe to
+    /// show: an attacker in the middle gets one blind guess in a million
+    /// per attempt, instead of grinding keys offline until both screens
+    /// match. Only sent to a peer that announced `protocol_version >= 4`.
+    PairCommit {
+        #[serde(with = "b64")]
+        commitment: Vec<u8>,
+    },
+    /// v4 pairing, step 2: the nonce behind the sender's `PairCommit`, sent
+    /// only once the peer's own commitment has arrived. The receiver checks
+    /// it against that commitment and aborts the pairing on a mismatch.
+    PairReveal {
+        #[serde(with = "b64")]
+        nonce: Vec<u8>,
+    },
 
     /// Clipboard content changed on `origin_device`. `content_hash` lets
     /// receivers dedupe and lets the origin device's own watcher ignore its
@@ -176,7 +219,18 @@ pub enum Message {
     /// anything, the sender's own `MediaController::now_playing()`
     /// watcher polls for changes and broadcasts them unprompted, mirroring
     /// how `ClipboardUpdate` works.
-    NowPlayingUpdate { info: NowPlayingInfo },
+    ///
+    /// `artwork_omitted` (v4): `info.artwork` is empty because it hasn't
+    /// changed since the artwork this connection last carried, not because
+    /// there is none — the receiver keeps showing what it has. Playback
+    /// position changes on nearly every update, and resending a few hundred
+    /// kilobytes of artwork with each one was most of the traffic a playing
+    /// device sent. Only ever `true` towards a peer that announced v4.
+    NowPlayingUpdate {
+        info: NowPlayingInfo,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        artwork_omitted: bool,
+    },
 
     /// Sent once, right before the sender closes the connection, when the
     /// user removes this peer from their trust store
@@ -497,6 +551,40 @@ mod tests {
         let cancel = serde_json::to_string(&Message::FileCancel { transfer_id: "t1".into() }).unwrap();
         assert_eq!(cancel, r#"{"type":"file_cancel","transfer_id":"t1"}"#);
         assert!(matches!(serde_json::from_str(&cancel).unwrap(), Message::FileCancel { transfer_id } if transfer_id == "t1"));
+    }
+
+    /// The v4 additions must leave a v3 peer's messages readable, and a
+    /// message with the new fields at their defaults must look exactly like
+    /// a v3 peer's, so a v3 receiver sees nothing new.
+    #[test]
+    fn v4_fields_are_optional_on_the_wire() {
+        let old_announce: Message = serde_json::from_str(
+            r#"{"type":"device_announce","device":{"id":"a","name":"A","platform":"linux","protocol_version":3}}"#,
+        )
+        .expect("a v3 announce parses");
+        assert!(matches!(old_announce, Message::DeviceAnnounce { trusts_peer: None, .. }));
+
+        let device = DeviceInfo { id: "a".into(), name: "A".into(), platform: Platform::Linux, protocol_version: 4 };
+        let plain = serde_json::to_string(&Message::DeviceAnnounce { device: device.clone(), trusts_peer: None }).unwrap();
+        assert!(!plain.contains("trusts_peer"));
+        let flagged = serde_json::to_string(&Message::DeviceAnnounce { device, trusts_peer: Some(false) }).unwrap();
+        assert!(flagged.contains(r#""trusts_peer":false"#));
+
+        let old_update: Message =
+            serde_json::from_str(r#"{"type":"now_playing_update","info":{"title":null,"artist":null,"album":null,"artwork":"","is_playing":false,"position_ms":0,"duration_ms":0,"volume_percent":null}}"#)
+                .expect("a v3 update parses");
+        assert!(matches!(old_update, Message::NowPlayingUpdate { artwork_omitted: false, .. }));
+        let update = serde_json::to_string(&Message::NowPlayingUpdate { info: NowPlayingInfo::default(), artwork_omitted: false }).unwrap();
+        assert!(!update.contains("artwork_omitted"));
+        let omitted = serde_json::to_string(&Message::NowPlayingUpdate { info: NowPlayingInfo::default(), artwork_omitted: true }).unwrap();
+        assert!(omitted.contains(r#""artwork_omitted":true"#));
+
+        let commit = Message::PairCommit { commitment: vec![7u8; 32] };
+        let back: Message = serde_json::from_str(&serde_json::to_string(&commit).unwrap()).unwrap();
+        assert!(matches!(back, Message::PairCommit { commitment } if commitment == vec![7u8; 32]));
+        let reveal = Message::PairReveal { nonce: vec![9u8; 32] };
+        let back: Message = serde_json::from_str(&serde_json::to_string(&reveal).unwrap()).unwrap();
+        assert!(matches!(back, Message::PairReveal { nonce } if nonce == vec![9u8; 32]));
     }
 
     /// `RemoteControlEnded.reason` was added without a protocol version

@@ -288,7 +288,7 @@ fn serve_one(
         Ok(request) => request,
         Err(e) => return send_line(&stream, &ShareResponse { ok: false, message: format!("malformed request: {e}") }),
     };
-    if request.get("token").and_then(|t| t.as_str()) != Some(token) {
+    if !request.get("token").and_then(|t| t.as_str()).is_some_and(|given| tokens_match(given, token)) {
         return send_line(&stream, &ShareResponse { ok: false, message: WRONG_TOKEN.to_string() });
     }
     if request.get("op").is_none() {
@@ -321,6 +321,18 @@ fn serve_one(
         }
         Err(e) => send_line(&stream, &ShareResponse { ok: false, message: format!("unknown request: {e}") }),
     }
+}
+
+/// Whether `given` is `token`, taking the same time whatever `given` is — a
+/// plain `==` stops at the first wrong byte, which, measured closely enough
+/// over many tries, says how much of a guess was right.
+fn tokens_match(given: &str, token: &str) -> bool {
+    let (given, token) = (given.as_bytes(), token.as_bytes());
+    let mut difference = given.len() ^ token.len();
+    for i in 0..token.len() {
+        difference |= usize::from(token[i] ^ given.get(i).copied().unwrap_or(0));
+    }
+    difference == 0
 }
 
 fn send_line(stream: &TcpStream, value: &impl Serialize) -> std::io::Result<()> {
@@ -800,6 +812,15 @@ mod tests {
 
     fn peers(list: &[(&str, &str)]) -> HashMap<String, String> {
         list.iter().map(|(id, name)| (id.to_string(), name.to_string())).collect()
+    }
+
+    #[test]
+    fn tokens_match_only_when_equal() {
+        assert!(tokens_match("abc123", "abc123"));
+        assert!(!tokens_match("abc124", "abc123"));
+        assert!(!tokens_match("abc12", "abc123"));
+        assert!(!tokens_match("abc1234", "abc123"));
+        assert!(!tokens_match("", "abc123"));
     }
 
     #[test]

@@ -181,14 +181,24 @@ impl TrustStore {
     /// Writes a sibling temp file and renames it into place, so anything
     /// reading the trust file at the same time (a desktop settings window
     /// does) sees either the old contents or the new, never half of one.
+    /// Readable only by this user on Unix: it says which devices this one
+    /// trusts and which may unlock it, which no other account needs to see.
     fn save(&self) -> Result<(), TrustError> {
+        use std::io::Write;
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let raw = serde_json::to_string_pretty(&self.file)?;
         let mut temp = self.path.clone().into_os_string();
         temp.push(".tmp");
-        std::fs::write(&temp, raw)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options.open(&temp)?.write_all(raw.as_bytes())?;
         std::fs::rename(&temp, &self.path)?;
         Ok(())
     }
@@ -323,6 +333,16 @@ mod tests {
         store.set_remote_control_allowed("stranger", true).unwrap();
         assert!(!store.is_remote_control_allowed("stranger"));
         drop(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_trust_file_is_private_to_this_user() {
+        use std::os::unix::fs::PermissionsExt;
+        let (mut store, _dir) = temp_store();
+        store.trust(TrustedDevice { id: "abc123".into(), name: "Test Phone".into(), paired_at_unix: 1 }).unwrap();
+        let mode = std::fs::metadata(store_path(&store)).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "mode {mode:o}");
     }
 
     #[test]

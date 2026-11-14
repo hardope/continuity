@@ -37,13 +37,14 @@
 //! spare.
 
 use super::{
-    handle_connection, spawn_screen_stream_connection, unique_destination_path, SharedState, FILE_ACCEPT_TIMEOUT,
-    PROGRESS_EVENT_BYTES,
+    dial_peer, handle_connection, spawn_screen_stream_connection, unique_destination_path, Origin, SharedState,
+    FILE_ACCEPT_TIMEOUT, PROGRESS_EVENT_BYTES,
 };
 use crate::events::{FileTransferDirection, SyncEvent};
 use continuity_crypto::IncrementalHash;
 use continuity_net::{
-    connect, read_frame, read_frame_up_to, read_message, write_frame_unflushed, write_message, Connection, FramingError,
+    read_frame, read_frame_up_to, read_message, read_message_up_to, write_frame_unflushed, write_message, Connection, FramingError,
+    HANDSHAKE_MAX_MESSAGE_BYTES,
 };
 use continuity_proto::{DeviceInfo, Message};
 use std::io::{Read, Write};
@@ -76,10 +77,6 @@ pub(super) const RESUME_WINDOW: Duration = Duration::from_secs(10 * 60);
 /// free-space figure is only a snapshot anyway.
 const FREE_SPACE_MARGIN: u64 = 64 * 1024 * 1024;
 
-/// Bounds the TCP connect + TLS handshake of a data connection. A peer
-/// behind a firewall that silently drops the SYN would otherwise hold the
-/// transfer for the OS's own connect timeout (minutes) before falling back.
-const DATA_DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long an inbound connection from a peer with a transfer under way may
 /// take to send its first message before it's dropped (see
@@ -424,6 +421,29 @@ fn create_part_file(dir: &Path, file_name: &str) -> std::io::Result<(PathBuf, st
     Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "no free file name left"))
 }
 
+/// Creates `file_name` in `dir` for an in-band transfer to write into, or
+/// `stem (n).ext` if that's taken — `create_new`, so a name another transfer
+/// or program took between the look and the create is skipped, never
+/// truncated (the old exists-check-then-`create` could).
+pub(super) fn create_unique_file(dir: &Path, file_name: &str) -> std::io::Result<(PathBuf, std::fs::File)> {
+    let stem = Path::new(file_name).file_stem().and_then(|s| s.to_str()).unwrap_or(file_name);
+    let ext = Path::new(file_name).extension().and_then(|s| s.to_str());
+    for i in 0..1000 {
+        let name = match (i, ext) {
+            (0, _) => file_name.to_string(),
+            (_, Some(ext)) => format!("{stem} ({i}).{ext}"),
+            (_, None) => format!("{stem} ({i})"),
+        };
+        let path = dir.join(&name);
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "no free file name left"))
+}
+
 /// Deletes the partial files a previous run left in `dir` — killed or
 /// crashed mid-transfer, it took what it needed to resume them with it, so
 /// they'd only ever take up space. Only Continuity's own (`PART_SUFFIX`),
@@ -706,7 +726,7 @@ pub(super) fn may_dial_data_connection(state: &SharedState, peer_id: &str) -> bo
 /// reconnect, and was dropped as "already connected" — a session that
 /// started but never showed a frame.
 pub(super) async fn route_inbound(mut conn: Connection, state: Arc<SharedState>, peer_id: String, addr: SocketAddr) {
-    let first = match tokio::time::timeout(FIRST_MESSAGE_TIMEOUT, read_message(&mut conn)).await {
+    let first = match tokio::time::timeout(FIRST_MESSAGE_TIMEOUT, read_message_up_to(&mut conn, HANDSHAKE_MAX_MESSAGE_BYTES)).await {
         Ok(Ok(message)) => message,
         Ok(Err(e)) => {
             tracing::debug!("inbound connection from {addr} closed before its first message: {e}");
@@ -723,14 +743,9 @@ pub(super) async fn route_inbound(mut conn: Connection, state: Arc<SharedState>,
     }
     let Message::FileStreamHandshake { transfer_id, offset } = first else {
         state.test_hooks.mesh_connections_read_first.fetch_add(1, Ordering::Relaxed);
-        let id_for_registry = peer_id.clone();
-        let conn_state = state.clone();
-        let join = tokio::spawn(async move {
-            if let Err(e) = handle_connection(conn, conn_state, peer_id, Some(first)).await {
-                tracing::debug!("inbound connection from {addr} ended: {e}");
-            }
-        });
-        state.connection_handles.lock().unwrap().insert(id_for_registry, join.abort_handle());
+        if let Err(e) = handle_connection(conn, &state, peer_id, Some(first), Origin::Inbound) {
+            tracing::debug!("inbound connection from {addr} not taken: {e}");
+        }
         return;
     };
 
@@ -1378,17 +1393,9 @@ async fn stream_file(state: &Arc<SharedState>, o: &Outgoing, addr: SocketAddr, o
         tokio::task::spawn_blocking(move || read_for_stream(&path, offset, size, chunks_tx))
     };
 
-    let mut conn = match tokio::time::timeout(DATA_DIAL_TIMEOUT, connect(addr, &state.tls_identity)).await {
-        Ok(Ok(conn)) => conn,
-        Ok(Err(e)) => return Err(StreamError::Dial(format!("couldn't connect to {addr}: {e}"))),
-        Err(_) => return Err(StreamError::Dial(format!("timed out connecting to {addr}"))),
-    };
-    // The address is only a cache; make sure it's still the device the
-    // file is meant for before sending it anything.
-    match conn.peer_device_id() {
-        Ok(id) if id == o.peer_id => {}
-        _ => return Err(StreamError::Dial(format!("a different device answered at {addr}"))),
-    }
+    // The address is only a cache; `dial_peer` makes sure it's still the
+    // device the file is meant for before sending it anything.
+    let mut conn = dial_peer(&state.tls_identity, &o.peer_id, addr).await.map_err(StreamError::Dial)?;
     let handshake = Message::FileStreamHandshake { transfer_id: o.transfer_id.clone(), offset };
     if let Err(e) = write_message(&mut conn, &handshake).await {
         return Err(StreamError::Dial(format!("couldn't start the data connection: {e}")));

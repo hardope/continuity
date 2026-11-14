@@ -7,6 +7,15 @@
 pub trait ClipboardBackend: Send + Sync {
     fn get_text(&self) -> Option<String>;
     fn set_text(&self, text: &str);
+    /// A value that changes whenever the clipboard's contents do, where the
+    /// platform keeps one (macOS's pasteboard change count, Windows's
+    /// clipboard sequence number) — the engine's watcher then only reads and
+    /// hashes the text when it has changed, instead of twice a second.
+    /// `None` where there's no such counter (the default), which means
+    /// "read it and see".
+    fn change_token(&self) -> Option<u64> {
+        None
+    }
 }
 
 #[cfg(feature = "arboard-clipboard")]

@@ -69,6 +69,10 @@ tao = "0.34"
 serde = { workspace = true }
 serde_json = { workspace = true }
 rand = "0.8"
+# The clipboard (clipboard_desktop.rs): the engine's own backend is arboard
+# too, but the desktop needs what it leaves out — concealed-content marks and
+# the change count — alongside it.
+arboard = "3"
 # Both power the remote-control *viewer* window (any desktop platform can
 # be the controlling side, not just macOS/Windows — those two are just
 # the only ones that can currently be the *controlled* side, which is
@@ -121,7 +125,7 @@ mac-usernotifications = "0.3.1"
 futures-lite = "2"
 futures-timer = "3"
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", features = ["NSEvent", "NSGraphicsContext", "objc2-core-graphics"] }
+objc2-app-kit = { version = "0.3", features = ["NSEvent", "NSGraphicsContext", "NSPasteboard", "objc2-core-graphics"] }
 objc2-core-graphics = "0.3"
 objc2-core-foundation = "0.3"
 objc2-foundation = "0.3"
@@ -166,6 +170,9 @@ windows = { version = "0.58", features = [
     # (control.rs), and registering Continuity's AppUserModelID so its
     # notifications are shown (main.rs).
     "Win32_System_Registry",
+    # The clipboard's sequence number and the concealed-content format
+    # (clipboard_desktop.rs).
+    "Win32_System_DataExchange",
 ] }
 
 # The Continuity window on Linux and Windows (settings_window.rs): one HTML

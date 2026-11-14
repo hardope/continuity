@@ -179,7 +179,13 @@ object ContinuityStore {
         when (event) {
             is FfiSyncEvent.PairingRequested -> _pendingPairing.value = PendingPairing(event.peer, event.code)
             is FfiSyncEvent.Paired -> log(ActivityKind.PAIRED, "Paired with '${event.peer.name}'", Tone.SUCCESS)
-            is FfiSyncEvent.PairingDeclined -> log(ActivityKind.DISCONNECTED, "Pairing with '${event.peerName}' declined", Tone.WARNING)
+            is FfiSyncEvent.PairingDeclined -> {
+                // Also the engine giving up on a request nobody answered in
+                // time: the dialog for it would otherwise stay up with a
+                // code that no longer means anything.
+                if (_pendingPairing.value?.peer?.name == event.peerName) _pendingPairing.value = null
+                log(ActivityKind.DISCONNECTED, "Pairing with '${event.peerName}' declined", Tone.WARNING)
+            }
             is FfiSyncEvent.Connected -> {
                 val peer = event.peer
                 _nearby.update { it - peer.id }

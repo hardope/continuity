@@ -106,7 +106,10 @@ import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.produceState
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -562,8 +565,16 @@ private fun RemoteControlScreen(
             val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
 
             Box(modifier = Modifier.fillMaxSize()) {
-                val bitmap = remember(frame) {
-                    frame?.let { BitmapFactory.decodeByteArray(it, 0, it.size)?.asImageBitmap() }
+                // Decoded off the main thread: a frame can arrive thirty
+                // times a second, and decoding each one in composition kept
+                // the UI thread busy with nothing else (the desktop viewer
+                // had the same freeze). A frame superseded before its decode
+                // finished is dropped; the last picture stays up meanwhile.
+                val bitmap by produceState<androidx.compose.ui.graphics.ImageBitmap?>(initialValue = null, frame) {
+                    val bytes = frame ?: return@produceState
+                    value = withContext(Dispatchers.Default) {
+                        BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
+                    }
                 }
                 var imageBounds by remember { mutableStateOf<Rect?>(null) }
                 var trackpadMode by remember { mutableStateOf(false) }

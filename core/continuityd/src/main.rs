@@ -51,12 +51,13 @@ mod screen_lock_mac;
 mod screen_lock_windows;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 mod settings_window;
+mod clipboard_desktop;
 mod control;
 mod log_file;
 mod share;
 
 use continuity_crypto::{Identity, TrustStore};
-use continuity_daemon::{ArboardClipboard, EngineCommand, EngineConfig, SyncEvent};
+use continuity_daemon::{EngineCommand, EngineConfig, SyncEvent};
 #[cfg(feature = "remote-control")]
 use continuity_proto::Platform;
 use std::collections::HashMap;
@@ -551,83 +552,7 @@ fn handle_sync_event(
 ) {
     match event {
         SyncEvent::Listening { port } => tracing::info!("listening on port {port}"),
-        SyncEvent::PairingRequested { peer, code } => {
-            // A modal `rfd::MessageDialog` is a brand-new top-level GTK
-            // window with no parent, created from a background daemon
-            // rather than in direct response to a user click — GNOME/
-            // Mutter's Wayland focus-stealing prevention can simply
-            // never present a window like that at all. Confirmed for
-            // real on a live GNOME 50/Wayland session: the dialog's own
-            // `.show()` call never returned, leaving the pairing request
-            // stuck forever with no visible prompt. A desktop
-            // notification with actions goes through the OS's own
-            // notification server instead of a raw app window,
-            // sidestepping that restriction — same approach
-            // `notify_file_received` above already uses successfully.
-            // macOS/Windows keep the plain dialog, which testing this
-            // session confirmed works fine there.
-            #[cfg(target_os = "linux")]
-            {
-                tracing::debug!("PairingRequested: showing the confirm notification for '{}' (code {code})", peer.name);
-                let peer_id = peer.id.clone();
-                let commands = commands.clone();
-                match notify_rust::Notification::new()
-                    .summary("Continuity — Pairing Request")
-                    .body(&format!(
-                        "'{}' wants to pair.\n\nConfirmation code: {code}\n\nDoes this match the code shown on the other device?",
-                        peer.name
-                    ))
-                    .action("accept", "Yes, pair")
-                    .action("decline", "No")
-                    // Critical + Never: this needs a real answer, not
-                    // something that silently vanishes after a few
-                    // seconds while the user's still reading the code.
-                    .urgency(notify_rust::Urgency::Critical)
-                    .timeout(notify_rust::Timeout::Never)
-                    .show()
-                {
-                    Ok(handle) => {
-                        std::thread::spawn(move || {
-                            let mut accepted = false;
-                            handle.wait_for_action(|action| {
-                                accepted = action == "accept" || action == "default";
-                            });
-                            tracing::debug!("PairingRequested: notification action resolved, accepted={accepted}");
-                            let _ = commands.send(EngineCommand::ConfirmPairing { peer_crypto_id: peer_id, accept: accepted });
-                        });
-                    }
-                    Err(e) => {
-                        tracing::warn!("couldn't show the pairing-confirmation notification, falling back to a dialog: {e}");
-                        let result = rfd::MessageDialog::new()
-                            .set_title("Continuity — Pairing Request")
-                            .set_description(format!(
-                                "'{}' wants to pair.\n\nConfirmation code: {code}\n\nDoes this match the code shown on the other device?",
-                                peer.name
-                            ))
-                            .set_buttons(rfd::MessageButtons::YesNo)
-                            .show();
-                        let accepted = matches!(result, rfd::MessageDialogResult::Yes);
-                        let _ = commands.send(EngineCommand::ConfirmPairing { peer_crypto_id: peer_id, accept: accepted });
-                    }
-                }
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                let result = rfd::MessageDialog::new()
-                    .set_title("Continuity — Pairing Request")
-                    .set_description(format!(
-                        "'{}' wants to pair.\n\nConfirmation code: {code}\n\nDoes this match the code shown on the other device?",
-                        peer.name
-                    ))
-                    .set_buttons(rfd::MessageButtons::YesNo)
-                    .show();
-                let accepted = matches!(result, rfd::MessageDialogResult::Yes);
-                let _ = commands.send(EngineCommand::ConfirmPairing {
-                    peer_crypto_id: peer.id,
-                    accept: accepted,
-                });
-            }
-        }
+        SyncEvent::PairingRequested { peer, code } => prompt_pairing(peer, code, commands.clone()),
         // Paired/Disconnected/ClipboardReceived are routine — they'd fire
         // constantly on an active mesh and a popup for each one is just
         // noise. Still logged for debugging, just not shown.
@@ -718,67 +643,25 @@ fn handle_sync_event(
             // No UI surface for this on desktop yet — logged for now. The
             // interesting direction is mobile displaying *this* device's
             // now-playing info, not the desktop displaying a peer's.
-            tracing::debug!("'{peer_name}' now playing: {info:?}");
+            // Not `{info:?}`: that printed the artwork, byte by byte, on every
+            // update — a few hundred kilobytes of text every second or two
+            // while a peer was playing, which is the log-flood class the
+            // size cap was added for.
+            tracing::debug!(
+                "'{peer_name}' now playing: {:?} by {:?}, {} at {}/{} ms, {} bytes of artwork",
+                info.title,
+                info.artist,
+                if info.is_playing { "playing" } else { "paused" },
+                info.position_ms,
+                info.duration_ms,
+                info.artwork.len()
+            );
         }
         // No desktop UI surface for this yet (see task #44 — Android-only
         // so far); fires once per connection per ping interval (30s), too
         // frequent to be worth a debug log line on its own.
         SyncEvent::PeerActivity { .. } => {}
-        SyncEvent::RemoteControlRequested { peer_id, peer_name, .. } => {
-            // Same shape as the pairing-request prompt above — a fresh,
-            // explicit accept every time, deliberately not a "remember
-            // this device" checkbox (see `Message::RemoteControlRequest`'s
-            // doc comment in continuity-proto) — and the same Linux/
-            // Wayland dialog-never-presented risk, since this is also
-            // triggered by a network event, not a user click. See the
-            // `PairingRequested` handler's comment for the full
-            // explanation of why Linux gets a notification instead.
-            #[cfg(target_os = "linux")]
-            {
-                let commands = commands.clone();
-                match notify_rust::Notification::new()
-                    .summary("Continuity — Remote Control Request")
-                    .body(&format!("'{peer_name}' wants to control this device's keyboard, mouse, and screen."))
-                    .action("accept", "Allow")
-                    .action("decline", "Deny")
-                    .urgency(notify_rust::Urgency::Critical)
-                    .timeout(notify_rust::Timeout::Never)
-                    .show()
-                {
-                    Ok(handle) => {
-                        std::thread::spawn(move || {
-                            let mut accept = false;
-                            handle.wait_for_action(|action| {
-                                accept = action == "accept" || action == "default";
-                            });
-                            let _ = commands.send(EngineCommand::RespondToRemoteControlRequest { peer_crypto_id: peer_id, accept });
-                        });
-                    }
-                    Err(e) => {
-                        tracing::warn!("couldn't show the remote-control-request notification, falling back to a dialog: {e}");
-                        let result = rfd::MessageDialog::new()
-                            .set_title("Continuity — Remote Control Request")
-                            .set_description(format!("'{peer_name}' wants to control this device's keyboard, mouse, and screen.\n\nAllow it?"))
-                            .set_buttons(rfd::MessageButtons::YesNo)
-                            .show();
-                        let accept = matches!(result, rfd::MessageDialogResult::Yes);
-                        let _ = commands.send(EngineCommand::RespondToRemoteControlRequest { peer_crypto_id: peer_id, accept });
-                    }
-                }
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                let result = rfd::MessageDialog::new()
-                    .set_title("Continuity — Remote Control Request")
-                    .set_description(format!(
-                        "'{peer_name}' wants to control this device's keyboard, mouse, and screen.\n\nAllow it?"
-                    ))
-                    .set_buttons(rfd::MessageButtons::YesNo)
-                    .show();
-                let accept = matches!(result, rfd::MessageDialogResult::Yes);
-                let _ = commands.send(EngineCommand::RespondToRemoteControlRequest { peer_crypto_id: peer_id, accept });
-            }
-        }
+        SyncEvent::RemoteControlRequested { peer_id, peer_name, .. } => prompt_remote_control(peer_id, peer_name, commands.clone()),
         SyncEvent::RemoteControlDeclined { peer_name, .. } => {
             notify(&format!("'{peer_name}' declined the remote control request"));
         }
@@ -858,6 +741,114 @@ fn handle_sync_event(
         // the trust store (see control.rs).
         SyncEvent::UnlockPermissionChanged { .. } => {}
     }
+}
+
+/// A yes/no question raised by something a peer sent, answered by whoever
+/// is at this computer. Never on the event loop's thread: a modal dialog
+/// there stopped everything else in the app — the viewer, the window's
+/// requests, notifications — until it was answered, and anyone on the
+/// network could raise one by connecting. Each platform gets what works
+/// there:
+///
+/// - **macOS**: a notification with buttons (`notifications_mac::prompt`).
+///   An unbundled development build can't show those, so it falls back to
+///   the dialog, on a thread of its own (AppKit runs it on the main thread
+///   anyway, so that build still blocks while it's up — the price of not
+///   being an app bundle).
+/// - **Windows**: the dialog, on a thread of its own, which is fine there.
+/// - **Linux**: a notification with buttons. GNOME's focus-stealing
+///   prevention can refuse a bare dialog from a background app outright,
+///   and rfd's GTK dialogs can't run off the main thread (they'd deadlock
+///   against tao's GTK), so the fallback dialog stays on the event loop,
+///   as a last resort when no notification server answers.
+///
+/// Dismissing the question (closing the notification, Clear All) counts as
+/// no: nothing is paired or allowed without an explicit yes.
+fn ask(title: String, body: String, yes: &'static str, no: &'static str, on_answer: impl FnOnce(bool) + Send + 'static) {
+    #[cfg(target_os = "macos")]
+    {
+        let (dialog_title, dialog_body) = (title.clone(), body.clone());
+        notifications_mac::prompt(&title, &body, &[("yes", yes), ("no", no)], move |outcome| match outcome {
+            notifications_mac::PromptOutcome::Clicked(action) => on_answer(action == "yes"),
+            notifications_mac::PromptOutcome::Dismissed => on_answer(false),
+            notifications_mac::PromptOutcome::Unavailable(why) => {
+                tracing::debug!("couldn't ask with a notification ({why}) — asking with a dialog");
+                on_answer(dialog_answer(&dialog_title, &dialog_body));
+            }
+        });
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::thread::spawn(move || on_answer(dialog_answer(&title, &body)));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        match notification()
+            .summary(&title)
+            // GNOME's notification server renders markup in bodies; a device
+            // name is the peer's to choose.
+            .body(&escape_markup(&body))
+            .action("yes", yes)
+            .action("no", no)
+            // Critical + Never: this needs a real answer, not something that
+            // silently vanishes after a few seconds while the user's still
+            // reading the code.
+            .urgency(notify_rust::Urgency::Critical)
+            .timeout(notify_rust::Timeout::Never)
+            .show()
+        {
+            Ok(handle) => {
+                std::thread::spawn(move || {
+                    let mut accepted = false;
+                    handle.wait_for_action(|action| {
+                        accepted = action == "yes" || action == "default";
+                    });
+                    on_answer(accepted);
+                });
+            }
+            Err(e) => {
+                tracing::warn!("couldn't show the question as a notification, falling back to a dialog: {e}");
+                on_answer(dialog_answer(&title, &body));
+            }
+        }
+    }
+}
+
+/// The dialog form of `ask`: yes or no, blocking the calling thread.
+fn dialog_answer(title: &str, body: &str) -> bool {
+    let result = rfd::MessageDialog::new().set_title(title).set_description(body).set_buttons(rfd::MessageButtons::YesNo).show();
+    matches!(result, rfd::MessageDialogResult::Yes)
+}
+
+/// `&`, `<` and `>` as entities, for a notification body a server may read
+/// as markup — GNOME's does.
+#[cfg(target_os = "linux")]
+fn escape_markup(text: &str) -> String {
+    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+fn prompt_pairing(peer: continuity_proto::DeviceInfo, code: String, commands: tokio::sync::mpsc::UnboundedSender<EngineCommand>) {
+    tracing::debug!("PairingRequested: asking about '{}' (code {code})", peer.name);
+    // Grouped in pairs, like the Android app shows it: a solid run of six
+    // digits is easy to skim-match instead of actually comparing.
+    let grouped: Vec<String> = code.chars().collect::<Vec<_>>().chunks(2).map(|pair| pair.iter().collect()).collect();
+    let body = format!(
+        "'{}' wants to pair. Confirmation code: {}. Pair only if every digit matches the code shown on that device.",
+        peer.name,
+        grouped.join(" ")
+    );
+    let peer_id = peer.id;
+    ask("Continuity — Pairing Request".to_string(), body, "Yes, pair", "No", move |accept| {
+        tracing::debug!("PairingRequested: answered accept={accept}");
+        let _ = commands.send(EngineCommand::ConfirmPairing { peer_crypto_id: peer_id, accept });
+    });
+}
+
+fn prompt_remote_control(peer_id: String, peer_name: String, commands: tokio::sync::mpsc::UnboundedSender<EngineCommand>) {
+    let body = format!("'{peer_name}' wants to control this device's keyboard, mouse, and screen. Allow it?");
+    ask("Continuity — Remote Control Request".to_string(), body, "Allow", "Deny", move |accept| {
+        let _ = commands.send(EngineCommand::RespondToRemoteControlRequest { peer_crypto_id: peer_id, accept });
+    });
 }
 
 /// A size the way people read it — "1.3 GB", "820 KB" — in the same
@@ -1233,6 +1224,8 @@ fn notify(body: &str) {
     tracing::info!("{body}");
     #[cfg(target_os = "macos")]
     notifications_mac::show("Continuity", body);
+    #[cfg(target_os = "linux")]
+    let body = &escape_markup(body);
     #[cfg(not(target_os = "macos"))]
     if let Err(e) = notification().summary("Continuity").body(body).show() {
         tracing::debug!("notification not shown (expected for an unbundled binary): {e}");
@@ -1252,6 +1245,8 @@ fn notify_file_received(file_name: &str, from: Option<&str>, path: &str) {
         Some(from) => format!("Received '{file_name}' from '{from}'"),
         None => format!("Received '{file_name}'"),
     };
+    #[cfg(target_os = "linux")]
+    let body = escape_markup(&body);
     let path = path.to_string();
     let on_action = move |action: &str| match action {
         "default" => {
@@ -1396,7 +1391,7 @@ fn start_engine_thread(
                     identity,
                     device_name,
                     trust_store,
-                    clipboard: Arc::new(ArboardClipboard),
+                    clipboard: Arc::new(clipboard_desktop::DesktopClipboard),
                     media,
                     remote_control,
                     screen_lock,

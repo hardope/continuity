@@ -459,7 +459,7 @@ async fn a_screen_stream_arriving_after_a_data_connection_still_delivers_frames(
     let tls = continuity_crypto::generate_self_signed(&b_identity).unwrap();
     let mut mesh = continuity_net::connect(addr, &tls).await.unwrap();
     let b_device = DeviceInfo { id: b_id.clone(), name: "HandB".into(), platform: Platform::Linux, protocol_version: 3 };
-    continuity_net::announce_and_identify(&mut mesh, &b_device).await.unwrap();
+    continuity_net::announce_and_identify(&mut mesh, &b_device, true).await.unwrap();
 
     // Next message on the mesh connection other than background chatter.
     async fn next(mesh: &mut continuity_net::Connection) -> Message {

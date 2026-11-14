@@ -1,8 +1,10 @@
 package app.continuity.android
 
 import android.content.ClipData
+import android.content.ClipDescription
 import android.content.ClipboardManager
 import android.content.Context
+import android.os.Build
 import uniffi.continuity_ffi.ClipboardProvider
 
 /**
@@ -33,6 +35,13 @@ class AndroidClipboardProvider(private val context: Context) : ClipboardProvider
         return try {
             val clip = clipboardManager.primaryClip ?: return null
             if (clip.itemCount == 0) return null
+            // A password manager marks what it copies as sensitive (Android
+            // 13+); that's for this phone's paste, not for every device.
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                clip.description.extras?.getBoolean(ClipDescription.EXTRA_IS_SENSITIVE, false) == true
+            ) {
+                return null
+            }
             clip.getItemAt(0).coerceToText(context)?.toString()
         } catch (e: Exception) {
             null

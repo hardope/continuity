@@ -34,6 +34,22 @@ pub async fn write_message<W: AsyncWrite + Unpin>(
 }
 
 pub async fn read_message<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Message, FramingError> {
+    read_message_up_to(reader, MAX_MESSAGE_BYTES).await
+}
+
+/// The most a message may be before the peer has been identified and found
+/// trusted: a `DeviceAnnounce`, the pairing messages and the data- and
+/// screen-stream handshakes are all well under a kilobyte. **Real bug fixed
+/// here**: every read allowed `MAX_MESSAGE_BYTES`, so anyone on the network
+/// could open a connection, announce a 64 MiB message and have this device
+/// allocate for it, as many times over as it liked, with no pairing.
+pub const HANDSHAKE_MAX_MESSAGE_BYTES: u32 = 64 * 1024;
+
+/// `read_message` with a smaller bound than the general one, for a stream
+/// whose next message is known to be small (see `HANDSHAKE_MAX_MESSAGE_BYTES`)
+/// — a longer one is refused from its length prefix, before anything is
+/// allocated for it.
+pub async fn read_message_up_to<R: AsyncRead + Unpin>(reader: &mut R, max_bytes: u32) -> Result<Message, FramingError> {
     let mut len_buf = [0u8; 4];
     match reader.read_exact(&mut len_buf).await {
         Ok(_) => {}
@@ -41,7 +57,7 @@ pub async fn read_message<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Messag
         Err(e) => return Err(e.into()),
     }
     let len = u32::from_be_bytes(len_buf);
-    if len > MAX_MESSAGE_BYTES {
+    if len > max_bytes.min(MAX_MESSAGE_BYTES) {
         return Err(FramingError::TooLarge(len));
     }
     let mut payload = vec![0u8; len as usize];
@@ -175,6 +191,22 @@ mod tests {
         assert!(read_frame(&mut b).await.unwrap().is_empty());
         assert!(matches!(read_message(&mut b).await.unwrap(), Message::FileComplete { .. }));
         writer.await.unwrap();
+    }
+
+    /// A message over the handshake bound is refused from its length prefix
+    /// alone — nothing is read or allocated for it.
+    #[tokio::test]
+    async fn an_oversized_handshake_message_is_refused_from_its_length() {
+        let (mut a, mut b) = tokio::io::duplex(4096);
+        write_message(&mut a, &Message::Ping).await.unwrap();
+        assert!(matches!(read_message_up_to(&mut b, HANDSHAKE_MAX_MESSAGE_BYTES).await.unwrap(), Message::Ping));
+
+        let claimed = HANDSHAKE_MAX_MESSAGE_BYTES + 1;
+        a.write_all(&claimed.to_be_bytes()).await.unwrap();
+        assert!(matches!(
+            read_message_up_to(&mut b, HANDSHAKE_MAX_MESSAGE_BYTES).await.unwrap_err(),
+            FramingError::TooLarge(len) if len == claimed
+        ));
     }
 
     #[tokio::test]

@@ -479,9 +479,7 @@ impl ContinuityEngine {
                 Ok(mut engine) => {
                     tracing::debug!("engine setup complete, forwarding events to host listener");
                     let _ = ready_tx.send(Ok(engine.command_sender()));
-                    while let Some(event) = engine.events.recv().await {
-                        listener.on_event(event.into());
-                    }
+                    forward_events(&mut engine.events, listener.as_ref()).await;
                     tracing::warn!("event forwarding loop ended (engine event channel closed)");
                 }
                 Err(e) => {
@@ -651,6 +649,44 @@ impl ContinuityEngine {
     /// clipboard update on the wire).
     pub fn send_text(&self, peer_id: String, text: String) {
         let _ = self.commands.send(EngineCommand::SendText { peer_crypto_id: peer_id, text });
+    }
+}
+
+/// Hands every engine event to the host, one at a time (`on_event` is a
+/// synchronous call into Kotlin/Swift). Screen frames are the exception:
+/// of the frames queued at any moment only the newest is handed over, since
+/// the host can't show the older ones any more. **Real bug fixed here**: a
+/// frame arrives up to thirty times a second and each was handed over in
+/// turn, so a host that decoded them more slowly than that fell further
+/// behind with every frame, the picture lagging more and more, with the
+/// queue — and the memory for it — growing without bound.
+async fn forward_events(
+    events: &mut tokio::sync::mpsc::UnboundedReceiver<continuity_daemon::SyncEvent>,
+    listener: &dyn EventListener,
+) {
+    use continuity_daemon::SyncEvent;
+    while let Some(event) = events.recv().await {
+        let mut pending_frame = None;
+        let deliver = |event: SyncEvent, pending_frame: &mut Option<SyncEvent>| {
+            if matches!(event, SyncEvent::ScreenFrameReceived { .. }) {
+                // Replaces an older frame nobody has seen yet.
+                *pending_frame = Some(event);
+            } else {
+                if let Some(frame) = pending_frame.take() {
+                    listener.on_event(frame.into());
+                }
+                listener.on_event(event.into());
+            }
+        };
+        deliver(event, &mut pending_frame);
+        // Whatever else is already waiting, before any of it has to wait
+        // for the host to come back from the first.
+        while let Ok(next) = events.try_recv() {
+            deliver(next, &mut pending_frame);
+        }
+        if let Some(frame) = pending_frame {
+            listener.on_event(frame.into());
+        }
     }
 }
 

@@ -11,9 +11,13 @@ mod pairing;
 
 pub use connection::{connect, Connection, ConnectionError, Incoming, Listener};
 pub use discovery::{peer_from_service_info, DiscoveredPeer, Discovery, DiscoveryError, SERVICE_TYPE};
-pub use framing::{read_frame, read_frame_up_to, read_message, write_frame, write_frame_unflushed, write_message, FramingError};
+pub use framing::{
+    read_frame, read_frame_up_to, read_message, read_message_up_to, write_frame, write_frame_unflushed, write_message, FramingError,
+    HANDSHAKE_MAX_MESSAGE_BYTES,
+};
 pub use pairing::{
-    announce_and_identify, announce_and_identify_after, start_pairing, start_pairing_after, PairingError, PendingPairing,
+    announce_and_identify, announce_and_identify_after, start_pairing, Announcement, PairingError, PendingPairing,
+    COMMITTED_PAIRING_VERSION,
 };
 
 // Re-exported so downstream crates don't need a direct `mdns-sd` dependency
