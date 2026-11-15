@@ -99,6 +99,23 @@ fn platform_str(platform: Platform) -> &'static str {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_record_with_only_a_link_local_ipv6_address_has_no_address_yet() {
+        let make = |addrs: &[&str]| {
+            let props = [("id", "abc"), ("name", "A"), ("platform", "linux"), ("protocol_version", "4")];
+            let info = ServiceInfo::new(SERVICE_TYPE, "abc", "abc.local.", addrs.join(","), 1234, &props[..]).unwrap();
+            peer_from_service_info(&info).map(|p| p.addr.ip())
+        };
+        assert_eq!(make(&["fe80::1"]), None, "link-local only: wait for a better resolve");
+        assert_eq!(make(&["fe80::1", "192.168.1.5"]).map(|a| a.to_string()), Some("192.168.1.5".to_string()));
+        assert_eq!(make(&["fe80::1", "2001:db8::5"]).map(|a| a.to_string()), Some("2001:db8::5".to_string()), "a routable IPv6 address is fine");
+    }
+}
+
 fn platform_from_str(s: &str) -> Option<Platform> {
     match s {
         "mac_os" => Some(Platform::MacOs),
@@ -126,12 +143,16 @@ pub fn peer_from_service_info(info: &ServiceInfo) -> Option<DiscoveredPeer> {
     // those fails outright ("no route to host"), and plain `.next()` could
     // land on either. Prefer IPv4 (always safely dialable on the LAN);
     // fall back to whatever's there for IPv6-only networks.
-    let addr = info
-        .get_addresses()
-        .iter()
-        .find(|a| a.is_ipv4())
-        .or_else(|| info.get_addresses().iter().next())
-        .copied()?;
+    // A link-local IPv6 address (`fe80::/10`) is never dialable from here
+    // — without a scope id `connect` fails with "invalid argument" (it did,
+    // on CI) — so a record that resolved only to those has no address yet:
+    // mdns-sd delivers the IPv4 one in a later event.
+    let addresses = info.get_addresses();
+    let dialable = |a: &&std::net::IpAddr| match a {
+        std::net::IpAddr::V4(_) => true,
+        std::net::IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) != 0xfe80,
+    };
+    let addr = addresses.iter().filter(dialable).find(|a| a.is_ipv4()).or_else(|| addresses.iter().find(dialable)).copied()?;
     let port = info.get_port();
 
     Some(DiscoveredPeer {

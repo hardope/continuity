@@ -2,6 +2,66 @@
 
 All notable user-facing changes to Continuity are documented here.
 
+## [0.1.8] - 2026-11-15
+
+### Added
+
+- **Use one keyboard and mouse across two computers.** On a Mac, place a
+  paired computer at an edge of your screen (its page in the Continuity
+  window → Keyboard and Mouse). Move the cursor off that edge and it appears
+  on the other computer, which your mouse and keyboard now drive — no window,
+  no picture of its screen, and no screen-recording permission there. Move it
+  back off the facing edge to return, or double-tap Control to come back at
+  once from anywhere. Works with a Mac, Windows PC or Linux computer on the
+  other side (a Linux computer asks once to allow remote input, with no
+  screen sharing). The Mac whose mouse crosses over needs the Accessibility
+  and Input Monitoring permissions, and says so if one is missing. Windows
+  and Linux can't yet be the computer whose mouse crosses over.
+
+### Fixed
+
+
+- **Security: a device on your network could pass itself off as one of your
+  paired devices.** Continuity found paired devices by the id in their
+  network announcement, which anyone can forge, and didn't check that the
+  device that answered really was the one it meant to reach. Now every
+  connection Continuity makes checks the other device's certificate against
+  the device it was for, and drops it otherwise.
+- **Security: the pairing code is now safe against an attacker in the
+  middle.** It was derived from the two devices' public keys alone, which an
+  attacker could work around offline. Between devices on this version, each
+  pairing uses fresh random values that both sides commit to first, so the
+  code is different every time and can't be steered. Older devices pair the
+  old way until updated.
+- Devices that aren't paired can no longer hold unlimited connections and
+  pairing prompts open: a few at a time, each for a bounded time, and a
+  pairing request nobody answers in three minutes is declined.
+- Pairing and remote-control prompts no longer freeze the rest of Continuity
+  on macOS and Windows while they're on screen. On macOS they're
+  notifications with buttons.
+- Text copied from a password manager (marked concealed on macOS, Windows
+  and Android 13+) stays on the device it was copied on. Clipboard text over
+  4 MB isn't synced. On Windows, text received from another device is kept
+  out of the cloud clipboard.
+- **Forget no longer loops.** A device that had been forgotten kept
+  reconnecting to the device that forgot it, which showed a pairing prompt
+  every few minutes. The forgotten device now learns at once and waits until
+  you ask to connect again, on either device, which pairs the two afresh.
+- Disconnect, Forget and Reset now reliably close the connection, and stop a
+  connection that was still being made.
+- A device that moved to another network no longer makes Connect do nothing
+  for minutes: connections time out after ten seconds.
+- With syncing paused, a file offer is turned down with a reason instead of
+  being accepted and then never arriving.
+- Now-playing updates send the album artwork once per track instead of with
+  every update, and the log no longer records the artwork.
+- The Continuity app on Android no longer stutters during remote control:
+  frames are decoded off the screen thread, and only the latest frame waiting
+  is shown.
+- A remote-control session could fail to show the screen when the other
+  device's network announcement listed only a link-local IPv6 address;
+  Continuity now waits for an address it can actually reach.
+
 ## [0.1.8-beta.3] - 2026-11-15
 
 ### Fixed
