@@ -57,6 +57,14 @@ use tokio::sync::mpsc::UnboundedSender;
 /// bring the mouse and keyboard back to this Mac.
 const ESCAPE_DOUBLE_TAP: Duration = Duration::from_millis(400);
 
+/// How far in from the edge the cursor is put when it comes back — past
+/// the edge check's one pixel, so standing there isn't already crossing.
+const RETURN_INSET: f64 = 4.0;
+
+/// After the cursor comes back, how long a move at the edge is left alone
+/// — the moves of the gesture that brought it back are still arriving.
+const RECROSS_HOLDOFF: Duration = Duration::from_millis(300);
+
 /// Told when the mouse crosses over or comes back, or a session that it
 /// was over at ends (for the window's status). Never from `set_placements`,
 /// which the event loop calls in response to this.
@@ -94,6 +102,10 @@ struct State {
     /// Whether the event tap is running (made once there's something to
     /// watch for, and the permission for it).
     tap_running: bool,
+    /// When the cursor last came back (see `RECROSS_HOLDOFF`).
+    released_at: Option<Instant>,
+    /// Whether the person here has been told the tap couldn't be made.
+    warned_no_tap: bool,
 }
 
 struct Shared {
@@ -166,6 +178,10 @@ impl InputShare {
                 if state.placements.contains_key(&peer.id) && !state.sessions.contains_key(&peer.id) {
                     let _ = shared.commands.send(EngineCommand::RequestRemoteControl { peer_crypto_id: peer.id.clone(), screen: false });
                 }
+                // The permission may have been granted since the tap was
+                // last tried; a connection is a good moment to try again.
+                drop(state);
+                self.ensure_tap();
             }
             SyncEvent::Disconnected { peer_id, .. } | SyncEvent::WasRevoked { peer_id, .. } | SyncEvent::RevokedByPeer { peer_id, .. } => {
                 state.platforms.remove(peer_id);
@@ -231,6 +247,12 @@ impl InputShare {
             }
         }
         crate::media_mac::ensure_accessibility_trust();
+        // Since macOS 10.15 a tap that sees keyboard events also needs Input
+        // Monitoring; this is the call that asks for it (the system's own
+        // prompt the first time) and lists Continuity under it.
+        if !objc2_core_graphics::CGPreflightListenEventAccess() {
+            objc2_core_graphics::CGRequestListenEventAccess();
+        }
         let shared = self.shared.clone();
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let spawned = std::thread::Builder::new().name("input-share".to_string()).spawn(move || run_tap(shared, started_tx));
@@ -240,9 +262,17 @@ impl InputShare {
         }
         match started_rx.recv() {
             Ok(true) => self.shared.state.lock().unwrap().tap_running = true,
-            _ => tracing::warn!(
-                "couldn't watch the mouse for keyboard-and-mouse sharing — Continuity needs the Accessibility permission (System Settings > Privacy & Security > Accessibility)"
-            ),
+            _ => {
+                tracing::warn!(
+                    "couldn't watch the mouse for keyboard-and-mouse sharing — Continuity needs the Accessibility permission (System Settings > Privacy & Security > Accessibility)"
+                );
+                let mut state = self.shared.state.lock().unwrap();
+                if !state.warned_no_tap {
+                    state.warned_no_tap = true;
+                    drop(state);
+                    crate::notify("Keyboard and mouse sharing needs the Accessibility and Input Monitoring permissions. Grant both in System Settings > Privacy & Security; Continuity tries again when a device connects.");
+                }
+            }
         }
     }
 }
@@ -331,7 +361,9 @@ fn handle_event(shared: &Shared, kind: CGEventType, event: &CGEvent) -> bool {
     if state.grab.is_none() {
         if matches!(kind, CGEventType::MouseMoved | CGEventType::LeftMouseDragged | CGEventType::RightMouseDragged | CGEventType::OtherMouseDragged) {
             let location = CGEvent::location(Some(event));
-            if let Some(peer_id) = crossing(&state, location) {
+            let dx = CGEvent::integer_value_field(Some(event), CGEventField::MouseEventDeltaX) as f64;
+            let dy = CGEvent::integer_value_field(Some(event), CGEventField::MouseEventDeltaY) as f64;
+            if let Some(peer_id) = crossing(&state, location, (dx, dy)) {
                 grab(&mut state, &shared.commands, peer_id, location);
                 drop(state);
                 (shared.on_change)();
@@ -435,10 +467,27 @@ fn modifier_change(code: i64, flags: CGEventFlags) -> Option<(KeyCode, bool)> {
 }
 
 /// The peer the cursor at `location` has just crossed onto, if any: at a
-/// placed edge of the main display, with a session up for the computer
-/// placed there.
-fn crossing(state: &State, location: CGPoint) -> Option<String> {
+/// placed edge of the main display, moving *outward* through it (`delta`,
+/// the move that got it there), with a session up for the computer placed
+/// there — and not within `RECROSS_HOLDOFF` of coming back. **Real bug
+/// fixed here**: the cursor came back one pixel inside the edge, which the
+/// edge check counts as at it, so the first movement after returning
+/// crossed straight over again — the mouse was trapped on the other
+/// computer, and only the escape chord brought it home.
+fn crossing(state: &State, location: CGPoint, delta: (f64, f64)) -> Option<String> {
+    if state.released_at.is_some_and(|at| at.elapsed() < RECROSS_HOLDOFF) {
+        return None;
+    }
     let (edge, _) = edge_of(location, main_bounds())?;
+    let outward = match edge {
+        ScreenEdge::Left => delta.0 < 0.0,
+        ScreenEdge::Right => delta.0 > 0.0,
+        ScreenEdge::Top => delta.1 < 0.0,
+        ScreenEdge::Bottom => delta.1 > 0.0,
+    };
+    if !outward {
+        return None;
+    }
     state.placements.iter().find(|(peer_id, placed)| **placed == edge && state.sessions.contains_key(*peer_id)).map(|(peer_id, _)| peer_id.clone())
 }
 
@@ -447,16 +496,17 @@ fn main_bounds() -> CGRect {
 }
 
 /// The point `position` (0.0..=1.0) of the way along `edge` of `bounds`,
-/// one pixel in.
+/// `RETURN_INSET` in — clear of the edge check, so a cursor put there isn't
+/// at the edge until it's moved there again.
 fn point_on_edge(bounds: CGRect, edge: ScreenEdge, position: f64) -> CGPoint {
     let (left, top) = (bounds.origin.x, bounds.origin.y);
     let (right, bottom) = (left + bounds.size.width - 1.0, top + bounds.size.height - 1.0);
     let position = position.clamp(0.0, 1.0);
     match edge {
-        ScreenEdge::Left => CGPoint { x: left + 1.0, y: top + position * (bottom - top) },
-        ScreenEdge::Right => CGPoint { x: right - 1.0, y: top + position * (bottom - top) },
-        ScreenEdge::Top => CGPoint { x: left + position * (right - left), y: top + 1.0 },
-        ScreenEdge::Bottom => CGPoint { x: left + position * (right - left), y: bottom - 1.0 },
+        ScreenEdge::Left => CGPoint { x: left + RETURN_INSET, y: top + position * (bottom - top) },
+        ScreenEdge::Right => CGPoint { x: right - RETURN_INSET, y: top + position * (bottom - top) },
+        ScreenEdge::Top => CGPoint { x: left + position * (right - left), y: top + RETURN_INSET },
+        ScreenEdge::Bottom => CGPoint { x: left + position * (right - left), y: bottom - RETURN_INSET },
     }
 }
 
@@ -552,6 +602,7 @@ fn release(state: &mut State, commands: &UnboundedSender<EngineCommand>, at: Opt
     CGAssociateMouseAndMouseCursorPosition(true);
     CGWarpMouseCursorPosition(at.unwrap_or(grabbed.left_at));
     CGDisplayShowCursor(CGMainDisplayID());
+    state.released_at = Some(Instant::now());
     tracing::info!("keyboard and mouse are back on this Mac");
 }
 
@@ -615,16 +666,16 @@ mod tests {
     }
 
     #[test]
-    fn the_point_on_an_edge_is_one_pixel_in() {
+    fn the_cursor_comes_back_clear_of_the_edge() {
         let bounds = CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: CGSize { width: 1920.0, height: 1080.0 } };
         let p = point_on_edge(bounds, ScreenEdge::Right, 0.5);
-        assert_eq!((p.x, p.y), (1918.0, 539.5));
+        assert_eq!((p.x, p.y), (1915.0, 539.5));
         let p = point_on_edge(bounds, ScreenEdge::Top, 0.0);
-        assert_eq!((p.x, p.y), (0.0, 1.0));
-        // Round trip with `edge_of`: a point put on an edge is at that edge.
+        assert_eq!((p.x, p.y), (0.0, 4.0));
+        // Where it lands is *not* at the edge, or it would cross straight back.
         for edge in [ScreenEdge::Left, ScreenEdge::Right, ScreenEdge::Top, ScreenEdge::Bottom] {
             let p = point_on_edge(bounds, edge, 0.3);
-            assert_eq!(edge_of(p, bounds).map(|(e, _)| e), Some(edge), "{edge:?}");
+            assert_eq!(edge_of(p, bounds), None, "{edge:?}");
         }
     }
 
@@ -645,12 +696,17 @@ mod tests {
         state.placements.insert("pc".into(), ScreenEdge::Right);
         let bounds = main_bounds();
         let right = CGPoint { x: bounds.origin.x + bounds.size.width - 1.0, y: bounds.origin.y + 10.0 };
-        assert_eq!(crossing(&state, right), None, "placed, but no session yet");
+        assert_eq!(crossing(&state, right, (3.0, 0.0)), None, "placed, but no session yet");
         state.sessions.insert("pc".into(), Target { name: "PC".into(), platform: Platform::Windows, screen_size: None });
-        assert_eq!(crossing(&state, right), Some("pc".to_string()));
+        let outward = (3.0, 0.0);
+        assert_eq!(crossing(&state, right, outward), Some("pc".to_string()));
+        assert_eq!(crossing(&state, right, (-3.0, 0.0)), None, "moving away from the edge isn't crossing");
+        assert_eq!(crossing(&state, right, (0.0, 5.0)), None, "nor moving along it");
         let middle = CGPoint { x: bounds.origin.x + bounds.size.width / 2.0, y: bounds.origin.y + bounds.size.height / 2.0 };
-        assert_eq!(crossing(&state, middle), None);
+        assert_eq!(crossing(&state, middle, outward), None);
         let left = CGPoint { x: bounds.origin.x, y: bounds.origin.y + 10.0 };
-        assert_eq!(crossing(&state, left), None, "nothing placed there");
+        assert_eq!(crossing(&state, left, (-3.0, 0.0)), None, "nothing placed there");
+        state.released_at = Some(Instant::now());
+        assert_eq!(crossing(&state, right, outward), None, "just came back: not again yet");
     }
 }

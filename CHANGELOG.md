@@ -2,6 +2,17 @@
 
 All notable user-facing changes to Continuity are documented here.
 
+## [0.1.8-beta.3] - 2026-11-15
+
+### Fixed
+
+- **Keyboard and mouse sharing: the mouse no longer gets trapped on the
+  other computer.** Moving back off its facing edge brings the cursor home,
+  as intended, instead of crossing straight over again.
+- Keyboard and mouse sharing asks for the Input Monitoring permission it
+  also needs on macOS, tries again whenever a device connects, and says so
+  when it can't watch the mouse.
+
 ## [0.1.8-beta.2] - 2026-11-14
 
 ### Added
