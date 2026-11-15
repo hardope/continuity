@@ -194,6 +194,18 @@ impl MockRemoteDesktop {
         Ok(())
     }
 
+    async fn notify_pointer_motion(
+        &self,
+        session: OwnedObjectPath,
+        _options: HashMap<String, OwnedValue>,
+        dx: f64,
+        dy: f64,
+    ) -> zbus::fdo::Result<()> {
+        self.0.check_session(&session)?;
+        self.0.record.lock().unwrap().input.push(format!("move {dx} {dy}"));
+        Ok(())
+    }
+
     async fn notify_keyboard_keycode(
         &self,
         session: OwnedObjectPath,
@@ -346,10 +358,31 @@ async fn negotiation_completes_with_handle_tokens_on_every_request() {
 async fn frames_for_a_desktop_viewer_leave_the_pointer_out() {
     let (client, _server, shared) = start_mock(StartBehavior::Approve, false, true).await;
     let (_stop_tx, stop) = watch::channel(false);
-    negotiate_with(client, None, false, &stop, Duration::from_secs(5)).await.expect("negotiates");
+    negotiate_with(client, None, false, true, &stop, Duration::from_secs(5)).await.expect("negotiates");
     let record = shared.record.lock().unwrap();
     let sources = &record.calls[2].1;
     assert!(sources.get("cursor_mode").is_none(), "{sources:?}");
+}
+
+/// Keyboard-and-mouse sharing: a RemoteDesktop session with no screen
+/// source at all — `SelectSources` is never called, no PipeWire remote is
+/// opened, and the session still carries input.
+#[tokio::test]
+async fn an_input_only_session_asks_for_no_screen() {
+    let (client, _server, shared) = start_mock(StartBehavior::Approve, false, true).await;
+    let (_stop_tx, stop) = watch::channel(false);
+    let negotiated = negotiate_with(client, None, false, false, &stop, Duration::from_secs(5)).await.expect("negotiates");
+    assert!(negotiated.pipewire_fd.is_none());
+    assert_eq!(negotiated.session.node_id, 0);
+    {
+        let record = shared.record.lock().unwrap();
+        let steps: Vec<&str> = record.calls.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(steps, ["CreateSession", "SelectDevices", "Start"], "{steps:?}");
+    }
+    negotiated.session.notify_pointer_motion(5.0, -3.0).await.unwrap();
+    negotiated.session.notify_keyboard_keycode(30, true).await.unwrap();
+    let record = shared.record.lock().unwrap();
+    assert_eq!(record.input.len(), 2, "{:?}", record.input);
 }
 
 #[tokio::test]

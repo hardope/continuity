@@ -57,7 +57,9 @@ use tokio::sync::mpsc::UnboundedSender;
 /// bring the mouse and keyboard back to this Mac.
 const ESCAPE_DOUBLE_TAP: Duration = Duration::from_millis(400);
 
-/// Told when the sharing state changes (for the window's status).
+/// Told when the mouse crosses over or comes back, or a session that it
+/// was over at ends (for the window's status). Never from `set_placements`,
+/// which the event loop calls in response to this.
 pub type OnChange = Arc<dyn Fn() + Send + Sync>;
 
 /// What's known about a computer placed at an edge, once its session is up.
@@ -145,7 +147,12 @@ impl InputShare {
             let _ = self.shared.commands.send(EngineCommand::EndRemoteControlSession { peer_crypto_id: peer_id });
         }
         self.ensure_tap();
-        (self.shared.on_change)();
+        // Deliberately no `on_change` here: the event loop calls this *from*
+        // its handler for that very change, so one would feed the other
+        // forever. **Real bug fixed here**: it did, and the first build with
+        // this feature spun its event loop at full CPU from the moment it
+        // started, the tray dead. `on_change` is for the mouse crossing over
+        // and coming back, which nothing else reports.
     }
 
     /// Follows the engine: sessions coming and going, the pointer over
