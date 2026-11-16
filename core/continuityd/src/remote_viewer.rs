@@ -1099,12 +1099,21 @@ fn is_fullscreen_shortcut(key: KeyCode, modifiers: ModifiersState, mac: bool) ->
 /// what `remote_control_linux.rs`'s `NotifyKeyboardKeycode` expects).
 /// `None` for keys outside `KEY_CODES` and for Android/iOS, which can't be
 /// controlled.
-/// The physical key a macOS virtual key code (`kVK_*`, what an event tap
-/// reports) stands for — the reverse of `native_key_code` for this Mac's
-/// own keyboard, for forwarding it (keyboard-and-mouse sharing).
-#[cfg(target_os = "macos")]
-pub(crate) fn key_from_mac_code(code: u16) -> Option<KeyCode> {
-    KEY_CODES.iter().find(|row| row.1 == Some(code)).map(|row| row.0)
+/// The physical key a native code of `platform` stands for — the reverse
+/// of `native_key_code`, for forwarding this computer's own keyboard
+/// (keyboard-and-mouse sharing): a macOS `kVK_*` code from an event tap, a
+/// Windows `VK_*` code from a low-level keyboard hook (which reports the
+/// left/right modifier codes this table uses), a Linux evdev code from
+/// libei. No code appears twice in a column but one: Windows' VK_RETURN is
+/// both Enter and Numpad Enter, answered here as Enter.
+pub(crate) fn key_from_native_code(code: u16, platform: Platform) -> Option<KeyCode> {
+    let column = |row: &(KeyCode, Option<u16>, Option<u16>, Option<u16>)| match platform {
+        Platform::MacOs => row.1,
+        Platform::Windows => row.2,
+        Platform::Linux => row.3,
+        Platform::Android | Platform::Ios => None,
+    };
+    KEY_CODES.iter().find(|row| column(row) == Some(code)).map(|row| row.0)
 }
 
 fn native_key_code(key: KeyCode, platform: Platform) -> Option<u16> {
@@ -1244,6 +1253,27 @@ const KEY_CODES: &[(KeyCode, Option<u16>, Option<u16>, Option<u16>)] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_platforms_native_codes_map_back_to_their_keys() {
+        for &(key, mac, windows, linux) in KEY_CODES {
+            for (code, platform) in [(mac, Platform::MacOs), (windows, Platform::Windows), (linux, Platform::Linux)] {
+                // Windows gives Enter and Numpad Enter the one VK_RETURN; a
+                // low-level hook tells them apart by its extended flag (see
+                // input_share/windows.rs), so the lookup answers Enter.
+                if key == KeyCode::NumpadEnter && platform == Platform::Windows {
+                    continue;
+                }
+                if let Some(code) = code {
+                    assert_eq!(key_from_native_code(code, platform), Some(key), "{key:?} on {platform:?}");
+                }
+            }
+        }
+        assert_eq!(key_from_native_code(0xA2, Platform::Windows), Some(KeyCode::ControlLeft), "a low-level hook's VK_LCONTROL");
+        assert_eq!(key_from_native_code(29, Platform::Linux), Some(KeyCode::ControlLeft), "evdev KEY_LEFTCTRL");
+        assert_eq!(key_from_native_code(0x3B, Platform::MacOs), Some(KeyCode::ControlLeft));
+        assert_eq!(key_from_native_code(30, Platform::Android), None);
+    }
 
     const DESKTOPS: [Platform; 3] = [Platform::MacOs, Platform::Windows, Platform::Linux];
 

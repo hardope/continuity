@@ -517,9 +517,9 @@ impl ControlState {
     }
 
     /// Whether this computer can share its keyboard and mouse at all —
-    /// the controlling side exists on macOS with the remote-control feature.
+    /// every desktop with the remote-control feature (see input_share/).
     pub fn can_share_input() -> bool {
-        cfg!(all(target_os = "macos", feature = "remote-control"))
+        cfg!(all(feature = "remote-control", any(target_os = "macos", target_os = "windows", target_os = "linux")))
     }
 
     /// Which edge each paired computer is placed at.

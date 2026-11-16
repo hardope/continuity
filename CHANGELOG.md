@@ -2,6 +2,12 @@
 
 All notable user-facing changes to Continuity are documented here.
 
+## [0.1.9-beta.1] - 2026-11-16
+
+### Added
+
+- **Keyboard and mouse sharing from Windows and Linux.** A Windows PC or a Linux computer can now be the one whose mouse and keyboard cross over to another computer, as a Mac already could: place the other computer at an edge of the screen in the Continuity window, move the cursor off that edge, and double-tap Control to come back at once. On Windows the PC's cursor waits in the middle of its screen while yours is over there. On Linux it needs GNOME 45 or KDE Plasma 6.1 or newer on Wayland, which asks once to allow input capture.
+
 ## [0.1.8] - 2026-11-15
 
 ### Added

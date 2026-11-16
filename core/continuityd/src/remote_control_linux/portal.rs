@@ -36,12 +36,12 @@ use tokio::sync::watch;
 use zbus::zvariant::{self, OwnedObjectPath, OwnedValue, Value};
 use zbus::{Connection, MatchRule, MessageStream};
 
-const PORTAL_DEST: &str = "org.freedesktop.portal.Desktop";
-const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
+pub(crate) const PORTAL_DEST: &str = "org.freedesktop.portal.Desktop";
+pub(crate) const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
 const REMOTE_DESKTOP_IFACE: &str = "org.freedesktop.portal.RemoteDesktop";
 const SCREEN_CAST_IFACE: &str = "org.freedesktop.portal.ScreenCast";
 const REQUEST_IFACE: &str = "org.freedesktop.portal.Request";
-const SESSION_IFACE: &str = "org.freedesktop.portal.Session";
+pub(crate) const SESSION_IFACE: &str = "org.freedesktop.portal.Session";
 const PROPERTIES_IFACE: &str = "org.freedesktop.DBus.Properties";
 
 // Bit values and modes as the portal specification numbers them.
@@ -49,12 +49,12 @@ const DEVICE_KEYBOARD: u32 = 1;
 const DEVICE_POINTER: u32 = 2;
 const SOURCE_MONITOR: u32 = 1;
 const CURSOR_MODE_EMBEDDED: u32 = 2;
-const PERSIST_UNTIL_REVOKED: u32 = 2;
+pub(crate) const PERSIST_UNTIL_REVOKED: u32 = 2;
 
 /// Setup steps that never involve a person (creating the session, picking
 /// devices and sources) answer within milliseconds; this only bounds a
 /// portal that has stopped responding.
-const SETUP_TIMEOUT: Duration = Duration::from_secs(20);
+pub(crate) const SETUP_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// `Start` is the step that shows the person at this computer the system's
 /// "allow remote control?" dialog. Long enough to walk over and answer it,
@@ -326,7 +326,7 @@ async fn configure_and_start(
 /// Calls a portal method that answers through a `Request` object, and
 /// waits for that object's `Response` — see the module docs for why the
 /// listener has to exist before the call.
-async fn request<B, R>(
+pub(crate) async fn request<B, R>(
     connection: &Connection,
     interface: &str,
     method: &'static str,
@@ -419,7 +419,7 @@ async fn stopped(stop: &mut watch::Receiver<bool>) {
 /// `CreateSession`'s `session_handle` result. xdg-desktop-portal sends it
 /// typed `s` for historical reasons even though it's an object path;
 /// accept either, as `ashpd` does, in case that's ever corrected.
-fn session_handle(results: &HashMap<String, OwnedValue>) -> Option<OwnedObjectPath> {
+pub(crate) fn session_handle(results: &HashMap<String, OwnedValue>) -> Option<OwnedObjectPath> {
     match &**results.get("session_handle")? {
         Value::Str(path) => OwnedObjectPath::try_from(path.as_str()).ok(),
         Value::ObjectPath(path) => Some(path.clone().into()),
@@ -434,18 +434,18 @@ fn sender_path_element(connection: &Connection, step: &'static str) -> Result<St
 
 /// A token for a request or session path element (`[A-Za-z0-9_]` only),
 /// unique within this process.
-fn new_token(step: &str) -> String {
+pub(crate) fn new_token(step: &str) -> String {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     format!("continuity_{step}_{}_{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
-async fn property_u32(connection: &Connection, interface: &str, name: &str) -> zbus::Result<u32> {
+pub(crate) async fn property_u32(connection: &Connection, interface: &str, name: &str) -> zbus::Result<u32> {
     let reply = connection.call_method(Some(PORTAL_DEST), PORTAL_PATH, Some(PROPERTIES_IFACE), "Get", &(interface, name)).await?;
     let value: OwnedValue = reply.body().deserialize()?;
     Ok(u32::try_from(value)?)
 }
 
-async fn close_object(connection: &Connection, path: &str, interface: &str) {
+pub(crate) async fn close_object(connection: &Connection, path: &str, interface: &str) {
     if let Err(e) = connection.call_method(Some(PORTAL_DEST), path, Some(interface), "Close", &()).await {
         tracing::debug!("couldn't close {interface} at {path}: {e}");
     }

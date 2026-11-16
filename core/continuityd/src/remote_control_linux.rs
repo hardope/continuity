@@ -15,7 +15,9 @@
 //! the first time a session can start without the dialog; the token for
 //! that lives next to the trust store.
 
-mod portal;
+/// Also what keyboard-and-mouse sharing's Linux backend (input_share/linux.rs)
+/// drives the InputCapture portal with.
+pub(crate) mod portal;
 
 use crate::frame_encoding::{self, LastFrame};
 use continuity_daemon::RemoteControlHost;

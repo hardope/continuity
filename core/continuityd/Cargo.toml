@@ -173,6 +173,9 @@ windows = { version = "0.58", features = [
     # The clipboard's sequence number and the concealed-content format
     # (clipboard_desktop.rs).
     "Win32_System_DataExchange",
+    # GetModuleHandleW, for keyboard-and-mouse sharing's low-level hooks
+    # (input_share/windows.rs).
+    "Win32_System_LibraryLoader",
 ] }
 
 # The Continuity window on Linux and Windows (settings_window.rs): one HTML
@@ -221,6 +224,10 @@ rfd = { version = "0.15", default-features = false, features = ["gtk3"] }
 # not something zbus itself re-exports a combinator for).
 futures-util = "0.3"
 pipewire = "0.8"
+# Keyboard-and-mouse sharing's controlling side (input_share/linux.rs): the
+# InputCapture portal hands over the captured mouse and keyboard as a libei
+# stream, which reis reads. Pure Rust, no libei system library needed.
+reis = { version = "0.7", features = ["tokio"] }
 # getuid() for screen_lock_linux.rs's fallback lookup of this user's
 # logind display session. (`serde`, which remote_control_linux.rs's
 # `call_portal_method` bound names directly, is now an all-platform

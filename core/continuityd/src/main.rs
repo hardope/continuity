@@ -31,8 +31,6 @@ mod notifications_mac;
 mod permissions_mac;
 #[cfg(all(target_os = "macos", feature = "remote-control"))]
 mod remote_control_mac;
-#[cfg(all(target_os = "macos", feature = "remote-control"))]
-mod input_share_mac;
 #[cfg(all(target_os = "windows", feature = "remote-control"))]
 mod remote_control_windows;
 #[cfg(all(target_os = "linux", feature = "remote-control"))]
@@ -43,6 +41,10 @@ mod remote_control_linux;
 // doc comment) — so it's gated only on the feature, not target_os.
 #[cfg(feature = "remote-control")]
 mod frame_encoding;
+// Keyboard-and-mouse sharing's controlling side: macOS, Windows and Linux,
+// each with its own way of watching and holding this computer's input.
+#[cfg(feature = "remote-control")]
+mod input_share;
 #[cfg(feature = "remote-control")]
 mod remote_viewer;
 #[cfg(target_os = "linux")]
@@ -91,9 +93,9 @@ enum AppEvent {
     ViewerFrameReady,
     /// A device's shared edge changed in the window (see
     /// `ControlState::set_on_shared_edges_changed`), or the mouse crossed
-    /// over or came back (see input_share_mac.rs) — the sharing state is
+    /// over or came back (see input_share/) — the sharing state is
     /// read again.
-    #[cfg(all(target_os = "macos", feature = "remote-control"))]
+    #[cfg(feature = "remote-control")]
     InputShareChanged,
 }
 
@@ -285,16 +287,17 @@ fn main() -> anyhow::Result<()> {
     control.spawn_trust_watcher();
     control.spawn_received_dir_watcher(received_files_dir(&profile()), commands.clone());
     // Keyboard-and-mouse sharing with the computers placed at this screen's
-    // edges (see input_share_mac.rs). The window changes the placements
+    // edges (see input_share/). The window changes the placements
     // through the control socket; the sharing itself reports back here.
-    #[cfg(all(target_os = "macos", feature = "remote-control"))]
+    #[cfg(feature = "remote-control")]
     let input_share = {
         let wake = Mutex::new(event_loop.create_proxy());
-        let share = input_share_mac::InputShare::new(
+        let share = input_share::InputShare::new(
             commands.clone(),
             Arc::new(move || {
                 let _ = wake.lock().unwrap().send_event(AppEvent::InputShareChanged);
             }),
+            &profile(),
         );
         share.set_placements(control.shared_edges());
         let changed = Mutex::new(event_loop.create_proxy());
@@ -407,7 +410,7 @@ fn main() -> anyhow::Result<()> {
         match event {
             tao::event::Event::UserEvent(AppEvent::Engine(sync_event)) => {
                 control.observe(&sync_event);
-                #[cfg(all(target_os = "macos", feature = "remote-control"))]
+                #[cfg(feature = "remote-control")]
                 input_share.observe(&sync_event);
                 let tray_line = match &sync_event {
                     SyncEvent::FileTransferProgress { .. } => Some(false),
@@ -474,7 +477,7 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             tao::event::Event::UserEvent(AppEvent::OpenWindow) => open_window = true,
-            #[cfg(all(target_os = "macos", feature = "remote-control"))]
+            #[cfg(feature = "remote-control")]
             tao::event::Event::UserEvent(AppEvent::InputShareChanged) => {
                 input_share.set_placements(control.shared_edges());
                 control.set_input_sharing(input_share.sharing_with());
