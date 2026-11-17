@@ -2,6 +2,16 @@
 
 All notable user-facing changes to Continuity are documented here.
 
+## [0.1.9] - 2026-11-17
+
+### Added
+
+- **Keyboard and mouse sharing from Windows and Linux.** A Windows PC or a Linux computer can now be the one whose mouse and keyboard cross over to another computer, as a Mac already could: place the other computer at an edge of the screen in the Continuity window, move the cursor off that edge, and double-tap Control to come back at once. On Windows the PC's cursor waits in the middle of its screen while yours is over there. On Linux it needs GNOME 45 or KDE Plasma 6.1 or newer on Wayland, which asks once to allow input capture.
+
+### Fixed
+
+- **macOS: the pairing code shows again.** Since 0.1.8 a Mac asked to pair with a notification, and if Continuity's notifications were set to None or a Focus was on, macOS filed it away in Notification Center without showing it. Nothing appeared, and the request was declined after three minutes. Pairing and remote-control requests now open an alert window in front of everything else, whatever the notification and Focus settings. An alert left unanswered closes after three minutes and counts as no.
+
 ## [0.1.9-beta.1] - 2026-11-16
 
 ### Added

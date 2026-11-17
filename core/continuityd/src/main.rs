@@ -26,6 +26,8 @@ mod media_linux;
 #[cfg(target_os = "linux")]
 mod file_chooser_linux;
 #[cfg(target_os = "macos")]
+mod alert_mac;
+#[cfg(target_os = "macos")]
 mod notifications_mac;
 #[cfg(target_os = "macos")]
 mod permissions_mac;
@@ -789,11 +791,13 @@ fn handle_sync_event(
 /// network could raise one by connecting. Each platform gets what works
 /// there:
 ///
-/// - **macOS**: a notification with buttons (`notifications_mac::prompt`).
-///   An unbundled development build can't show those, so it falls back to
-///   the dialog, on a thread of its own (AppKit runs it on the main thread
-///   anyway, so that build still blocks while it's up — the price of not
-///   being an app bundle).
+/// - **macOS**: an alert window drawn by the system (`alert_mac::ask`),
+///   waited on from a thread of its own. Not a notification: with
+///   Continuity's notification style set to None, or a Focus on, those were
+///   filed away unseen and every pairing request went unanswered. If the
+///   alert can't be shown, it falls back to the dialog. AppKit runs that on
+///   the main thread anyway, so the app blocks while it's up, but it's a
+///   last resort.
 /// - **Windows**: the dialog, on a thread of its own, which is fine there.
 /// - **Linux**: a notification with buttons. GNOME's focus-stealing
 ///   prevention can refuse a bare dialog from a background app outright,
@@ -801,19 +805,18 @@ fn handle_sync_event(
 ///   against tao's GTK), so the fallback dialog stays on the event loop,
 ///   as a last resort when no notification server answers.
 ///
-/// Dismissing the question (closing the notification, Clear All) counts as
-/// no: nothing is paired or allowed without an explicit yes.
+/// Dismissing the question (closing the notification, Clear All, leaving the
+/// alert until it times out) counts as no: nothing is paired or allowed
+/// without an explicit yes.
 fn ask(title: String, body: String, yes: &'static str, no: &'static str, on_answer: impl FnOnce(bool) + Send + 'static) {
     #[cfg(target_os = "macos")]
     {
-        let (dialog_title, dialog_body) = (title.clone(), body.clone());
-        notifications_mac::prompt(&title, &body, &[("yes", yes), ("no", no)], move |outcome| match outcome {
-            notifications_mac::PromptOutcome::Clicked(action) => on_answer(action == "yes"),
-            notifications_mac::PromptOutcome::Dismissed => on_answer(false),
-            notifications_mac::PromptOutcome::Unavailable(why) => {
-                tracing::debug!("couldn't ask with a notification ({why}) — asking with a dialog");
-                on_answer(dialog_answer(&dialog_title, &dialog_body));
-            }
+        std::thread::spawn(move || {
+            let answer = alert_mac::ask(&title, &body, yes, no, QUESTION_TIMEOUT).unwrap_or_else(|| {
+                tracing::debug!("couldn't ask with an alert — asking with a dialog");
+                dialog_answer(&title, &body)
+            });
+            on_answer(answer);
         });
     }
     #[cfg(target_os = "windows")]
@@ -852,6 +855,14 @@ fn ask(title: String, body: String, yes: &'static str, no: &'static str, on_answ
         }
     }
 }
+
+/// How long a macOS alert from `ask` stays up unanswered before it counts as
+/// no. It matches the engine's `PAIRING_ANSWER_TIMEOUT`, which declines a
+/// pairing request at that point anyway, so the alert doesn't outlive the
+/// request. A remote-control request has no engine deadline, so this
+/// timeout is its decline.
+#[cfg(target_os = "macos")]
+const QUESTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
 /// The dialog form of `ask`: yes or no, blocking the calling thread.
 fn dialog_answer(title: &str, body: &str) -> bool {
