@@ -825,7 +825,7 @@ checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
 
 [[package]]
 name = "continuity-crypto"
-version = "0.1.9"
+version = "0.1.10-beta.1"
 dependencies = [
  "directories",
  "ed25519-dalek",
@@ -843,7 +843,7 @@ dependencies = [
 
 [[package]]
 name = "continuity-daemon"
-version = "0.1.9"
+version = "0.1.10-beta.1"
 dependencies = [
  "anyhow",
  "arboard",
@@ -861,7 +861,7 @@ dependencies = [
 
 [[package]]
 name = "continuity-ffi"
-version = "0.1.9"
+version = "0.1.10-beta.1"
 dependencies = [
  "continuity-crypto",
  "continuity-daemon",
@@ -876,7 +876,7 @@ dependencies = [
 
 [[package]]
 name = "continuity-net"
-version = "0.1.9"
+version = "0.1.10-beta.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -900,7 +900,7 @@ dependencies = [
 
 [[package]]
 name = "continuity-proto"
-version = "0.1.9"
+version = "0.1.10-beta.1"
 dependencies = [
  "base64",
  "serde",
@@ -909,7 +909,7 @@ dependencies = [
 
 [[package]]
 name = "continuityctl"
-version = "0.1.9"
+version = "0.1.10-beta.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -925,7 +925,7 @@ dependencies = [
 
 [[package]]
 name = "continuityd"
-version = "0.1.9"
+version = "0.1.10-beta.1"
 dependencies = [
  "anyhow",
  "arboard",
@@ -963,6 +963,7 @@ dependencies = [
  "tracing-subscriber",
  "tray-icon",
  "windows 0.58.0",
+ "winresource",
  "wry",
  "zbus 4.4.0",
 ]
@@ -5952,6 +5953,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "winresource"
+version = "0.1.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2bc6d36480b829272a5bdabf08e6dca8004761c1da7e35efef800540c66221b"
+dependencies = [
+ "version_check",
 ]
 
 [[package]]

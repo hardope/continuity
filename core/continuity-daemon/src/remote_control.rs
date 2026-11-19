@@ -47,17 +47,34 @@ pub trait RemoteControlHost: Send + Sync {
     fn set_pointer_in_frames(&self, _include: bool) {}
 
     /// Stops any capture in progress. Safe to call even if nothing was
-    /// started (e.g. `start_capture` already returned `None`).
+    /// started (e.g. `start_capture` already returned `None`). Only for a
+    /// session with the screen; keyboard-and-mouse sharing ends with
+    /// `stop_input_only`.
     fn stop_capture(&self);
 
     /// Gets ready to take input without capturing the screen — a
     /// keyboard-and-mouse sharing session (`RemoteControlRequest { screen:
     /// false }`). macOS and Windows inject with nothing to set up; Linux
     /// opens a portal session without a screen source. `Err` is a reason
-    /// the engine ends the request with. `stop_capture` ends it, as for a
-    /// session with the screen.
+    /// the engine ends the request with. Called when the first such session
+    /// starts: several computers can share their keyboard and mouse with
+    /// this one at once, and with a screen session alongside.
     fn start_input_only(&self) -> Result<(), String> {
         Ok(())
+    }
+
+    /// The last keyboard-and-mouse sharing session has ended: lets go of
+    /// whatever was left held down, and (Linux) ends the portal session.
+    fn stop_input_only(&self) {}
+
+    /// Why input for keyboard-and-mouse sharing can't be injected any more,
+    /// when that happened on its own after `start_input_only` succeeded —
+    /// on Linux, the desktop's own dialog was declined or never answered,
+    /// or remote interaction was stopped from the desktop's controls. The
+    /// engine asks every so often while such sessions are up, and ends them
+    /// with this reason.
+    fn input_only_failure(&self) -> Option<String> {
+        None
     }
 
     /// This screen's size in pixels, for a controller forwarding its own

@@ -18,8 +18,10 @@
 /// Also what keyboard-and-mouse sharing's Linux backend (input_share/linux.rs)
 /// drives the InputCapture portal with.
 pub(crate) mod portal;
+mod pointer_track;
 
 use crate::frame_encoding::{self, LastFrame};
+use pointer_track::{Desktop, PointerTrack};
 use continuity_daemon::RemoteControlHost;
 use continuity_proto::{InputEventKind, MouseButton as ProtoMouseButton, ScreenEdge};
 use pipewire as pw;
@@ -64,65 +66,63 @@ pub struct LinuxRemoteControlHost {
     /// Where the pointer is thought to be, during keyboard-and-mouse sharing
     /// — see `PointerTrack`.
     pointer: Mutex<PointerTrack>,
+    /// Whether computers are sharing their keyboard and mouse with this one
+    /// (`start_input_only` to `stop_input_only`) — so a screen session's
+    /// portal session ending starts an input-only one for them again.
+    input_only_wanted: AtomicBool,
+    /// Why the latest input-only portal session stopped on its own — see
+    /// `input_only_failure`.
+    input_failure: Arc<Mutex<Option<String>>>,
 }
 
-/// A guess at the pointer's position for `pointer_at_edge`, from the
-/// relative moves injected: the portal gives no way to read the pointer
-/// back, and an input-only session has no stream to learn the screen's size
-/// from. The controlling computer puts the pointer at an edge with one move
-/// far longer than any screen (`PIN`), which pins it there; from then on the
-/// moves away from that edge are summed, and the pointer is back at it when
-/// the sum returns to nothing. How far along the edge it is stays unknown
-/// (reported as the middle), and the compositor's own acceleration of the
-/// injected moves, if any, isn't accounted for — so this is best effort,
-/// and the escape chord on the controlling computer is the sure way back.
-#[derive(Default)]
-struct PointerTrack {
-    edge: Option<ScreenEdge>,
-    /// Distance from `edge` into the screen, in the moves' own units.
-    inward: f64,
+/// The desktop's extent in the compositor's logical pixels — the bounding
+/// box of its monitors, as GDK sees them — kept current from the main
+/// thread by `watch_desktop`, since GTK may only be used there. What an
+/// input-only session measures the pointer against, and gives as this
+/// screen's size. (GDK's monitor geometry is the compositor's own layout,
+/// in the units the portal's relative moves are in.)
+static DESKTOP: Mutex<Option<Desktop>> = Mutex::new(None);
+
+fn desktop() -> Option<Desktop> {
+    *DESKTOP.lock().unwrap()
 }
 
-/// A relative move at least this long is a pin to an edge.
-const PIN: f64 = 100_000.0;
-
-impl PointerTrack {
-    fn moved(&mut self, dx: f64, dy: f64) {
-        if dx <= -PIN {
-            self.edge = Some(ScreenEdge::Left);
-            self.inward = 0.0;
-        } else if dx >= PIN {
-            self.edge = Some(ScreenEdge::Right);
-            self.inward = 0.0;
-        } else if dy <= -PIN {
-            self.edge = Some(ScreenEdge::Top);
-            self.inward = 0.0;
-        } else if dy >= PIN {
-            self.edge = Some(ScreenEdge::Bottom);
-            self.inward = 0.0;
-        } else if let Some(edge) = self.edge {
-            let inward = match edge {
-                ScreenEdge::Left => dx,
-                ScreenEdge::Right => -dx,
-                ScreenEdge::Top => dy,
-                ScreenEdge::Bottom => -dy,
-            };
-            self.inward = (self.inward + inward).max(0.0);
+/// Reads the desktop's extent now and every few seconds after, on the main
+/// thread (GTK's). Call once, after GTK is up.
+pub fn watch_desktop() {
+    fn update() {
+        use gtk::gdk::prelude::MonitorExt;
+        let desktop = gtk::gdk::Display::default().and_then(|display| {
+            let monitors: Vec<gtk::gdk::Rectangle> = (0..display.n_monitors()).filter_map(|i| display.monitor(i)).map(|m| m.geometry()).collect();
+            pointer_track::union(monitors.iter().map(|m| (m.x(), m.y(), m.width(), m.height())))
+        });
+        let mut current = DESKTOP.lock().unwrap();
+        if *current != desktop {
+            tracing::info!("desktop for keyboard-and-mouse sharing: {desktop:?}");
+            *current = desktop;
         }
     }
-
-    fn at_edge(&self) -> Option<(ScreenEdge, f64)> {
-        self.edge.filter(|_| self.inward <= 0.0).map(|edge| (edge, 0.5))
-    }
+    update();
+    gtk::glib::timeout_add_seconds_local(3, || {
+        update();
+        gtk::glib::ControlFlow::Continue
+    });
 }
 
 /// One `start_capture`'s worth of state, so a session that's still winding
 /// down can't be mistaken for the next one.
 struct CaptureRun {
+    /// With a monitor's stream (`start_capture`), or input only.
+    screen: bool,
     stop: watch::Sender<bool>,
     /// Feeds the single task that delivers this session's input, once the
     /// portal session exists.
     input: Mutex<Option<mpsc::UnboundedSender<InputEventKind>>>,
+    /// Input is being delivered: the desktop approved, and the session
+    /// hasn't ended.
+    ready: AtomicBool,
+    /// The session is over (stopped, or failed on its own).
+    finished: AtomicBool,
 }
 
 impl LinuxRemoteControlHost {
@@ -133,6 +133,8 @@ impl LinuxRemoteControlHost {
             failure: Arc::new(Mutex::new(None)),
             pointer_in_frames: AtomicBool::new(true),
             pointer: Mutex::new(PointerTrack::default()),
+            input_only_wanted: AtomicBool::new(false),
+            input_failure: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -140,24 +142,35 @@ impl LinuxRemoteControlHost {
     /// (`start_capture`), or input only — on a thread of its own, since
     /// portal setup is async D-Bus traffic that can wait minutes on a
     /// person. Returns the frame channel, which stays empty for input only.
+    /// Input only keeps its approval in a restore token of its own: the
+    /// desktop won't restore a screen session's for it, or the other way
+    /// round, and each would otherwise spend the other's.
     fn start_run(&self, screen: bool) -> Option<mpsc::Receiver<Vec<u8>>> {
         let (stop_tx, stop_rx) = watch::channel(false);
-        let run = Arc::new(CaptureRun { stop: stop_tx, input: Mutex::new(None) });
+        let run = Arc::new(CaptureRun {
+            screen,
+            stop: stop_tx,
+            input: Mutex::new(None),
+            ready: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
+        });
         if let Some(previous) = self.current.lock().unwrap().replace(run.clone()) {
             let _ = previous.stop.send(true);
         }
         *self.failure.lock().unwrap() = None;
+        *self.input_failure.lock().unwrap() = None;
         *self.pointer.lock().unwrap() = PointerTrack::default();
 
         let (frames_tx, frames_rx) = mpsc::channel(2);
-        let failure = self.failure.clone();
-        let token_path = self.restore_token_path.clone();
+        let failure = if screen { self.failure.clone() } else { self.input_failure.clone() };
+        let token_path = if screen { self.restore_token_path.clone() } else { self.restore_token_path.as_deref().map(input_only_token_path) };
         let pointer = self.pointer_in_frames.load(Ordering::Relaxed);
         let spawned = std::thread::Builder::new().name("remote-desktop".to_string()).spawn(move || {
             let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
                 Ok(runtime) => runtime,
                 Err(e) => {
-                    *failure.lock().unwrap() = Some(format!("couldn't start screen sharing: {e}"));
+                    *failure.lock().unwrap() = Some(format!("couldn't start the desktop's remote-desktop session: {e}"));
+                    run.finished.store(true, Ordering::Relaxed);
                     return;
                 }
             };
@@ -169,6 +182,20 @@ impl LinuxRemoteControlHost {
         }
         Some(frames_rx)
     }
+
+    /// The portal session that injects input now, if one is up or on its
+    /// way.
+    fn live_run(&self) -> Option<Arc<CaptureRun>> {
+        self.current.lock().unwrap().clone().filter(|run| !run.finished.load(Ordering::Relaxed))
+    }
+}
+
+/// Where an input-only session's restore token is kept: next to the
+/// screen session's.
+fn input_only_token_path(screen_token: &Path) -> PathBuf {
+    let mut name = screen_token.file_name().map(|name| name.to_os_string()).unwrap_or_default();
+    name.push(".input-only");
+    screen_token.with_file_name(name)
 }
 
 /// Where the portal's restore token is kept: next to the trust store, one
@@ -180,8 +207,11 @@ pub fn restore_token_path(profile: &str) -> Option<PathBuf> {
 
 impl RemoteControlHost for LinuxRemoteControlHost {
     fn inject(&self, event: InputEventKind) {
-        if let InputEventKind::MouseMoveRelative { dx, dy } = event {
-            self.pointer.lock().unwrap().moved(dx, dy);
+        crate::input_share::note_remote_input();
+        match event {
+            InputEventKind::MouseMove { x, y } => self.pointer.lock().unwrap().placed(desktop(), x, y),
+            InputEventKind::MouseMoveRelative { dx, dy } => self.pointer.lock().unwrap().moved(desktop(), dx, dy),
+            _ => {}
         }
         let Some(run) = self.current.lock().unwrap().clone() else {
             return;
@@ -193,6 +223,8 @@ impl RemoteControlHost for LinuxRemoteControlHost {
     }
 
     fn start_capture(&self) -> Option<mpsc::Receiver<Vec<u8>>> {
+        // Replaces an input-only session, if there is one: this one carries
+        // their input too, and they get theirs back when it ends.
         self.start_run(true)
     }
 
@@ -200,21 +232,70 @@ impl RemoteControlHost for LinuxRemoteControlHost {
     /// asks about input only (or a stored approval restores it), and input
     /// is injected once it's up. Setup is asynchronous, so this can't say
     /// whether the person here approves; until they do, injected input is
-    /// dropped, and a refusal is logged.
+    /// dropped and the controller's cursor sent straight back
+    /// (`pointer_at_edge`), and a refusal ends the sessions
+    /// (`input_only_failure`). A screen session already up carries the
+    /// input instead.
     fn start_input_only(&self) -> Result<(), String> {
+        self.input_only_wanted.store(true, Ordering::Relaxed);
+        if self.live_run().is_some() {
+            return Ok(());
+        }
         match self.start_run(false) {
             Some(_frames) => Ok(()),
             None => Err("couldn't start the desktop's remote-desktop session".to_string()),
         }
     }
 
+    fn stop_input_only(&self) {
+        self.input_only_wanted.store(false, Ordering::Relaxed);
+        let mut current = self.current.lock().unwrap();
+        if current.as_ref().is_some_and(|run| !run.screen) {
+            if let Some(run) = current.take() {
+                let _ = run.stop.send(true);
+            }
+        }
+    }
+
+    fn input_only_failure(&self) -> Option<String> {
+        self.input_failure.lock().unwrap().clone()
+    }
+
+    /// This screen's size, for a controller placing the pointer: the
+    /// desktop's, when GDK has said.
+    fn screen_size(&self) -> Option<(u32, u32)> {
+        let desktop = desktop()?;
+        (desktop.width >= 1.0 && desktop.height >= 1.0).then(|| (desktop.width as u32, desktop.height as u32))
+    }
+
+    /// Where the pointer is thought to be (`PointerTrack`) — or, while no
+    /// portal session can inject yet (the desktop's dialog not answered),
+    /// the edge it arrived at, so the controller takes its cursor straight
+    /// back instead of sending it into nothing.
     fn pointer_at_edge(&self) -> Option<(ScreenEdge, f64)> {
-        self.pointer.lock().unwrap().at_edge()
+        let ready = self.live_run().is_some_and(|run| run.ready.load(Ordering::Relaxed));
+        let track = self.pointer.lock().unwrap();
+        if ready {
+            track.at_edge(desktop())
+        } else {
+            track.arrived()
+        }
     }
 
     fn stop_capture(&self) {
-        if let Some(run) = self.current.lock().unwrap().take() {
-            let _ = run.stop.send(true);
+        {
+            let mut current = self.current.lock().unwrap();
+            if current.as_ref().is_some_and(|run| run.screen) {
+                if let Some(run) = current.take() {
+                    let _ = run.stop.send(true);
+                }
+            }
+        }
+        // Computers sharing their keyboard and mouse with this one had their
+        // input carried by the screen session; they get a session of their
+        // own back.
+        if self.input_only_wanted.load(Ordering::Relaxed) && self.live_run().is_none() {
+            self.start_run(false);
         }
     }
 
@@ -249,8 +330,18 @@ async fn run_session(
                 tracing::debug!("remote-desktop setup cancelled: {e}");
             } else {
                 tracing::warn!("remote-desktop setup failed: {e}");
-                *failure.lock().unwrap() = Some(e.reason);
+                // The portal's own reasons are worded for screen sharing.
+                let reason = match (screen, e.kind) {
+                    (true, _) => e.reason,
+                    (false, portal::ErrorKind::Declined) => "remote interaction was declined on this computer".to_string(),
+                    (false, portal::ErrorKind::TimedOut) if e.step == "Start" => {
+                        format!("nobody allowed remote interaction on this computer within {} seconds", portal::APPROVAL_TIMEOUT.as_secs())
+                    }
+                    (false, _) => e.reason,
+                };
+                *failure.lock().unwrap() = Some(reason);
             }
+            run.finished.store(true, Ordering::Relaxed);
             return;
         }
     };
@@ -271,6 +362,7 @@ async fn run_session(
     let (input_tx, input_rx) = mpsc::unbounded_channel();
     *run.input.lock().unwrap() = Some(input_tx);
     let input_task = tokio::spawn(forward_input(session.clone(), input_rx, frame_size.clone()));
+    run.ready.store(true, Ordering::Relaxed);
 
     // The portal closes the session when sharing is stopped from this
     // computer's own controls (GNOME's "Stop" button in the top bar).
@@ -311,8 +403,11 @@ async fn run_session(
         None => {
             let mut stop = stop.clone();
             loop {
-                if *stop.borrow_and_update() || portal_closed.load(Ordering::Relaxed) {
+                if *stop.borrow_and_update() {
                     break Ok(());
+                }
+                if portal_closed.load(Ordering::Relaxed) {
+                    break Err("remote interaction was stopped on this computer".to_string());
                 }
                 tokio::select! {
                     changed = stop.changed() => if changed.is_err() { break Ok(()) },
@@ -323,11 +418,13 @@ async fn run_session(
     };
     if let Err(reason) = outcome {
         if !*stop.borrow() {
-            tracing::warn!("screen capture ended: {reason}");
+            tracing::warn!("remote-desktop session ended: {reason}");
             *failure.lock().unwrap() = Some(reason);
         }
     }
 
+    run.ready.store(false, Ordering::Relaxed);
+    run.finished.store(true, Ordering::Relaxed);
     input_task.abort();
     closed_watch.abort();
     run.input.lock().unwrap().take();
@@ -351,6 +448,21 @@ async fn forward_input(session: Arc<portal::PortalSession>, mut events: mpsc::Un
         let result = match event {
             InputEventKind::KeyDown { code } => session.notify_keyboard_keycode(code as i32, true).await,
             InputEventKind::KeyUp { code } => session.notify_keyboard_keycode(code as i32, false).await,
+            // Input only: no stream to place the pointer on, only moves —
+            // see `pointer_track::placing_moves`.
+            InputEventKind::MouseMove { x, y } if session.node_id == 0 => {
+                let Some(desktop) = desktop() else {
+                    continue;
+                };
+                let mut result = Ok(());
+                for (dx, dy) in pointer_track::placing_moves(desktop, x, y) {
+                    result = session.notify_pointer_motion(dx, dy).await;
+                    if result.is_err() {
+                        break;
+                    }
+                }
+                result
+            }
             InputEventKind::MouseMove { x, y } => {
                 let Some((width, height)) = pointer_space(&session, &frame_size, logical) else {
                     continue;
@@ -667,23 +779,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_pointer_is_back_at_its_arrival_edge_when_the_moves_away_add_up_to_nothing() {
-        let mut track = PointerTrack::default();
-        assert_eq!(track.at_edge(), None, "nothing known yet");
-        // The controller's arrival: a pin to the top, then to the left edge.
-        track.moved(0.0, -PIN);
-        track.moved(-PIN, 0.0);
-        assert_eq!(track.at_edge().map(|(e, _)| e), Some(ScreenEdge::Left), "the last pin is the edge it's at");
-        track.moved(0.0, 500.0);
-        assert_eq!(track.at_edge().map(|(e, _)| e), Some(ScreenEdge::Left), "along the edge is still at it");
-        track.moved(30.0, 0.0);
-        assert_eq!(track.at_edge(), None, "moved into the screen");
-        track.moved(-20.0, 0.0);
-        assert_eq!(track.at_edge(), None);
-        track.moved(-15.0, 0.0);
-        assert_eq!(track.at_edge(), Some((ScreenEdge::Left, 0.5)), "back at the edge; how far along it is unknown");
-        track.moved(5.0, 0.0);
-        assert_eq!(track.at_edge(), None);
+    fn input_only_keeps_its_own_restore_token() {
+        let screen = Path::new("/home/me/.config/continuity/remote-desktop-restore-token.default");
+        assert_eq!(input_only_token_path(screen), Path::new("/home/me/.config/continuity/remote-desktop-restore-token.default.input-only"));
     }
 
     #[test]

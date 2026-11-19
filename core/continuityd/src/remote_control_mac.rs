@@ -186,6 +186,7 @@ impl Default for MacRemoteControlHost {
 
 impl RemoteControlHost for MacRemoteControlHost {
     fn inject(&self, event: InputEventKind) {
+        crate::input_share::note_remote_input();
         if let InputEventKind::MouseMove { x, y } = event {
             *self.last_cursor.lock().unwrap() = Some((x, y));
         }
@@ -278,6 +279,10 @@ impl RemoteControlHost for MacRemoteControlHost {
     fn pointer_at_edge(&self) -> Option<(ScreenEdge, f64)> {
         let bounds = CGDisplayBounds(CGMainDisplayID());
         edge_of(current_mouse_location(), bounds)
+    }
+
+    fn stop_input_only(&self) {
+        self.release_held_input();
     }
 
     fn stop_capture(&self) {
@@ -488,6 +493,12 @@ fn inject_event(event: InputEventKind, held: &mut HeldInput) {
     }
 }
 
+/// Marks every event posted here (`kCGEventSourceUserData`), so this
+/// computer's own keyboard-and-mouse sharing tap (input_share/mac.rs),
+/// which sees them go by like any other, can tell them from the person
+/// here's own mouse and keyboard. "CONT" in ASCII.
+pub(crate) const INJECTED_EVENT_MARK: i64 = 0x434f_4e54;
+
 /// Posts `event` with `held` as its modifier flags (see `HeldKeys`).
 fn post(event: Option<objc2_core_foundation::CFRetained<CGEvent>>, held: u64) {
     let Some(event) = event else {
@@ -499,6 +510,7 @@ fn post(event: Option<objc2_core_foundation::CFRetained<CGEvent>>, held: u64) {
     // non-coalesced bit) is left as it was.
     let flags = CGEvent::flags(Some(&event)).0;
     CGEvent::set_flags(Some(&event), CGEventFlags((flags & !MANAGED_MODIFIER_FLAGS) | held));
+    CGEvent::set_integer_value_field(Some(&event), CGEventField::EventSourceUserData, INJECTED_EVENT_MARK);
     CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
 }
 

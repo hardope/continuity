@@ -5,7 +5,10 @@ use continuity_proto::{DeviceInfo, InputEventKind, MediaCommand, NowPlayingInfo,
 /// view plus input controls to send, `Controlled` gets a "you're being
 /// controlled by X" indicator and an end button, nothing else (the
 /// controlled side doesn't need its own screen re-rendered to itself).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A device can be in one session of each role with the same peer at
+/// once: two computers placed at each other's edges for keyboard-and-mouse
+/// sharing each control the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RemoteControlRole {
     Controlling,
     Controlled,
@@ -279,6 +282,11 @@ pub enum EngineCommand {
     /// takes the cursor back on `SyncEvent::PointerReachedEdge`. Only
     /// meaningful with a v4 peer; an older one takes it as a request for
     /// the screen.
+    ///
+    /// One controlling session per peer: a request while one is pending or
+    /// up is ignored — except that asking for the screen ends a
+    /// keyboard-and-mouse sharing session with that peer first, since that
+    /// one only sits idle until the cursor crosses over.
     RequestRemoteControl { peer_crypto_id: String, screen: bool },
     /// Answers an inbound `SyncEvent::RemoteControlRequested` from
     /// `peer_crypto_id`. Accepting starts local screen capture
@@ -295,11 +303,11 @@ pub enum EngineCommand {
     /// forget, like `SendMediaCommand` — a real-time input stream has no
     /// use for a per-event acknowledgement.
     SendInputEvent { peer_crypto_id: String, event: InputEventKind },
-    /// Ends whichever remote-control session is currently active with
-    /// `peer_crypto_id`, regardless of which role this device is playing
-    /// in it — the controlling side stopping cleanly and the controlled
-    /// side revoking access mid-session both go through this same
-    /// command. A no-op if no session is active with that peer.
+    /// Ends this device's session controlling `peer_crypto_id`, or, with
+    /// none, the session in which `peer_crypto_id` controls this device —
+    /// the controlling side stopping cleanly and the controlled side
+    /// revoking access mid-session both go through this same command. A
+    /// no-op if no session is active with that peer.
     EndRemoteControlSession { peer_crypto_id: String },
     /// Asks `peer_crypto_id` to lock or unlock its screen. The answer
     /// comes back as `SyncEvent::ScreenLockResult`. Only send this to a

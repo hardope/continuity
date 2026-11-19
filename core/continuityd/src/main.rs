@@ -190,6 +190,11 @@ fn main() -> anyhow::Result<()> {
 
     let event_loop = EventLoopBuilder::<AppEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
+    // A computer sharing its keyboard and mouse with this one has the
+    // pointer measured against the desktop as GDK reports it, which only
+    // the main thread may ask; GTK is up now.
+    #[cfg(all(target_os = "linux", feature = "remote-control"))]
+    remote_control_linux::watch_desktop();
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     let settings_route = settings_window::Route { proxy: event_loop.create_proxy(), wrap: AppEvent::Settings };
     #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -328,6 +333,9 @@ fn main() -> anyhow::Result<()> {
     // tooltip that announced each, oldest first — the tray icon's red dot
     // stays while any is left.
     let mut remote_sessions: Vec<(String, String)> = Vec::new();
+    // Keyboard-and-mouse sharing's sessions, by id: open whenever a placed
+    // computer is connected, so neither announced nor dotted.
+    let mut sharing_sessions: std::collections::HashSet<String> = std::collections::HashSet::new();
     // The open remote-control viewer window, if any — at most one at a
     // time (mirrors the engine's own one-Controlled-session-device-wide
     // rule; nothing stops *this* device from controlling several peers
@@ -447,6 +455,7 @@ fn main() -> anyhow::Result<()> {
                     &tray_icon,
                     &control,
                     &mut remote_sessions,
+                    &mut sharing_sessions,
                 );
                 if let Some(changed) = tray_line {
                     refresh_tray_transfers(&control, &menu, &transfer_item, &tray_icon, &remote_sessions, &mut tray_transfers, changed);
@@ -588,6 +597,7 @@ fn handle_sync_event(
     tray_icon: &tray_icon::TrayIcon,
     control: &control::ControlState,
     remote_sessions: &mut Vec<(String, String)>,
+    sharing_sessions: &mut std::collections::HashSet<String>,
 ) {
     match event {
         SyncEvent::Listening { port } => tracing::info!("listening on port {port}"),
@@ -704,6 +714,15 @@ fn handle_sync_event(
         SyncEvent::RemoteControlDeclined { peer_name, .. } => {
             notify(&format!("'{peer_name}' declined the remote control request"));
         }
+        // Keyboard-and-mouse sharing keeps a session open with every placed
+        // computer that's connected, in both directions; it isn't anyone
+        // taking control, so it isn't announced as that. **Real complaint
+        // fixed here**: every connection told this computer it was "now
+        // being controlled", and kept the tray's red dot on for good.
+        SyncEvent::RemoteControlSessionStarted { peer_name, role, session_id, screen: false, .. } => {
+            tracing::info!("keyboard-and-mouse sharing session with '{peer_name}' up ({role:?})");
+            sharing_sessions.insert(session_id);
+        }
         SyncEvent::RemoteControlSessionStarted { peer_name, role, session_id, .. } => {
             let text = match role {
                 continuity_daemon::RemoteControlRole::Controlled => {
@@ -729,6 +748,16 @@ fn handle_sync_event(
         // session ends the first only after it has started (see
         // `handle_remote_control_sync_event`), and this device can be
         // controlled while it controls another.
+        // Sharing's sessions come and go with connections unannounced; only
+        // one that stopped for a reason (the other computer's desktop
+        // refusing, say) is worth saying.
+        SyncEvent::RemoteControlSessionEnded { peer_name, reason, session_id, .. } if sharing_sessions.contains(&session_id) => {
+            sharing_sessions.remove(&session_id);
+            match reason {
+                Some(reason) => notify(&format!("Keyboard and mouse sharing with '{peer_name}' stopped: {reason}")),
+                None => tracing::info!("keyboard-and-mouse sharing session with '{peer_name}' ended"),
+            }
+        }
         SyncEvent::RemoteControlSessionEnded { peer_name, reason, session_id, .. } => {
             let text = match reason {
                 Some(reason) => format!("Remote control session with '{peer_name}' ended: {reason}"),

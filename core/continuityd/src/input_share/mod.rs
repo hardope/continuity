@@ -16,8 +16,8 @@
 //!
 //! - **macOS**: a session-level `CGEventTap`; the cursor is hidden and
 //!   unlinked from the mouse while it's over there.
-//! - **Windows**: low-level mouse and keyboard hooks; the cursor waits in the
-//!   middle of the screen, so every movement reads as a delta.
+//! - **Windows**: low-level mouse and keyboard hooks; the cursor stays where
+//!   it left, and each movement is measured from there.
 //! - **Linux**: the InputCapture portal — the compositor draws pointer
 //!   barriers on the placed edges, hides the cursor and hands over the
 //!   captured input through libei, which is the only way a Wayland app may
@@ -27,14 +27,25 @@
 //! where the cursor is; a move outward through a placed edge with a session
 //! up crosses. On Linux the compositor decides and says so (`crossed`). The
 //! other computer's pointer is then put at the matching point of its
-//! opposite edge — placed exactly when it said its screen size, else moved
-//! there with moves longer than any screen (`PIN`) — and from then on every
-//! mouse and keyboard event is forwarded: moves as deltas, buttons, the
-//! wheel, keys through the viewer's layout translation (Command and Control
-//! trade places between a Mac and a PC). When the other computer reports its
-//! pointer against the edge facing this screen (`PointerReachedEdge`), the
-//! cursor comes back at the matching point of this screen's edge, a few
-//! pixels in.
+//! opposite edge, a few pixels in — placed exactly when it said its screen
+//! size, else moved there with moves longer than any screen (`PIN`) — and
+//! from then on every mouse and keyboard event is forwarded: moves as
+//! deltas, buttons, the wheel, keys through the viewer's layout translation
+//! (Command and Control trade places between a Mac and a PC). When the
+//! other computer reports its pointer against the edge facing this screen
+//! (`PointerReachedEdge`), the cursor comes back at the matching point of
+//! this screen's edge, a few pixels in.
+//!
+//! **Never while being driven.** Two computers placed at each other's edges
+//! each control the other. Input another computer is injecting here
+//! (`note_remote_input`) never crosses over: the backends leave injected
+//! events alone where they can tell them apart (macOS, Windows), and no
+//! crossing is taken while such input is arriving (Linux, where the
+//! compositor's barrier can't tell). **Real bug fixed here**: on a Mac
+//! being driven from Windows, the Mac's own event tap took the moves it was
+//! injecting for Windows as the Mac's mouse — the pointer, driven to the
+//! Mac's edge facing Windows, "crossed" back, both computers' input went
+//! round in a loop, and the cursor vanished on one of them.
 //!
 //! **Getting back no matter what.** Double-tapping Control brings the mouse
 //! and keyboard back on this computer alone, before anything is sent, so it
@@ -61,7 +72,8 @@ use crate::remote_viewer::{KeyTranslator, KeyboardForwarder};
 use continuity_daemon::{EngineCommand, RemoteControlRole, SyncEvent};
 use continuity_proto::{InputEventKind, MouseButton as ProtoMouseButton, Platform, ScreenEdge, ScreenSize};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tao::keyboard::KeyCode;
 use tokio::sync::mpsc::UnboundedSender;
@@ -70,13 +82,23 @@ use tokio::sync::mpsc::UnboundedSender;
 /// bring the mouse and keyboard back to this computer.
 const ESCAPE_DOUBLE_TAP: Duration = Duration::from_millis(400);
 
-/// How far in from the edge the cursor is put when it comes back — past
-/// the edge check's one pixel, so standing there isn't already crossing.
+/// How far in from the edge the cursor is put when it comes back, and the
+/// other computer's pointer when it arrives — past the edge checks' one
+/// pixel, so standing there isn't already crossing.
 const RETURN_INSET: f64 = 4.0;
 
 /// After the cursor comes back, how long a move at the edge is left alone
 /// — the moves of the gesture that brought it back are still arriving.
 const RECROSS_HOLDOFF: Duration = Duration::from_millis(300);
+
+/// How long after input another computer injected here the cursor can't
+/// cross over (see the module docs).
+const REMOTE_INPUT_QUIET: Duration = Duration::from_millis(400);
+
+/// After a session ended with nothing wrong (the connection blinked, a
+/// screen session took its place), how long before asking for a new one —
+/// if the computer is still placed and connected by then.
+const ASK_AGAIN_AFTER: Duration = Duration::from_secs(2);
 
 /// A move at least this long pins the other computer's pointer to an edge
 /// wherever it was (see `arrival_moves`); the Linux host recognizes it.
@@ -91,6 +113,27 @@ pub(crate) const WHEEL_NOTCH: f64 = 24.0;
 /// at ends (for the window's status). Never from `set_placements`, which
 /// the event loop calls in response to this.
 pub type OnChange = Arc<dyn Fn() + Send + Sync>;
+
+/// When input another computer sent was last injected here, in
+/// milliseconds since `clock()` started (0: never).
+static REMOTE_INPUT_AT: AtomicU64 = AtomicU64::new(0);
+
+fn clock() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64 + 1
+}
+
+/// Called by this computer's remote-control host for every event another
+/// computer has it inject: while those arrive, the cursor here is being
+/// driven from over there, and never crosses over on its own account.
+pub(crate) fn note_remote_input() {
+    REMOTE_INPUT_AT.store(clock(), Ordering::Relaxed);
+}
+
+fn driven_from_elsewhere() -> bool {
+    let at = REMOTE_INPUT_AT.load(Ordering::Relaxed);
+    at != 0 && clock().saturating_sub(at) < REMOTE_INPUT_QUIET.as_millis() as u64
+}
 
 /// A point in this computer's screen coordinates, as its backend reports
 /// them (points on macOS, pixels on Windows, logical pixels on Linux).
@@ -125,6 +168,10 @@ pub(crate) enum LocalInput {
 /// What's known about a computer placed at an edge, once its session is up.
 #[derive(Clone)]
 struct Target {
+    /// The engine's session, so the end of some other session with the
+    /// same computer (it controlling this one, say) isn't taken for this
+    /// one's.
+    session_id: String,
     name: String,
     platform: Platform,
     /// The other screen's size, when it said — without it the pointer is
@@ -140,6 +187,16 @@ struct Grab {
     /// Control keys down right now, so a held one's auto-repeat (Windows
     /// repeats them) isn't taken for a second tap.
     controls_held: Vec<KeyCode>,
+    /// Keys and buttons that were already down here when the mouse went
+    /// over: they stay this computer's until let go, so the release isn't
+    /// swallowed and left stuck down here.
+    keys_here: Vec<KeyCode>,
+    buttons_here: Vec<ProtoMouseButton>,
+    /// The fractions of a pixel not yet forwarded, of moves and of
+    /// scrolling: a host injects whole pixels, and a slow mouse (libei's
+    /// are fractional) would otherwise not move it at all.
+    move_carry: (f64, f64),
+    scroll_carry: (f64, f64),
     /// Where the cursor comes back to on escape: by the edge it left
     /// through, a few pixels in.
     left_at: Point,
@@ -154,6 +211,14 @@ struct State {
     platforms: HashMap<String, Platform>,
     /// Peers with an input-only session up.
     sessions: HashMap<String, Target>,
+    /// Screen sessions this computer has open, by peer: sharing's session
+    /// with that computer gives way to one, and is asked for again once it
+    /// ends.
+    screen_sessions: HashMap<String, String>,
+    /// Keys and buttons down here while the mouse is here — see
+    /// `Grab::keys_here`.
+    keys_here: Vec<KeyCode>,
+    buttons_here: Vec<ProtoMouseButton>,
     grab: Option<Grab>,
     /// Whether the backend is watching input (started once there's
     /// something to watch for, and the permission for it).
@@ -242,6 +307,7 @@ impl InputShare {
             }
             SyncEvent::Disconnected { peer_id, .. } | SyncEvent::WasRevoked { peer_id, .. } | SyncEvent::RevokedByPeer { peer_id, .. } => {
                 state.platforms.remove(peer_id);
+                state.screen_sessions.remove(peer_id);
                 if state.sessions.remove(peer_id).is_some() {
                     if state.grab.as_ref().is_some_and(|g| &g.peer_id == peer_id) {
                         shared.release(&mut state, None);
@@ -254,29 +320,48 @@ impl InputShare {
             SyncEvent::WasReset => {
                 state.platforms.clear();
                 state.sessions.clear();
+                state.screen_sessions.clear();
                 if state.grab.is_some() {
                     shared.release(&mut state, None);
                 }
                 drop(state);
                 shared.backend.placements_changed(&shared.watched_edges());
             }
-            SyncEvent::RemoteControlSessionStarted { peer_id, peer_name, role, screen: false, screen_size, .. }
-                if *role == RemoteControlRole::Controlling =>
-            {
+            SyncEvent::RemoteControlSessionStarted { peer_id, session_id, role: RemoteControlRole::Controlling, screen: true, .. } => {
+                state.screen_sessions.insert(peer_id.clone(), session_id.clone());
+            }
+            SyncEvent::RemoteControlSessionStarted { peer_id, peer_name, session_id, role: RemoteControlRole::Controlling, screen: false, screen_size } => {
                 let platform = state.platforms.get(peer_id).copied().unwrap_or(Platform::MacOs);
-                state.sessions.insert(peer_id.clone(), Target { name: peer_name.clone(), platform, screen_size: *screen_size });
-                tracing::info!("sharing the keyboard and mouse with '{peer_name}' when the cursor crosses to it");
+                let target = Target { session_id: session_id.clone(), name: peer_name.clone(), platform, screen_size: *screen_size };
+                state.sessions.insert(peer_id.clone(), target);
+                tracing::info!("sharing the keyboard and mouse with '{peer_name}' when the cursor crosses to it (its screen {screen_size:?})");
                 drop(state);
                 shared.backend.placements_changed(&shared.watched_edges());
             }
-            SyncEvent::RemoteControlSessionEnded { peer_id, .. } => {
-                if state.sessions.remove(peer_id).is_some() {
-                    if state.grab.as_ref().is_some_and(|g| &g.peer_id == peer_id) {
-                        shared.release(&mut state, None);
-                    }
+            SyncEvent::RemoteControlSessionEnded { peer_id, peer_name, session_id, reason } => {
+                if state.screen_sessions.get(peer_id) == Some(session_id) {
+                    // A screen session took sharing's place; sharing comes
+                    // back now it's over.
+                    state.screen_sessions.remove(peer_id);
                     drop(state);
-                    shared.backend.placements_changed(&shared.watched_edges());
-                    (shared.on_change)();
+                    shared.ask_again_later(peer_id.clone());
+                    return;
+                }
+                if !state.sessions.get(peer_id).is_some_and(|target| &target.session_id == session_id) {
+                    return;
+                }
+                state.sessions.remove(peer_id);
+                if state.grab.as_ref().is_some_and(|g| &g.peer_id == peer_id) {
+                    shared.release(&mut state, None);
+                }
+                drop(state);
+                shared.backend.placements_changed(&shared.watched_edges());
+                (shared.on_change)();
+                match reason {
+                    // Nothing wrong: asked for again, if it's still placed
+                    // and connected by then.
+                    None => shared.ask_again_later(peer_id.clone()),
+                    Some(reason) => tracing::info!("keyboard-and-mouse sharing with '{peer_name}' ended: {reason}"),
                 }
             }
             SyncEvent::RemoteControlDeclined { peer_id, peer_name } => {
@@ -333,10 +418,37 @@ impl Shared {
         }
     }
 
+    /// Asks `peer_id` for a session again after `ASK_AGAIN_AFTER`, if by
+    /// then it's still placed and connected, with no session — sharing's or
+    /// a screen one — up or on its way. (The engine drops a request while
+    /// one is pending.)
+    fn ask_again_later(self: &Arc<Self>, peer_id: String) {
+        let shared = self.clone();
+        let spawned = std::thread::Builder::new().name("input-share-ask".to_string()).spawn(move || {
+            std::thread::sleep(ASK_AGAIN_AFTER);
+            let state = shared.state.lock().unwrap();
+            let wanted = state.placements.contains_key(&peer_id)
+                && state.platforms.contains_key(&peer_id)
+                && !state.sessions.contains_key(&peer_id)
+                && !state.screen_sessions.contains_key(&peer_id);
+            drop(state);
+            if wanted {
+                let _ = shared.commands.send(EngineCommand::RequestRemoteControl { peer_crypto_id: peer_id, screen: false });
+            }
+        });
+        if let Err(e) = spawned {
+            tracing::debug!("couldn't schedule asking for keyboard-and-mouse sharing again: {e}");
+        }
+    }
+
     /// The placed edges with a session up — the ones worth watching.
     fn watched_edges(&self) -> Vec<ScreenEdge> {
         let state = self.state.lock().unwrap();
-        state.placements.iter().filter(|(peer_id, _)| state.sessions.contains_key(*peer_id)).map(|(_, edge)| *edge).collect()
+        let mut edges: Vec<ScreenEdge> =
+            state.placements.iter().filter(|(peer_id, _)| state.sessions.contains_key(*peer_id)).map(|(_, edge)| *edge).collect();
+        edges.sort_by_key(|edge| *edge as u8);
+        edges.dedup();
+        edges
     }
 
     /// Whether the mouse and keyboard are over there right now.
@@ -346,17 +458,25 @@ impl Shared {
     }
 
     /// One event from the backend. Returns whether to swallow it: every
-    /// event while the mouse is over there, none while it's here.
+    /// event while the mouse is over there, including the move that took it
+    /// there, and none while it's here.
     pub(crate) fn on_input(&self, input: LocalInput) -> bool {
         let mut state = self.state.lock().unwrap();
         if state.grab.is_none() {
-            if let LocalInput::Moved { at, delta } = input {
-                if let Some((peer_id, edge)) = crossing(&state, self.backend.screen(), at, delta) {
-                    let position = self.backend.screen().and_then(|bounds| edge_of(at, bounds)).map_or(0.5, |(_, position)| position);
-                    self.grab(&mut state, peer_id, edge, position, at);
-                    drop(state);
-                    (self.on_change)();
+            match input {
+                LocalInput::Moved { at, delta } => {
+                    if let Some((peer_id, edge)) = crossing(&state, self.backend.screen(), at, delta, driven_from_elsewhere()) {
+                        let position = self.backend.screen().and_then(|bounds| edge_of(at, bounds)).map_or(0.5, |(_, position)| position);
+                        self.grab(&mut state, peer_id, edge, position, at);
+                        let taken = state.grab.is_some();
+                        drop(state);
+                        (self.on_change)();
+                        return taken;
+                    }
                 }
+                LocalInput::Key { key: Some(key), down } => held(&mut state.keys_here, key, down),
+                LocalInput::Button { button, down } => held(&mut state.buttons_here, button, down),
+                LocalInput::Key { key: None, .. } | LocalInput::Scroll { .. } => {}
             }
             return false;
         }
@@ -384,11 +504,20 @@ impl Shared {
         };
         match input {
             LocalInput::Moved { delta: (dx, dy), .. } => {
+                let (dx, dy) = (whole(&mut grabbed.move_carry.0, dx), whole(&mut grabbed.move_carry.1, dy));
                 if dx != 0.0 || dy != 0.0 {
                     send(InputEventKind::MouseMoveRelative { dx, dy });
                 }
             }
             LocalInput::Button { button, down } => {
+                if grabbed.buttons_here.contains(&button) {
+                    // Down since before the mouse went over: this
+                    // computer's to let go of.
+                    if !down {
+                        grabbed.buttons_here.retain(|&held| held != button);
+                    }
+                    return false;
+                }
                 if down {
                     if !grabbed.buttons.contains(&button) {
                         grabbed.buttons.push(button);
@@ -399,6 +528,7 @@ impl Shared {
                 send(InputEventKind::MouseButton { button, down });
             }
             LocalInput::Scroll { dx, dy } => {
+                let (dx, dy) = (whole(&mut grabbed.scroll_carry.0, dx), whole(&mut grabbed.scroll_carry.1, dy));
                 if dx != 0.0 || dy != 0.0 {
                     send(InputEventKind::MouseScroll { delta_x: dx, delta_y: dy });
                 }
@@ -407,6 +537,13 @@ impl Shared {
                 grabbed.last_control_tap = None;
             }
             LocalInput::Key { key: Some(key), down } => {
+                if grabbed.keys_here.contains(&key) {
+                    // Its auto-repeat and its release both stay here.
+                    if !down {
+                        grabbed.keys_here.retain(|&held| held != key);
+                    }
+                    return false;
+                }
                 if matches!(key, KeyCode::ControlLeft | KeyCode::ControlRight) {
                     let repeat = down && grabbed.controls_held.contains(&key);
                     if down && !repeat {
@@ -438,18 +575,24 @@ impl Shared {
     /// The system decided the cursor crossed `edge` at `position` along it
     /// (Linux: the compositor's pointer barrier). Returns whether the mouse
     /// is now over there — `false` when nothing is placed there with a
-    /// session up, and the backend should give input back.
+    /// session up, or the pointer is being driven from another computer,
+    /// and the backend should give input back.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn crossed(&self, edge: ScreenEdge, position: f64, at: Point) -> bool {
         let mut state = self.state.lock().unwrap();
         if state.grab.is_some() {
             return true;
         }
+        if driven_from_elsewhere() {
+            tracing::debug!("not crossing at the {edge:?} edge: the pointer here is being driven from another computer");
+            return false;
+        }
         let Some(peer_id) = placed_with_session(&state, edge) else { return false };
         self.grab(&mut state, peer_id, edge, position, at);
+        let taken = state.grab.is_some();
         drop(state);
         (self.on_change)();
-        true
+        taken
     }
 
     /// The system took input back on its own (Linux: the compositor ended
@@ -469,11 +612,11 @@ impl Shared {
     fn grab(&self, state: &mut State, peer_id: String, edge: ScreenEdge, position: f64, at: Point) {
         let Some(target) = state.sessions.get(&peer_id).cloned() else { return };
         // A computer that can place its pointer (it said how big its screen
-        // is) gets the exact point; one that can only move it (Linux,
-        // input-only) gets moves that pin it to the arriving edge.
+        // is) gets the exact point; one that can only move it gets moves
+        // that pin it to the arriving edge.
         let events = match target.screen_size {
-            Some(_) => {
-                let (x, y) = arrival(edge, position);
+            Some(size) => {
+                let (x, y) = arrival(edge, position, Some(size));
                 vec![InputEventKind::MouseMove { x, y }]
             }
             None => arrival_moves(edge, position, None),
@@ -483,12 +626,16 @@ impl Shared {
         }
         let left_at = self.backend.screen().map_or(at, |bounds| point_on_edge(bounds, edge, position));
         self.backend.grabbed(left_at);
-        tracing::info!("keyboard and mouse now go to '{}'", target.name);
+        tracing::info!("keyboard and mouse now go to '{}' (left through the {edge:?} edge at {position:.2})", target.name);
         state.grab = Some(Grab {
             peer_id,
             keyboard: KeyboardForwarder::new(KeyTranslator::new(cfg!(target_os = "macos"), target.platform)),
             buttons: Vec::new(),
             controls_held: Vec::new(),
+            keys_here: std::mem::take(&mut state.keys_here),
+            buttons_here: std::mem::take(&mut state.buttons_here),
+            move_carry: (0.0, 0.0),
+            scroll_carry: (0.0, 0.0),
             left_at,
             last_control_tap: None,
         });
@@ -508,10 +655,34 @@ impl Shared {
         for event in grabbed.keyboard.release_all() {
             let _ = self.commands.send(EngineCommand::SendInputEvent { peer_crypto_id: grabbed.peer_id.clone(), event });
         }
+        // Still down here from before: still this computer's.
+        state.keys_here = grabbed.keys_here;
+        state.buttons_here = grabbed.buttons_here;
         self.backend.released(at.unwrap_or(grabbed.left_at));
         state.released_at = Some(Instant::now());
         tracing::info!("keyboard and mouse are back on this computer");
     }
+}
+
+/// Keeps `down_now` to what's down: `item` added on a press, removed on a
+/// release.
+fn held<T: PartialEq>(down_now: &mut Vec<T>, item: T, down: bool) {
+    if down {
+        if !down_now.contains(&item) {
+            down_now.push(item);
+        }
+    } else {
+        down_now.retain(|other| *other != item);
+    }
+}
+
+/// The whole pixels of `delta` plus what `carry` held back last time,
+/// keeping the fraction left over in `carry` for the next one.
+fn whole(carry: &mut f64, delta: f64) -> f64 {
+    let total = *carry + delta;
+    let whole = total.trunc();
+    *carry = total - whole;
+    whole
 }
 
 /// The peer placed at `edge` with a session up, if any.
@@ -522,13 +693,14 @@ fn placed_with_session(state: &State, edge: ScreenEdge) -> Option<String> {
 /// The peer the cursor at `at` has just crossed onto, if any, and through
 /// which edge: at a placed edge of `screen`, moving *outward* through it
 /// (`delta`, the move that got it there), with a session up for the
-/// computer placed there — and not within `RECROSS_HOLDOFF` of coming back.
+/// computer placed there — and not within `RECROSS_HOLDOFF` of coming back,
+/// nor while another computer is driving the pointer here (`driven`).
 /// **Real bug fixed here**: the cursor came back one pixel inside the edge,
 /// which the edge check counts as at it, so the first movement after
 /// returning crossed straight over again — the mouse was trapped on the
 /// other computer, and only the escape chord brought it home.
-fn crossing(state: &State, screen: Option<Bounds>, at: Point, delta: (f64, f64)) -> Option<(String, ScreenEdge)> {
-    if state.released_at.is_some_and(|released| released.elapsed() < RECROSS_HOLDOFF) {
+fn crossing(state: &State, screen: Option<Bounds>, at: Point, delta: (f64, f64), driven: bool) -> Option<(String, ScreenEdge)> {
+    if driven || state.released_at.is_some_and(|released| released.elapsed() < RECROSS_HOLDOFF) {
         return None;
     }
     let (edge, _) = edge_of(at, screen?)?;
@@ -585,38 +757,47 @@ pub(crate) fn point_on_edge(bounds: Bounds, edge: ScreenEdge, position: f64) -> 
 
 /// Where the other computer's pointer appears for a cursor leaving through
 /// `edge` at `position`: the matching point of the opposite edge, as the
-/// normalized position `MouseMove` takes.
-fn arrival(edge: ScreenEdge, position: f64) -> (f64, f64) {
+/// normalized position `MouseMove` takes — `RETURN_INSET` pixels in when
+/// the other screen's size is known, so a first move along the edge, or a
+/// little back, isn't already the way home.
+fn arrival(edge: ScreenEdge, position: f64, size: Option<ScreenSize>) -> (f64, f64) {
     let position = position.clamp(0.0, 1.0);
+    let inset = |extent: u32| if extent > 1 { (RETURN_INSET / f64::from(extent - 1)).min(0.5) } else { 0.0 };
+    let (inset_x, inset_y) = size.map_or((0.0, 0.0), |size| (inset(size.width), inset(size.height)));
     match edge {
-        ScreenEdge::Left => (1.0, position),
-        ScreenEdge::Right => (0.0, position),
-        ScreenEdge::Top => (position, 1.0),
-        ScreenEdge::Bottom => (position, 0.0),
+        ScreenEdge::Left => (1.0 - inset_x, position),
+        ScreenEdge::Right => (inset_x, position),
+        ScreenEdge::Top => (position, 1.0 - inset_y),
+        ScreenEdge::Bottom => (position, inset_y),
     }
 }
 
 /// The moves that put the other computer's pointer where `arrival` says
-/// when it can only be moved, not placed: a pin to the top (or left), then
-/// a pin to the arriving edge — last, so a host that tracks pins (Linux)
-/// takes that one as the edge the pointer is at — then along the edge by
-/// `position` of `screen`, or nothing more with the size unknown.
+/// when it can only be moved, not placed: a pin to the bottom (or the
+/// right), then a pin to the arriving edge — last, so a host that tracks
+/// pins (Linux) takes that one as the edge the pointer is at — then along
+/// the edge by `position` of `screen`, or nothing more with the size
+/// unknown. Never through the top-left corner: a pin into it opens GNOME's
+/// Activities overview (its hot corner). **Real bug fixed here**: the pins
+/// went to the top first, so a cursor crossing onto a Linux computer from
+/// its left landed in that corner and opened the overview.
 fn arrival_moves(edge: ScreenEdge, position: f64, screen: Option<ScreenSize>) -> Vec<InputEventKind> {
     let position = position.clamp(0.0, 1.0);
     let (secondary, arriving) = match edge {
-        ScreenEdge::Left => ((0.0, -PIN), (PIN, 0.0)),
-        ScreenEdge::Right => ((0.0, -PIN), (-PIN, 0.0)),
-        ScreenEdge::Top => ((-PIN, 0.0), (0.0, PIN)),
-        ScreenEdge::Bottom => ((-PIN, 0.0), (0.0, -PIN)),
+        ScreenEdge::Left => ((0.0, PIN), (PIN, 0.0)),
+        ScreenEdge::Right => ((0.0, PIN), (-PIN, 0.0)),
+        ScreenEdge::Top => ((PIN, 0.0), (0.0, PIN)),
+        ScreenEdge::Bottom => ((PIN, 0.0), (0.0, -PIN)),
     };
     let mut moves = vec![
         InputEventKind::MouseMoveRelative { dx: secondary.0, dy: secondary.1 },
         InputEventKind::MouseMoveRelative { dx: arriving.0, dy: arriving.1 },
     ];
     if let Some(size) = screen {
+        // From the bottom (or right) end of the edge.
         let along = match edge {
-            ScreenEdge::Left | ScreenEdge::Right => InputEventKind::MouseMoveRelative { dx: 0.0, dy: position * f64::from(size.height) },
-            ScreenEdge::Top | ScreenEdge::Bottom => InputEventKind::MouseMoveRelative { dx: position * f64::from(size.width), dy: 0.0 },
+            ScreenEdge::Left | ScreenEdge::Right => InputEventKind::MouseMoveRelative { dx: 0.0, dy: -(1.0 - position) * f64::from(size.height) },
+            ScreenEdge::Top | ScreenEdge::Bottom => InputEventKind::MouseMoveRelative { dx: -(1.0 - position) * f64::from(size.width), dy: 0.0 },
         };
         moves.push(along);
     }
@@ -631,25 +812,46 @@ mod tests {
 
     #[test]
     fn a_cursor_leaving_one_edge_arrives_at_the_opposite_one() {
-        assert_eq!(arrival(ScreenEdge::Right, 0.25), (0.0, 0.25));
-        assert_eq!(arrival(ScreenEdge::Left, 0.75), (1.0, 0.75));
-        assert_eq!(arrival(ScreenEdge::Top, 0.1), (0.1, 1.0));
-        assert_eq!(arrival(ScreenEdge::Bottom, 0.9), (0.9, 0.0));
-        assert_eq!(arrival(ScreenEdge::Right, 7.0), (0.0, 1.0), "clamped");
+        assert_eq!(arrival(ScreenEdge::Right, 0.25, None), (0.0, 0.25));
+        assert_eq!(arrival(ScreenEdge::Left, 0.75, None), (1.0, 0.75));
+        assert_eq!(arrival(ScreenEdge::Top, 0.1, None), (0.1, 1.0));
+        assert_eq!(arrival(ScreenEdge::Bottom, 0.9, None), (0.9, 0.0));
+        assert_eq!(arrival(ScreenEdge::Right, 7.0, None), (0.0, 1.0), "clamped");
+    }
+
+    #[test]
+    fn with_the_size_known_it_arrives_a_few_pixels_in() {
+        let size = Some(ScreenSize { width: 1441, height: 901 });
+        let (x, y) = arrival(ScreenEdge::Right, 0.5, size);
+        assert_eq!((x * 1440.0, y), (4.0, 0.5), "4 px from the left edge");
+        let (x, _) = arrival(ScreenEdge::Left, 0.5, size);
+        assert_eq!(((1.0 - x) * 1440.0).round(), 4.0, "4 px from the right edge");
+        let (_, y) = arrival(ScreenEdge::Bottom, 0.5, size);
+        assert_eq!(y * 900.0, 4.0);
+        // ...which a host's own edge check doesn't count as at the edge.
+        let other = Bounds { x: 0.0, y: 0.0, width: 1441.0, height: 901.0 };
+        let (x, y) = arrival(ScreenEdge::Right, 0.5, size);
+        assert_eq!(edge_of(Point { x: x * 1440.0, y: y * 900.0 }, other), None);
     }
 
     #[test]
     fn arrival_by_moves_pins_to_the_edge_last_then_goes_along_it() {
         let size = Some(ScreenSize { width: 1920, height: 1080 });
         // Leaving through the right edge: arrive at the other's left.
-        let moves = arrival_moves(ScreenEdge::Right, 0.5, size);
-        assert!(matches!(moves[0], InputEventKind::MouseMoveRelative { dx, dy } if dx == 0.0 && dy <= -PIN), "top first");
+        let moves = arrival_moves(ScreenEdge::Right, 0.25, size);
+        assert!(matches!(moves[0], InputEventKind::MouseMoveRelative { dx, dy } if dx == 0.0 && dy >= PIN), "the bottom first");
         assert!(matches!(moves[1], InputEventKind::MouseMoveRelative { dx, dy } if dx <= -PIN && dy == 0.0), "then the left edge");
-        assert!(matches!(moves[2], InputEventKind::MouseMoveRelative { dx, dy } if dx == 0.0 && dy == 540.0));
+        assert!(matches!(moves[2], InputEventKind::MouseMoveRelative { dx, dy } if dx == 0.0 && dy == -810.0), "a quarter of the way down");
         let moves = arrival_moves(ScreenEdge::Top, 0.25, size);
-        assert!(matches!(moves[1], InputEventKind::MouseMoveRelative { dx, dy } if dx == 0.0 && dy >= PIN), "the bottom edge");
-        assert!(matches!(moves[2], InputEventKind::MouseMoveRelative { dx, dy } if dx == 480.0 && dy == 0.0));
+        assert!(matches!(moves[0], InputEventKind::MouseMoveRelative { dx, dy } if dx >= PIN && dy == 0.0), "the right first");
+        assert!(matches!(moves[1], InputEventKind::MouseMoveRelative { dx, dy } if dx == 0.0 && dy >= PIN), "then the bottom edge");
+        assert!(matches!(moves[2], InputEventKind::MouseMoveRelative { dx, dy } if dx == -1440.0 && dy == 0.0));
         assert_eq!(arrival_moves(ScreenEdge::Left, 0.5, None).len(), 2, "no size: the pins alone");
+        // None of them heads for the top-left corner.
+        for edge in [ScreenEdge::Left, ScreenEdge::Right, ScreenEdge::Top, ScreenEdge::Bottom] {
+            let InputEventKind::MouseMoveRelative { dx, dy } = arrival_moves(edge, 0.5, None)[0] else { unreachable!() };
+            assert!(dx >= 0.0 && dy >= 0.0, "{edge:?}");
+        }
     }
 
     #[test]
@@ -677,21 +879,56 @@ mod tests {
         }
     }
 
+    fn target(session_id: &str) -> Target {
+        Target { session_id: session_id.into(), name: "PC".into(), platform: Platform::Windows, screen_size: None }
+    }
+
     #[test]
     fn crossing_needs_a_placed_edge_a_session_and_an_outward_move() {
         let mut state = State::default();
         state.placements.insert("pc".into(), ScreenEdge::Right);
         let right = Point { x: 1919.0, y: 10.0 };
         let outward = (3.0, 0.0);
-        assert_eq!(crossing(&state, Some(SCREEN), right, outward), None, "placed, but no session yet");
-        state.sessions.insert("pc".into(), Target { name: "PC".into(), platform: Platform::Windows, screen_size: None });
-        assert_eq!(crossing(&state, Some(SCREEN), right, outward), Some(("pc".to_string(), ScreenEdge::Right)));
-        assert_eq!(crossing(&state, Some(SCREEN), right, (-3.0, 0.0)), None, "moving away from the edge isn't crossing");
-        assert_eq!(crossing(&state, Some(SCREEN), right, (0.0, 5.0)), None, "nor moving along it");
-        assert_eq!(crossing(&state, Some(SCREEN), Point { x: 960.0, y: 540.0 }, outward), None);
-        assert_eq!(crossing(&state, Some(SCREEN), Point { x: 0.0, y: 10.0 }, (-3.0, 0.0)), None, "nothing placed there");
-        assert_eq!(crossing(&state, None, right, outward), None, "no screen known");
+        assert_eq!(crossing(&state, Some(SCREEN), right, outward, false), None, "placed, but no session yet");
+        state.sessions.insert("pc".into(), target("s1"));
+        assert_eq!(crossing(&state, Some(SCREEN), right, outward, false), Some(("pc".to_string(), ScreenEdge::Right)));
+        assert_eq!(crossing(&state, Some(SCREEN), right, outward, true), None, "never while driven from another computer");
+        assert_eq!(crossing(&state, Some(SCREEN), right, (-3.0, 0.0), false), None, "moving away from the edge isn't crossing");
+        assert_eq!(crossing(&state, Some(SCREEN), right, (0.0, 5.0), false), None, "nor moving along it");
+        assert_eq!(crossing(&state, Some(SCREEN), Point { x: 960.0, y: 540.0 }, outward, false), None);
+        assert_eq!(crossing(&state, Some(SCREEN), Point { x: 0.0, y: 10.0 }, (-3.0, 0.0), false), None, "nothing placed there");
+        assert_eq!(crossing(&state, None, right, outward, false), None, "no screen known");
         state.released_at = Some(Instant::now());
-        assert_eq!(crossing(&state, Some(SCREEN), right, outward), None, "just came back: not again yet");
+        assert_eq!(crossing(&state, Some(SCREEN), right, outward, false), None, "just came back: not again yet");
+    }
+
+    #[test]
+    fn injected_input_counts_as_driven_for_a_moment() {
+        note_remote_input();
+        assert!(driven_from_elsewhere());
+        REMOTE_INPUT_AT.store(clock().saturating_sub(REMOTE_INPUT_QUIET.as_millis() as u64 + 1), Ordering::Relaxed);
+        assert!(!driven_from_elsewhere(), "quiet long enough");
+    }
+
+    #[test]
+    fn fractions_of_a_pixel_add_up_instead_of_vanishing() {
+        let mut carry = 0.0;
+        let sent: Vec<f64> = [0.4, 0.4, 0.4, -0.3, 2.75].iter().map(|&d| whole(&mut carry, d)).collect();
+        assert_eq!(sent, vec![0.0, 0.0, 1.0, 0.0, 2.0]);
+        assert!((carry - 0.65).abs() < 1e-9);
+        let mut carry = 0.0;
+        assert_eq!(whole(&mut carry, -1.5), -1.0);
+        assert_eq!(whole(&mut carry, -0.5), -1.0, "negative fractions carry too");
+    }
+
+    #[test]
+    fn held_tracks_whats_down() {
+        let mut keys = Vec::new();
+        held(&mut keys, KeyCode::ShiftLeft, true);
+        held(&mut keys, KeyCode::ShiftLeft, true);
+        held(&mut keys, KeyCode::KeyA, true);
+        assert_eq!(keys, vec![KeyCode::ShiftLeft, KeyCode::KeyA], "a repeat isn't a second key");
+        held(&mut keys, KeyCode::ShiftLeft, false);
+        assert_eq!(keys, vec![KeyCode::KeyA]);
     }
 }

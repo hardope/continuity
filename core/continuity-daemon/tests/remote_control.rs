@@ -648,3 +648,183 @@ async fn an_input_only_session_relays_moves_and_reports_edges_without_capturing(
     a.shutdown();
     b.shutdown();
 }
+
+/// Waits until both engines have seen the other connect.
+async fn connect_both(a: &mut EngineHandle, b: &mut EngineHandle) {
+    let (mut a_connected, mut b_connected) = (false, false);
+    let deadline = tokio::time::sleep(Duration::from_secs(15));
+    tokio::pin!(deadline);
+    while !(a_connected && b_connected) {
+        tokio::select! {
+            _ = &mut deadline => panic!("A and B never connected"),
+            Some(ev) = a.events.recv() => if matches!(ev, SyncEvent::Connected { .. }) { a_connected = true },
+            Some(ev) = b.events.recv() => if matches!(ev, SyncEvent::Connected { .. }) { b_connected = true },
+        }
+    }
+}
+
+/// Two computers placed at each other's edges each keep a keyboard-and-mouse
+/// sharing session open controlling the other: both directions at once,
+/// even when both ask at the same moment, and ending one leaves the other.
+/// **Real bug fixed here** (see `remote_control_sessions` in `engine.rs`):
+/// sessions were kept one per peer, so the second direction never started —
+/// and when both asked at once, neither did.
+#[tokio::test]
+async fn two_computers_can_share_with_each_other_at_once() {
+    let a_identity = Identity::generate();
+    let b_identity = Identity::generate();
+    let a_id = a_identity.device_id();
+    let b_id = b_identity.device_id();
+
+    let a_host = FakeRemoteControlHost::default();
+    let b_host = FakeRemoteControlHost::default();
+    let mut a = make_engine("BothA", a_identity, &b_id, "BothB", Arc::new(a_host.clone())).await.expect("start engine A");
+    let mut b = make_engine("BothB", b_identity, &a_id, "BothA", Arc::new(b_host.clone())).await.expect("start engine B");
+    connect_both(&mut a, &mut b).await;
+
+    // Both ask at the same moment.
+    a.send_command(EngineCommand::RequestRemoteControl { peer_crypto_id: b_id.clone(), screen: false });
+    b.send_command(EngineCommand::RequestRemoteControl { peer_crypto_id: a_id.clone(), screen: false });
+
+    let mut a_roles = Vec::new();
+    let mut b_roles = Vec::new();
+    let deadline = tokio::time::sleep(Duration::from_secs(20));
+    tokio::pin!(deadline);
+    while a_roles.len() < 2 || b_roles.len() < 2 {
+        tokio::select! {
+            _ = &mut deadline => panic!("not every session started: A {a_roles:?}, B {b_roles:?}"),
+            Some(ev) = a.events.recv() => match ev {
+                SyncEvent::RemoteControlRequested { .. } => a.send_command(EngineCommand::RespondToRemoteControlRequest { peer_crypto_id: b_id.clone(), accept: true }),
+                SyncEvent::RemoteControlSessionStarted { role, screen: false, .. } => a_roles.push(role),
+                SyncEvent::RemoteControlDeclined { .. } => panic!("B declined A"),
+                SyncEvent::RemoteControlSessionEnded { reason, .. } => panic!("one of A's sessions ended: {reason:?}"),
+                _ => {}
+            },
+            Some(ev) = b.events.recv() => match ev {
+                SyncEvent::RemoteControlRequested { .. } => b.send_command(EngineCommand::RespondToRemoteControlRequest { peer_crypto_id: a_id.clone(), accept: true }),
+                SyncEvent::RemoteControlSessionStarted { role, screen: false, .. } => b_roles.push(role),
+                SyncEvent::RemoteControlDeclined { .. } => panic!("A declined B"),
+                SyncEvent::RemoteControlSessionEnded { reason, .. } => panic!("one of B's sessions ended: {reason:?}"),
+                _ => {}
+            },
+        }
+    }
+    for roles in [&mut a_roles, &mut b_roles] {
+        roles.sort_by_key(|role| *role == RemoteControlRole::Controlled);
+        assert_eq!(*roles, vec![RemoteControlRole::Controlling, RemoteControlRole::Controlled]);
+    }
+
+    // Input goes both ways.
+    a.send_command(EngineCommand::SendInputEvent { peer_crypto_id: b_id.clone(), event: InputEventKind::MouseMoveRelative { dx: 1.0, dy: 0.0 } });
+    b.send_command(EngineCommand::SendInputEvent { peer_crypto_id: a_id.clone(), event: InputEventKind::MouseMoveRelative { dx: 0.0, dy: 2.0 } });
+    let injected = |host: &FakeRemoteControlHost| host.injected.lock().unwrap().len();
+    let deadline = tokio::time::sleep(Duration::from_secs(5));
+    tokio::pin!(deadline);
+    while injected(&a_host) < 1 || injected(&b_host) < 1 {
+        tokio::select! {
+            _ = &mut deadline => panic!("input didn't go both ways: A injected {}, B {}", injected(&a_host), injected(&b_host)),
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            Some(_) = a.events.recv() => {}
+            Some(_) = b.events.recv() => {}
+        }
+    }
+
+    // A stops controlling B; B still controls A.
+    a.send_command(EngineCommand::EndRemoteControlSession { peer_crypto_id: b_id.clone() });
+    let (mut a_ended, mut b_ended) = (false, false);
+    let deadline = tokio::time::sleep(Duration::from_secs(5));
+    tokio::pin!(deadline);
+    while !(a_ended && b_ended) {
+        tokio::select! {
+            _ = &mut deadline => panic!("the end of A's control of B wasn't seen on both sides"),
+            Some(ev) = a.events.recv() => if matches!(ev, SyncEvent::RemoteControlSessionEnded { .. }) { a_ended = true },
+            Some(ev) = b.events.recv() => if matches!(ev, SyncEvent::RemoteControlSessionEnded { .. }) { b_ended = true },
+        }
+    }
+    let before = injected(&a_host);
+    b.send_command(EngineCommand::SendInputEvent { peer_crypto_id: a_id.clone(), event: InputEventKind::MouseMoveRelative { dx: 3.0, dy: 0.0 } });
+    a.send_command(EngineCommand::SendInputEvent { peer_crypto_id: b_id.clone(), event: InputEventKind::MouseMoveRelative { dx: 4.0, dy: 0.0 } });
+    let deadline = tokio::time::sleep(Duration::from_secs(5));
+    tokio::pin!(deadline);
+    while injected(&a_host) == before {
+        tokio::select! {
+            _ = &mut deadline => panic!("B's control of A ended along with A's of B"),
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            Some(ev) = a.events.recv() => assert!(!matches!(ev, SyncEvent::RemoteControlSessionEnded { .. }), "B's session with A ended"),
+            Some(ev) = b.events.recv() => assert!(!matches!(ev, SyncEvent::RemoteControlSessionEnded { .. }), "B's session with A ended"),
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(injected(&b_host), 1, "A's control of B is over: its move wasn't injected");
+    a.shutdown();
+    b.shutdown();
+}
+
+/// Accepts keyboard-and-mouse sharing, then — like the Linux host whose
+/// desktop dialog is declined after the session was accepted — reports
+/// that its input can't be injected after all.
+#[derive(Clone, Default)]
+struct FailingLaterHost {
+    failure: Arc<Mutex<Option<String>>>,
+    stopped: Arc<AtomicBool>,
+}
+
+impl RemoteControlHost for FailingLaterHost {
+    fn inject(&self, _event: InputEventKind) {}
+    fn start_capture(&self) -> Option<mpsc::Receiver<Vec<u8>>> {
+        None
+    }
+    fn stop_capture(&self) {}
+    fn stop_input_only(&self) {
+        self.stopped.store(true, Ordering::Relaxed);
+    }
+    fn input_only_failure(&self) -> Option<String> {
+        self.failure.lock().unwrap().clone()
+    }
+}
+
+/// A host that can't inject after all ends its sharing sessions, with its
+/// reason, instead of silently dropping everything sent to it. **Real bug
+/// fixed here**: nothing did, and the controlling computer's cursor
+/// vanished into a computer that ignored it.
+#[tokio::test]
+async fn a_host_that_stops_injecting_ends_its_sharing_sessions_with_why() {
+    let a_identity = Identity::generate();
+    let b_identity = Identity::generate();
+    let a_id = a_identity.device_id();
+    let b_id = b_identity.device_id();
+
+    let b_host = FailingLaterHost::default();
+    let mut a = make_engine("FailA", a_identity, &b_id, "FailB", Arc::new(continuity_daemon::NoopRemoteControlHost)).await.expect("start engine A");
+    let mut b = make_engine("FailB", b_identity, &a_id, "FailA", Arc::new(b_host.clone())).await.expect("start engine B");
+    connect_both(&mut a, &mut b).await;
+
+    a.send_command(EngineCommand::RequestRemoteControl { peer_crypto_id: b_id.clone(), screen: false });
+    let deadline = tokio::time::sleep(Duration::from_secs(20));
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            _ = &mut deadline => panic!("the session never started"),
+            Some(ev) = a.events.recv() => if matches!(ev, SyncEvent::RemoteControlSessionStarted { .. }) { break },
+            Some(ev) = b.events.recv() => if matches!(ev, SyncEvent::RemoteControlRequested { .. }) {
+                b.send_command(EngineCommand::RespondToRemoteControlRequest { peer_crypto_id: a_id.clone(), accept: true });
+            },
+        }
+    }
+
+    *b_host.failure.lock().unwrap() = Some("the desktop said no".to_string());
+    let deadline = tokio::time::sleep(Duration::from_secs(8));
+    tokio::pin!(deadline);
+    let reason = loop {
+        tokio::select! {
+            _ = &mut deadline => panic!("A's session never ended"),
+            Some(ev) = a.events.recv() => if let SyncEvent::RemoteControlSessionEnded { reason, .. } = ev { break reason },
+            Some(_) = b.events.recv() => {}
+        }
+    };
+    assert!(reason.as_deref().is_some_and(|reason| reason.contains("FailB can't share its keyboard and mouse: the desktop said no")), "{reason:?}");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(b_host.stopped.load(Ordering::Relaxed), "the last sharing session gone, the host stopped too");
+    a.shutdown();
+    b.shutdown();
+}

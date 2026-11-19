@@ -308,7 +308,6 @@ impl Drop for EngineHandle {
 #[derive(Clone)]
 struct RemoteControlSession {
     session_id: String,
-    role: RemoteControlRole,
     /// `false` for the controlling side between sending `RequestRemoteControl`
     /// and hearing back — `SendInputEvent` and the accept-loop screen-stream
     /// routing both only act once this flips to `true`, so an event fired
@@ -503,12 +502,20 @@ struct SharedState {
     media: Arc<dyn MediaController>,
     remote_control: Arc<dyn RemoteControlHost>,
     screen_lock: Arc<dyn ScreenLockController>,
-    /// One entry per peer with a remote-control session in flight or
-    /// active — a peer can only ever be in *one* session (either role) at
-    /// a time, so keying by `peer_crypto_id` (rather than `session_id`) is
-    /// enough and keeps every lookup a single hash-map access instead of
-    /// a scan.
-    remote_control_sessions: Mutex<HashMap<String, RemoteControlSession>>,
+    /// One entry per peer and role with a remote-control session in flight
+    /// or active — a peer is in at most one session of each role at a time,
+    /// so keying by `(peer_crypto_id, role)` (rather than `session_id`)
+    /// keeps every lookup a single hash-map access instead of a scan. Both
+    /// roles at once is keyboard-and-mouse sharing between two computers
+    /// placed at each other's edges: each keeps a session open controlling
+    /// the other. **Real bug fixed here**: this was keyed by peer alone, so
+    /// the second of those two sessions never started — its request was
+    /// dropped as "already in a session", or, when both computers asked at
+    /// the same moment, each one's acceptance of the other's request
+    /// overwrote its own pending one and neither could control the other.
+    remote_control_sessions: Mutex<HashMap<(String, RemoteControlRole), RemoteControlSession>>,
+    /// Whether `spawn_input_only_watcher`'s task is running.
+    input_only_watcher: AtomicBool,
     /// Inbound `RemoteControlRequest`s awaiting a local answer via
     /// `EngineCommand::RespondToRemoteControlRequest` — mirrors
     /// `pending_pairings`'s shape, but doesn't need that one's `oneshot`
@@ -526,13 +533,13 @@ struct SharedState {
     /// immediately by identity alone, no message-peeking or added
     /// latency on the far more common case of a normal reconnect.
     pending_screen_stream_peers: Mutex<HashSet<String>>,
-    /// Abort handle for the screen-stream connection's task, keyed by
-    /// peer id — the controlled side's frame-push loop, or the
-    /// controlling side's frame-receive loop, whichever role this device
-    /// is playing in the session. Aborted on `EndRemoteControlSession`
-    /// and on the underlying mesh connection dropping, so a session never
-    /// outlives the connection that authorized it.
-    remote_control_stream_handles: Mutex<HashMap<String, tokio::task::AbortHandle>>,
+    /// Abort handle for the screen-stream connection's task, keyed like
+    /// `remote_control_sessions` — the controlled side's frame-push loop,
+    /// or the controlling side's frame-receive loop. Aborted on
+    /// `EndRemoteControlSession` and on the underlying mesh connection
+    /// dropping, so a session never outlives the connection that
+    /// authorized it.
+    remote_control_stream_handles: Mutex<HashMap<(String, RemoteControlRole), tokio::task::AbortHandle>>,
     events_tx: mpsc::UnboundedSender<SyncEvent>,
     /// Behind a `Mutex` since `EngineCommand::SetReceivedFilesDir` can
     /// change it while running. Read once per offer — a transfer keeps the
@@ -609,26 +616,35 @@ impl SharedState {
     }
 }
 
-/// Tears down whatever's left of an active/pending remote-control session
-/// with `peer_crypto_id` — stops local capture if this device was the
-/// controlled side, aborts the screen-stream task, and emits
+/// Tears down whatever's left of this device's `role` session with
+/// `peer_crypto_id`, active or pending — stops local capture if this device
+/// was the controlled side, aborts the screen-stream task, and emits
 /// `SyncEvent::RemoteControlSessionEnded`. Idempotent: a no-op (no emit)
-/// if there's no session for that peer at all, since every caller below
-/// can race another — a connection dying and an explicit `EndRemoteControlSession`
+/// if there's no such session at all, since every caller below can race
+/// another — a connection dying and an explicit `EndRemoteControlSession`
 /// arriving at nearly the same moment, say — and only the first should
 /// actually report anything.
-fn end_remote_control_session(state: &Arc<SharedState>, peer_crypto_id: &str, reason: Option<String>, notify_peer: bool) {
-    let Some(session) = state.remote_control_sessions.lock().unwrap().remove(peer_crypto_id) else {
+fn end_remote_control_session(state: &Arc<SharedState>, peer_crypto_id: &str, role: RemoteControlRole, reason: Option<String>, notify_peer: bool) {
+    let Some(session) = state.remote_control_sessions.lock().unwrap().remove(&(peer_crypto_id.to_string(), role)) else {
         return;
     };
-    state.pending_screen_stream_peers.lock().unwrap().remove(peer_crypto_id);
-    if let Some(handle) = state.remote_control_stream_handles.lock().unwrap().remove(peer_crypto_id) {
-        handle.abort();
+    if session.screen {
+        if role == RemoteControlRole::Controlling {
+            state.pending_screen_stream_peers.lock().unwrap().remove(peer_crypto_id);
+        }
+        if let Some(handle) = state.remote_control_stream_handles.lock().unwrap().remove(&(peer_crypto_id.to_string(), role)) {
+            handle.abort();
+        }
     }
-    // Also for a session without the screen: it lets go of whatever the
-    // controller left held down, and on Linux ends the portal session.
-    if session.role == RemoteControlRole::Controlled {
-        state.remote_control.stop_capture();
+    if role == RemoteControlRole::Controlled {
+        if session.screen {
+            state.remote_control.stop_capture();
+        } else if !has_input_only_controlled(state) {
+            // The last keyboard-and-mouse sharing session here: lets go of
+            // whatever the controllers left held down, and on Linux ends
+            // the portal session.
+            state.remote_control.stop_input_only();
+        }
     }
     if notify_peer {
         if let Some(tx) = state.peer_senders.lock().unwrap().get(peer_crypto_id) {
@@ -648,6 +664,26 @@ fn end_remote_control_session(state: &Arc<SharedState>, peer_crypto_id: &str, re
         session_id: session.session_id,
         reason,
     });
+}
+
+/// Ends every session with `peer_crypto_id`, in both directions — for
+/// the peer being disconnected, forgotten or reset away.
+fn end_remote_control_sessions(state: &Arc<SharedState>, peer_crypto_id: &str, reason: Option<String>, notify_peer: bool) {
+    for role in [RemoteControlRole::Controlling, RemoteControlRole::Controlled] {
+        end_remote_control_session(state, peer_crypto_id, role, reason.clone(), notify_peer);
+    }
+}
+
+/// Whether any computer has a keyboard-and-mouse sharing session up
+/// controlling this one.
+fn has_input_only_controlled(state: &SharedState) -> bool {
+    state.remote_control_sessions.lock().unwrap().iter().any(|((_, role), s)| *role == RemoteControlRole::Controlled && !s.screen)
+}
+
+/// Whether a computer is watching and controlling this one's screen —
+/// there's one capture, so one such session at a time.
+fn has_screen_controlled(state: &SharedState) -> bool {
+    state.remote_control_sessions.lock().unwrap().iter().any(|((_, role), s)| *role == RemoteControlRole::Controlled && s.screen)
 }
 
 /// Where an inbound connection goes once its TLS handshake is done — to
@@ -854,7 +890,7 @@ fn spawn_screen_stream_connection(state: &Arc<SharedState>, conn: Connection, pe
             tracing::debug!("screen-stream connection from {addr} ended: {e}");
         }
     });
-    state.remote_control_stream_handles.lock().unwrap().insert(id_for_registry, join.abort_handle());
+    state.remote_control_stream_handles.lock().unwrap().insert((id_for_registry, RemoteControlRole::Controlling), join.abort_handle());
 }
 
 /// Handles the *separate*, dedicated connection opened for one session's
@@ -885,8 +921,8 @@ async fn handle_screen_stream_connection(
     let valid = {
         let sessions = state.remote_control_sessions.lock().unwrap();
         sessions
-            .get(&peer_crypto_id)
-            .is_some_and(|s| s.role == RemoteControlRole::Controlling && s.active && s.session_id == session_id)
+            .get(&(peer_crypto_id.clone(), RemoteControlRole::Controlling))
+            .is_some_and(|s| s.screen && s.active && s.session_id == session_id)
     };
     if !valid {
         anyhow::bail!("no active controlling session for {peer_crypto_id} matching session {session_id}");
@@ -917,7 +953,7 @@ async fn handle_screen_stream_connection(
     // explanation land first; its handling ends the session and aborts
     // this task mid-sleep. Only if nothing arrives is this "unexpected".
     tokio::time::sleep(SCREEN_STREAM_END_GRACE).await;
-    end_remote_control_session(&state, &peer_crypto_id, Some("screen stream ended unexpectedly".to_string()), true);
+    end_remote_control_session(&state, &peer_crypto_id, RemoteControlRole::Controlling, Some("screen stream ended unexpectedly".to_string()), true);
     result
 }
 
@@ -928,7 +964,7 @@ async fn handle_screen_stream_connection(
 fn report_pointer_edge(state: &Arc<SharedState>, peer_id: &str, session_id: &str, tx: &mpsc::UnboundedSender<Message>) {
     let at_edge = state.remote_control.pointer_at_edge();
     let mut sessions = state.remote_control_sessions.lock().unwrap();
-    let Some(session) = sessions.get_mut(peer_id) else { return };
+    let Some(session) = sessions.get_mut(&(peer_id.to_string(), RemoteControlRole::Controlled)) else { return };
     let edge = at_edge.map(|(edge, _)| edge);
     if edge == session.at_edge {
         return;
@@ -956,17 +992,22 @@ fn accept_remote_control_session(state: &Arc<SharedState>, peer_crypto_id: Strin
         return;
     };
 
-    // This device's keyboard/mouse/screen are one shared physical
-    // resource — two different peers controlling it at once would mean
-    // both fighting over the same cursor, and `RemoteControlHost`'s
-    // capture start/stop isn't session-scoped, just a single on/off
-    // switch. Accepting a second Controlled-role session while one's
-    // already active would silently corrupt that shared state (the
-    // first session's eventual `stop_capture` would kill the second
-    // one's stream too) — declined outright instead.
-    let already_controlled =
-        state.remote_control_sessions.lock().unwrap().values().any(|s| s.role == RemoteControlRole::Controlled);
-    if already_controlled {
+    // Keyboard-and-mouse sharing captures nothing, and dials nothing back:
+    // there's no stream, so no address to wait for, and several computers
+    // can share their keyboard and mouse with this one at once — each
+    // keeps a session open for whenever its cursor crosses over.
+    if !screen {
+        start_input_only_session(state, peer_crypto_id, session_id, tx);
+        return;
+    }
+
+    // This device's screen is one shared physical resource, and
+    // `RemoteControlHost`'s capture start/stop isn't session-scoped, just
+    // a single on/off switch. Accepting a second screen session while
+    // one's already active would silently corrupt that shared state (the
+    // first session's eventual `stop_capture` would kill the second one's
+    // stream too) — declined outright instead.
+    if has_screen_controlled(state) {
         let _ = tx.send(Message::RemoteControlResponse { session_id: session_id.clone(), accepted: false, screen_size: None });
         // This decline previously left both sides guessing why "accept"
         // didn't work — the requester just saw a plain decline, and this
@@ -992,12 +1033,6 @@ fn accept_remote_control_session(state: &Arc<SharedState>, peer_crypto_id: Strin
     // for it rather than declining a request that would have worked. The
     // address is checked before capture starts, so a session that can't
     // be dialed back never pops up the desktop's own screen-sharing prompt.
-    // Keyboard-and-mouse sharing dials nothing back: there's no stream, so
-    // no address to wait for.
-    if !screen {
-        start_input_only_session(state, peer_crypto_id, session_id, tx);
-        return;
-    }
     if let Some(addr) = state.known_addresses.lock().unwrap().get(&peer_crypto_id).copied() {
         start_controlled_session(state, peer_crypto_id, session_id, tx, addr);
         return;
@@ -1051,9 +1086,9 @@ fn pointer_in_frames_for(platform: Option<Platform>) -> bool {
 
 /// The rest of accepting, once the address to dial the screen stream back
 /// to is known: starts capture, records the session, tells the peer, and
-/// spawns the screen-stream push. Re-checks the one-controlled-session
-/// rule, since `accept_remote_control_session` may have waited for the
-/// address in the meantime.
+/// spawns the screen-stream push. Re-checks the one-screen-session rule,
+/// since `accept_remote_control_session` may have waited for the address
+/// in the meantime.
 fn start_controlled_session(
     state: &Arc<SharedState>,
     peer_crypto_id: String,
@@ -1062,9 +1097,7 @@ fn start_controlled_session(
     addr: SocketAddr,
 ) {
     let peer_name = || state.trust_store.lock().unwrap().get(&peer_crypto_id).map(|d| d.name.clone()).unwrap_or_else(|| peer_crypto_id.clone());
-    let already_controlled =
-        state.remote_control_sessions.lock().unwrap().values().any(|s| s.role == RemoteControlRole::Controlled);
-    if already_controlled {
+    if has_screen_controlled(state) {
         let _ = tx.send(Message::RemoteControlResponse { session_id: session_id.clone(), accepted: false, screen_size: None });
         state.emit(SyncEvent::RemoteControlSessionEnded {
             peer_id: peer_crypto_id.clone(),
@@ -1074,6 +1107,11 @@ fn start_controlled_session(
         });
         return;
     }
+    // The same computer sharing its keyboard and mouse with this one, now
+    // asking for the screen as well: the sharing session gives way (one
+    // session per peer and role). Its own engine ends it before asking;
+    // this covers one that didn't.
+    end_remote_control_session(state, &peer_crypto_id, RemoteControlRole::Controlled, None, true);
 
     // Accepting starts capture *before* telling the peer it succeeded —
     // if it fails (no Screen Recording permission, say), the peer hears
@@ -1093,8 +1131,8 @@ fn start_controlled_session(
     };
 
     state.remote_control_sessions.lock().unwrap().insert(
-        peer_crypto_id.clone(),
-        RemoteControlSession { session_id: session_id.clone(), role: RemoteControlRole::Controlled, active: true, screen: true, at_edge: None },
+        (peer_crypto_id.clone(), RemoteControlRole::Controlled),
+        RemoteControlSession { session_id: session_id.clone(), active: true, screen: true, at_edge: None },
     );
     let _ = tx.send(Message::RemoteControlResponse { session_id: session_id.clone(), accepted: true, screen_size: screen_size(state) });
     state.emit(SyncEvent::RemoteControlSessionStarted {
@@ -1111,7 +1149,7 @@ fn start_controlled_session(
     let join = tokio::spawn(async move {
         push_screen_stream(push_state, push_peer_id, session_id, addr, frames).await;
     });
-    state.remote_control_stream_handles.lock().unwrap().insert(peer_crypto_id, join.abort_handle());
+    state.remote_control_stream_handles.lock().unwrap().insert((peer_crypto_id, RemoteControlRole::Controlled), join.abort_handle());
 }
 
 /// This screen's size as the host reports it, for `RemoteControlResponse`.
@@ -1121,33 +1159,48 @@ fn screen_size(state: &SharedState) -> Option<ScreenSize> {
 
 /// Accepts a keyboard-and-mouse sharing request: no capture, no stream,
 /// just the session, so `InputEvent`s from the peer are injected from here
-/// on. A host that can't inject without its capture (Linux, today) has the
-/// request ended with a reason the controller shows, since a plain decline
-/// would read as the person here having said no.
+/// on. The first such session gets the host ready (`start_input_only`); a
+/// host that can't has the request ended with a reason the controller
+/// shows, since a plain decline would read as the person here having said
+/// no. Several computers can share with this one at once, and alongside a
+/// screen session: they all just inject into the one desktop.
+///
+/// **Real bug fixed here**: only one session controlling this computer was
+/// allowed at all, and `start_input_only` ran before that was checked — so
+/// a second computer's request restarted the first one's Linux portal
+/// session (its dialog shown again) and was then declined anyway.
 fn start_input_only_session(state: &Arc<SharedState>, peer_crypto_id: String, session_id: String, tx: mpsc::UnboundedSender<Message>) {
     let peer_name = || state.trust_store.lock().unwrap().get(&peer_crypto_id).map(|d| d.name.clone()).unwrap_or_else(|| peer_crypto_id.clone());
-    if let Err(why) = state.remote_control.start_input_only() {
-        let reason = format!("{} can't share its keyboard and mouse: {why}", state.my_device.name);
-        let _ = tx.send(Message::RemoteControlEnded { session_id: session_id.clone(), reason: Some(reason.clone()) });
-        let _ = tx.send(Message::RemoteControlResponse { session_id: session_id.clone(), accepted: false, screen_size: None });
-        state.emit(SyncEvent::RemoteControlSessionEnded { peer_id: peer_crypto_id.clone(), peer_name: peer_name(), session_id, reason: Some(reason) });
-        return;
+    let key = (peer_crypto_id.clone(), RemoteControlRole::Controlled);
+    let previous = state.remote_control_sessions.lock().unwrap().get(&key).map(|s| (s.screen, s.session_id.clone()));
+    match previous {
+        // Watching this screen already, which drives it too. Its own engine
+        // never asks for both; one that does is told no.
+        Some((true, _)) => {
+            let _ = tx.send(Message::RemoteControlResponse { session_id, accepted: false, screen_size: None });
+            return;
+        }
+        // The same computer asking again — it restarted, or never heard the
+        // first answer: that session is stale. Replaced, without stopping
+        // what injects input here.
+        Some((false, stale)) => {
+            state.remote_control_sessions.lock().unwrap().remove(&key);
+            state.emit(SyncEvent::RemoteControlSessionEnded { peer_id: peer_crypto_id.clone(), peer_name: peer_name(), session_id: stale, reason: None });
+        }
+        None => {}
     }
-    let already_controlled =
-        state.remote_control_sessions.lock().unwrap().values().any(|s| s.role == RemoteControlRole::Controlled);
-    if already_controlled {
-        let _ = tx.send(Message::RemoteControlResponse { session_id: session_id.clone(), accepted: false, screen_size: None });
-        state.emit(SyncEvent::RemoteControlSessionEnded {
-            peer_id: peer_crypto_id.clone(),
-            peer_name: peer_name(),
-            session_id,
-            reason: Some("already controlling another device".to_string()),
-        });
-        return;
+    if !has_input_only_controlled(state) {
+        if let Err(why) = state.remote_control.start_input_only() {
+            let reason = format!("{} can't share its keyboard and mouse: {why}", state.my_device.name);
+            let _ = tx.send(Message::RemoteControlEnded { session_id: session_id.clone(), reason: Some(reason.clone()) });
+            let _ = tx.send(Message::RemoteControlResponse { session_id: session_id.clone(), accepted: false, screen_size: None });
+            state.emit(SyncEvent::RemoteControlSessionEnded { peer_id: peer_crypto_id.clone(), peer_name: peer_name(), session_id, reason: Some(reason) });
+            return;
+        }
     }
     state.remote_control_sessions.lock().unwrap().insert(
-        peer_crypto_id.clone(),
-        RemoteControlSession { session_id: session_id.clone(), role: RemoteControlRole::Controlled, active: true, screen: false, at_edge: None },
+        key,
+        RemoteControlSession { session_id: session_id.clone(), active: true, screen: false, at_edge: None },
     );
     let _ = tx.send(Message::RemoteControlResponse { session_id: session_id.clone(), accepted: true, screen_size: screen_size(state) });
     let peer_name = peer_name();
@@ -1158,6 +1211,59 @@ fn start_input_only_session(state: &Arc<SharedState>, peer_crypto_id: String, se
         role: RemoteControlRole::Controlled,
         screen: false,
         screen_size: None,
+    });
+    spawn_input_only_watcher(state);
+}
+
+/// How often the engine asks the host whether keyboard-and-mouse sharing
+/// still works here (`RemoteControlHost::input_only_failure`).
+const INPUT_ONLY_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// While computers share their keyboard and mouse with this one: ends their
+/// sessions, with the host's reason, if what injects their input stops
+/// working on its own — on Linux, the desktop's dialog was declined or
+/// never answered, or remote interaction was stopped from the desktop's
+/// own controls. One at a time (`input_only_watcher`); it stops once no
+/// such session is left. **Real bug fixed here**: nothing did, so a
+/// controller went on sending its mouse to a computer that dropped all of
+/// it — the cursor gone from the controller's screen and nowhere on this
+/// one, until the escape chord.
+fn spawn_input_only_watcher(state: &Arc<SharedState>) {
+    if state.input_only_watcher.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let state = state.clone();
+    tokio::spawn(async move {
+        let sharing_peers = |state: &SharedState| -> Vec<String> {
+            state
+                .remote_control_sessions
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|((_, role), s)| *role == RemoteControlRole::Controlled && !s.screen)
+                .map(|((peer, _), _)| peer.clone())
+                .collect()
+        };
+        loop {
+            tokio::time::sleep(INPUT_ONLY_CHECK_INTERVAL).await;
+            let peers = sharing_peers(&state);
+            if peers.is_empty() || state.shutting_down.load(Ordering::Relaxed) {
+                state.input_only_watcher.store(false, Ordering::SeqCst);
+                // A session that started between the check and the store
+                // found a watcher still claimed, and started none.
+                if sharing_peers(&state).is_empty() || state.shutting_down.load(Ordering::Relaxed) || state.input_only_watcher.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                continue;
+            }
+            if let Some(why) = state.remote_control.input_only_failure() {
+                let reason = format!("{} can't share its keyboard and mouse: {why}", state.my_device.name);
+                tracing::warn!("{reason}");
+                for peer in peers {
+                    end_remote_control_session(&state, &peer, RemoteControlRole::Controlled, Some(reason.clone()), true);
+                }
+            }
+        }
     });
 }
 
@@ -1191,7 +1297,7 @@ async fn push_screen_stream(
             .capture_failure_reason()
             .unwrap_or_else(|| "screen capture stopped before sending anything".to_string());
         tracing::debug!("screen capture for {peer_crypto_id} ended before its first frame: {reason}");
-        end_remote_control_session(&state, &peer_crypto_id, Some(reason), true);
+        end_remote_control_session(&state, &peer_crypto_id, RemoteControlRole::Controlled, Some(reason), true);
         return;
     };
 
@@ -1201,13 +1307,13 @@ async fn push_screen_stream(
         Ok(c) => c,
         Err(e) => {
             tracing::debug!("couldn't dial screen-stream connection: {e}");
-            end_remote_control_session(&state, &peer_crypto_id, Some(format!("couldn't open screen stream: {e}")), true);
+            end_remote_control_session(&state, &peer_crypto_id, RemoteControlRole::Controlled, Some(format!("couldn't open screen stream: {e}")), true);
             return;
         }
     };
     if let Err(e) = write_message(&mut conn, &Message::ScreenStreamHandshake { session_id }).await {
         tracing::debug!("couldn't send screen-stream handshake to {addr}: {e}");
-        end_remote_control_session(&state, &peer_crypto_id, Some(format!("couldn't start screen stream: {e}")), true);
+        end_remote_control_session(&state, &peer_crypto_id, RemoteControlRole::Controlled, Some(format!("couldn't start screen stream: {e}")), true);
         return;
     }
     if write_frame(&mut conn, &first_frame).await.is_ok() {
@@ -1223,7 +1329,7 @@ async fn push_screen_stream(
     // now, with whatever the host knows — this goes out over the mesh
     // connection before `conn` closes, and the controlling side gives it
     // a moment to arrive (`SCREEN_STREAM_END_GRACE`).
-    end_remote_control_session(&state, &peer_crypto_id, state.remote_control.capture_failure_reason(), true);
+    end_remote_control_session(&state, &peer_crypto_id, RemoteControlRole::Controlled, state.remote_control.capture_failure_reason(), true);
 }
 
 /// Claims the right to start a single outbound dial to `peer_id` — `true`
@@ -1321,6 +1427,7 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
         remote_control: config.remote_control,
         screen_lock: config.screen_lock,
         remote_control_sessions: Mutex::new(HashMap::new()),
+        input_only_watcher: AtomicBool::new(false),
         pending_remote_control_requests: Mutex::new(HashMap::new()),
         pending_screen_stream_peers: Mutex::new(HashSet::new()),
         remote_control_stream_handles: Mutex::new(HashMap::new()),
@@ -1582,9 +1689,9 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                         // tearing down explicitly since the connections
                         // that would have done it themselves were just
                         // aborted out from under them.
-                        let session_peers: Vec<String> = state.remote_control_sessions.lock().unwrap().keys().cloned().collect();
-                        for peer_id in session_peers {
-                            end_remote_control_session(&state, &peer_id, None, false);
+                        let sessions: Vec<(String, RemoteControlRole)> = state.remote_control_sessions.lock().unwrap().keys().cloned().collect();
+                        for (peer_id, role) in sessions {
+                            end_remote_control_session(&state, &peer_id, role, None, false);
                         }
                         // v3 transfers outlive their mesh connections by
                         // design (that's what lets them resume), so
@@ -1619,7 +1726,7 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                         // would connect a moment after the disconnect.
                         abort_dials(&state, Some(&peer_crypto_id));
                         state.peer_senders.lock().unwrap().remove(&peer_crypto_id);
-                        end_remote_control_session(&state, &peer_crypto_id, None, false);
+                        end_remote_control_sessions(&state, &peer_crypto_id, None, false);
                         // Same reasoning as `Reset`'s cancel: a v3
                         // transfer's own data connection doesn't go down
                         // with the mesh one, and a manual disconnect means
@@ -1705,7 +1812,7 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                             state.connected.lock().unwrap().remove(&peer_crypto_id);
                             abort_dials(&state, Some(&peer_crypto_id));
                             state.peer_senders.lock().unwrap().remove(&peer_crypto_id);
-                            end_remote_control_session(&state, &peer_crypto_id, None, false);
+                            end_remote_control_sessions(&state, &peer_crypto_id, None, false);
                         });
                     }
                     EngineCommand::ReconnectPeer { peer_crypto_id } => {
@@ -1734,20 +1841,28 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                         redial_disconnected_trusted_peers(&state);
                     }
                     EngineCommand::RequestRemoteControl { peer_crypto_id, screen } => {
-                        // One session per peer at a time — a second
-                        // request while one's already pending/active with
-                        // the same peer would just confuse which
+                        // One controlling session per peer at a time — a
+                        // second request while one's already pending/active
+                        // with the same peer would just confuse which
                         // `session_id` the eventual response belongs to.
-                        if state.remote_control_sessions.lock().unwrap().contains_key(&peer_crypto_id) {
-                            continue;
+                        // Keyboard-and-mouse sharing's session only sits
+                        // idle until the cursor crosses over, so asking for
+                        // the screen ends it first (the sharing side asks
+                        // for it again once the screen session is over).
+                        let key = (peer_crypto_id.clone(), RemoteControlRole::Controlling);
+                        let existing = state.remote_control_sessions.lock().unwrap().get(&key).map(|s| s.screen);
+                        match existing {
+                            Some(false) if screen => end_remote_control_session(&state, &peer_crypto_id, RemoteControlRole::Controlling, None, true),
+                            Some(_) => continue,
+                            None => {}
                         }
                         let Some(tx) = state.peer_senders.lock().unwrap().get(&peer_crypto_id).cloned() else {
                             continue;
                         };
                         let session_id = format!("{:016x}", rand::random::<u64>());
                         state.remote_control_sessions.lock().unwrap().insert(
-                            peer_crypto_id.clone(),
-                            RemoteControlSession { session_id: session_id.clone(), role: RemoteControlRole::Controlling, active: false, screen, at_edge: None },
+                            key,
+                            RemoteControlSession { session_id: session_id.clone(), active: false, screen, at_edge: None },
                         );
                         let _ = tx.send(Message::RemoteControlRequest { session_id, screen });
                     }
@@ -1781,8 +1896,8 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                             .remote_control_sessions
                             .lock()
                             .unwrap()
-                            .get(&peer_crypto_id)
-                            .filter(|s| s.role == RemoteControlRole::Controlling && s.active)
+                            .get(&(peer_crypto_id.clone(), RemoteControlRole::Controlling))
+                            .filter(|s| s.active)
                             .map(|s| s.session_id.clone());
                         let Some(session_id) = valid_controlling_session else {
                             continue;
@@ -1792,7 +1907,9 @@ pub async fn start(config: EngineConfig) -> anyhow::Result<EngineHandle> {
                         }
                     }
                     EngineCommand::EndRemoteControlSession { peer_crypto_id } => {
-                        end_remote_control_session(&state, &peer_crypto_id, None, true);
+                        let controlling = state.remote_control_sessions.lock().unwrap().contains_key(&(peer_crypto_id.clone(), RemoteControlRole::Controlling));
+                        let role = if controlling { RemoteControlRole::Controlling } else { RemoteControlRole::Controlled };
+                        end_remote_control_session(&state, &peer_crypto_id, role, None, true);
                     }
                     EngineCommand::RequestScreenLock { peer_crypto_id, action } => {
                         if let Some(tx) = state.peer_senders.lock().unwrap().get(&peer_crypto_id) {
@@ -2019,8 +2136,15 @@ fn finish_connection(state: &Arc<SharedState>, peer_crypto_id: &str) {
     // both depend on this same peer relationship staying intact.
     // `notify_peer: false` since there's no live connection left to send
     // `RemoteControlEnded` over anyway (idempotent either way if some
-    // other path already cleaned this up).
-    end_remote_control_session(state, peer_crypto_id, Some("connection ended".to_string()), false);
+    // other path already cleaned this up). Keyboard-and-mouse sharing's
+    // idle sessions end without a reason: they come and go with the
+    // connection, and nobody needs telling why.
+    for role in [RemoteControlRole::Controlling, RemoteControlRole::Controlled] {
+        let screen = state.remote_control_sessions.lock().unwrap().get(&(peer_crypto_id.to_string(), role)).map(|s| s.screen);
+        if let Some(screen) = screen {
+            end_remote_control_session(state, peer_crypto_id, role, screen.then(|| "connection ended".to_string()), false);
+        }
+    }
 }
 
 async fn handle_connection_inner(
@@ -2395,23 +2519,24 @@ async fn handle_connection_inner(
                     });
                 }
                 Ok(Message::RemoteControlResponse { session_id, accepted, screen_size }) => {
+                    let key = (peer.id.clone(), RemoteControlRole::Controlling);
                     let matches_pending = state
                         .remote_control_sessions
                         .lock()
                         .unwrap()
-                        .get(&peer.id)
-                        .is_some_and(|s| s.role == RemoteControlRole::Controlling && !s.active && s.session_id == session_id);
+                        .get(&key)
+                        .is_some_and(|s| !s.active && s.session_id == session_id);
                     if !matches_pending {
                         continue;
                     }
                     if !accepted {
-                        state.remote_control_sessions.lock().unwrap().remove(&peer.id);
+                        state.remote_control_sessions.lock().unwrap().remove(&key);
                         state.emit(SyncEvent::RemoteControlDeclined { peer_id: peer.id.clone(), peer_name: peer.name.clone() });
                         continue;
                     }
                     let screen = {
                         let mut sessions = state.remote_control_sessions.lock().unwrap();
-                        let session = sessions.get_mut(&peer.id).expect("matched just above");
+                        let session = sessions.get_mut(&key).expect("matched just above");
                         session.active = true;
                         session.screen
                     };
@@ -2432,10 +2557,11 @@ async fn handle_connection_inner(
                     });
                 }
                 Ok(Message::RemoteControlEnded { session_id, reason }) => {
-                    let matches_active =
-                        state.remote_control_sessions.lock().unwrap().get(&peer.id).is_some_and(|s| s.session_id == session_id);
-                    if matches_active {
-                        end_remote_control_session(state, &peer.id, reason, false);
+                    let role = [RemoteControlRole::Controlling, RemoteControlRole::Controlled].into_iter().find(|role| {
+                        state.remote_control_sessions.lock().unwrap().get(&(peer.id.clone(), *role)).is_some_and(|s| s.session_id == session_id)
+                    });
+                    if let Some(role) = role {
+                        end_remote_control_session(state, &peer.id, role, reason, false);
                     }
                 }
                 Ok(Message::InputEvent { session_id, event }) => {
@@ -2443,12 +2569,21 @@ async fn handle_connection_inner(
                         .remote_control_sessions
                         .lock()
                         .unwrap()
-                        .get(&peer.id)
-                        .is_some_and(|s| s.role == RemoteControlRole::Controlled && s.active && s.session_id == session_id);
+                        .get(&(peer.id.clone(), RemoteControlRole::Controlled))
+                        .is_some_and(|s| s.active && s.session_id == session_id);
                     if valid {
                         state.remote_control.inject(event);
-                        if matches!(event, InputEventKind::MouseMoveRelative { .. }) {
-                            report_pointer_edge(state, &peer.id, &session_id, &tx);
+                        match event {
+                            InputEventKind::MouseMoveRelative { .. } => report_pointer_edge(state, &peer.id, &session_id, &tx),
+                            // The pointer placed: a new arrival, whose edge
+                            // is reported even if it's the one the last
+                            // arrival left by.
+                            InputEventKind::MouseMove { .. } => {
+                                if let Some(session) = state.remote_control_sessions.lock().unwrap().get_mut(&(peer.id.clone(), RemoteControlRole::Controlled)) {
+                                    session.at_edge = None;
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -2457,8 +2592,8 @@ async fn handle_connection_inner(
                         .remote_control_sessions
                         .lock()
                         .unwrap()
-                        .get(&peer.id)
-                        .is_some_and(|s| s.role == RemoteControlRole::Controlling && s.active && s.session_id == session_id);
+                        .get(&(peer.id.clone(), RemoteControlRole::Controlling))
+                        .is_some_and(|s| s.active && s.session_id == session_id);
                     if controlling {
                         state.emit(SyncEvent::PointerReachedEdge { peer_id: peer.id.clone(), edge, position: position.clamp(0.0, 1.0) });
                     }

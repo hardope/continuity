@@ -17,7 +17,7 @@
 ; can't fall behind the app the way a hand-edited number did; this default
 ; only applies to a manual compile.
 #ifndef MyAppVersion
-  #define MyAppVersion "0.1.9"
+  #define MyAppVersion "0.1.10-beta.1"
 #endif
 #define MyAppPublisher "hardope"
 #define MyAppURL "https://github.com/hardope/continuity"
@@ -42,6 +42,10 @@ AppSupportURL={#MyAppURL}
 ; otherwise) so it can register autostart without needing a UAC prompt,
 ; and so running the installer doesn't require admin rights at all.
 DefaultDirName={autopf}\{#MyAppName}
+; Installing again over the folder is normal — an update, a repair, or after
+; Windows Security removed continuityd.exe and left the folder behind — so
+; no "the folder already exists" question.
+DirExistsWarning=no
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest

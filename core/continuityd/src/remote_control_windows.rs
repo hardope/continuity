@@ -91,6 +91,7 @@ impl Default for WindowsRemoteControlHost {
 
 impl RemoteControlHost for WindowsRemoteControlHost {
     fn inject(&self, event: InputEventKind) {
+        crate::input_share::note_remote_input();
         match event {
             // Codes past `u16` can't be a virtual key; truncating one could
             // alias a real key, so it's dropped instead.
@@ -173,6 +174,10 @@ impl RemoteControlHost for WindowsRemoteControlHost {
 
     fn stop_capture(&self) {
         self.capturing.store(false, Ordering::Relaxed);
+        self.release_held_input();
+    }
+
+    fn stop_input_only(&self) {
         self.release_held_input();
     }
 }

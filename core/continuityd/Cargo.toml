@@ -233,3 +233,10 @@ reis = { version = "0.7", features = ["tokio"] }
 # `call_portal_method` bound names directly, is now an all-platform
 # dependency above.)
 libc = "0.2"
+
+# build.rs: Windows version information embedded in continuityd.exe (product
+# name, description, version, publisher) — what Explorer, Task Manager and
+# antivirus heuristics read about a program. Only does anything when the
+# target is Windows; it needs the Windows SDK's rc.exe, which the CI runner has.
+[build-dependencies]
+winresource = { version = "0.1.34", default-features = false }

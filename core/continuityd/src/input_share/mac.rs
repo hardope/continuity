@@ -7,7 +7,8 @@
 //! An active tap on keyboard events needs the Accessibility permission the
 //! remote-control host already asks for, and on macOS 10.15 and later Input
 //! Monitoring too. Only the main display is watched; a cursor on a second
-//! display never crosses onto another computer.
+//! display never crosses onto another computer. Events this process posts
+//! itself — another computer driving this one — go by untouched.
 
 use super::{Bounds, LocalInput, Point, Shared};
 use crate::remote_viewer::key_from_native_code;
@@ -147,12 +148,31 @@ unsafe extern "C-unwind" fn tap_callback(_proxy: CGEventTapProxy, kind: CGEventT
     // SAFETY: see `run_tap`.
     let shared: &Shared = unsafe { &*(user_info as *const Shared) };
     let event_ref: &CGEvent = unsafe { event.as_ref() };
+    // Another computer driving this one: its input, not the person here's —
+    // never forwarded, never crossing over (see the module docs of
+    // `input_share`).
+    if posted_by_this_process(event_ref) {
+        return event.as_ptr();
+    }
     let Some(input) = local_input(kind, event_ref) else { return event.as_ptr() };
     if shared.on_input(input) {
         std::ptr::null_mut()
     } else {
         event.as_ptr()
     }
+}
+
+/// Whether `event` is one this process posted: the remote-control host
+/// injecting what another computer sent (`INJECTED_EVENT_MARK`, or failing
+/// that, the id of the process that posted it). **Real bug fixed here**:
+/// the tap took those for this Mac's own mouse, so a Mac driven from
+/// Windows "crossed" back to Windows by itself the moment the pointer
+/// reached that edge — each computer then forwarded the other's input
+/// round in a loop, and the cursor vanished.
+fn posted_by_this_process(event: &CGEvent) -> bool {
+    let field = |field: CGEventField| CGEvent::integer_value_field(Some(event), field);
+    field(CGEventField::EventSourceUserData) == crate::remote_control_mac::INJECTED_EVENT_MARK
+        || field(CGEventField::EventSourceUnixProcessID) == i64::from(std::process::id())
 }
 
 /// What a tapped event is to the shared core.

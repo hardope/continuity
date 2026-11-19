@@ -10,14 +10,28 @@
 //! Setup: an input-capture session — `CreateSession2` and `Start` on a v2
 //! portal, with a restore token kept next to the trust store so the
 //! desktop's "allow input capture?" dialog is answered once; the deprecated
-//! `CreateSession` on a v1 one — then the EIS connection, the zones
-//! (`GetZones`), the barriers (`SetPointerBarriers`) and `Enable`. Zones
-//! changing (a monitor plugged in) and the session being disabled set the
-//! barriers up again. Everything runs on a thread of its own with its own
+//! `CreateSession` on a v1 one — then the EIS connection, and the barriers
+//! armed (`arm`). Everything runs on a thread of its own with its own
 //! runtime, like the remote-desktop host's portal session.
 //!
+//! **Arming the barriers** is `Disable`, `GetZones`, `SetPointerBarriers`,
+//! `Enable` — and only when what's armed has to change: the edges with a
+//! session up changed, the zones changed (a monitor plugged in), or the
+//! desktop disabled the session. Never while the mouse is over there: a
+//! change then waits until it's back. **Real bug fixed here**: the barriers
+//! used to be set again on an enabled session, at every session coming up
+//! and at every crossing. GNOME only takes barriers on a session that isn't
+//! enabled: it dropped the armed ones, refused the new ones, and refused
+//! the `Enable` after them — which stopped sharing altogether. The very
+//! first crossing also suspended the capture it had just started.
+//!
+//! A session the desktop closes, or whose input stream goes, is replaced
+//! by a new one (the restore token keeps the dialog away), with a growing
+//! pause when they keep ending straight away.
+//!
 //! **Compile-checked only** on CI: there's no Wayland session where this is
-//! written. The portal calls follow the interface XML; libei through reis
+//! written. The portal calls follow the interface XML and GNOME's
+//! implementation (xdg-desktop-portal-gnome, mutter); libei through reis
 //! 0.7's receiver API, as its own `receive` example drives it.
 
 use super::{Bounds, LocalInput, Point, Shared, WHEEL_NOTCH};
@@ -34,6 +48,7 @@ use std::collections::HashMap;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 use zbus::zvariant::{self, OwnedObjectPath, OwnedValue, Structure, Value};
 use zbus::{Connection, MatchRule, MessageStream};
@@ -49,6 +64,14 @@ const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
 const BTN_MIDDLE: u32 = 0x112;
 
+/// A session that ends sooner than this after starting counts towards
+/// giving up (`MAX_QUICK_ENDS`).
+const QUICK_END: Duration = Duration::from_secs(10);
+/// Sessions ending straight away this many times in a row: the backend
+/// gives up, says why, and is started again at the next placement change
+/// or connection.
+const MAX_QUICK_ENDS: u32 = 5;
+
 /// What the core asks of the portal task.
 enum Command {
     /// The edges to put barriers on (placed, with a session up).
@@ -61,7 +84,7 @@ pub(crate) struct Backend {
     restore_token_path: Option<PathBuf>,
     /// The running portal task's commands, once started.
     commands: Mutex<Option<mpsc::UnboundedSender<Command>>>,
-    /// The latest edges, for a task started after they were set.
+    /// The latest edges, for a session started after they were set.
     edges: Arc<Mutex<Vec<ScreenEdge>>>,
     /// The union of the zones — what the core measures edges against.
     screen: Arc<Mutex<Option<Bounds>>>,
@@ -96,8 +119,17 @@ impl Backend {
         Ok(())
     }
 
+    /// Passes the edges on only when they changed: the core reports them at
+    /// every crossing and every session coming and going, and arming the
+    /// barriers again isn't free (see the module docs).
     pub(crate) fn placements_changed(&self, edges: &[ScreenEdge]) {
-        *self.edges.lock().unwrap() = edges.to_vec();
+        {
+            let mut current = self.edges.lock().unwrap();
+            if *current == edges {
+                return;
+            }
+            *current = edges.to_vec();
+        }
         self.send(Command::Edges(edges.to_vec()));
     }
 
@@ -129,6 +161,17 @@ fn reason(error: PortalError) -> String {
     }
 }
 
+/// Why one input-capture session ended.
+enum Ended {
+    /// The backend was dropped.
+    Stopped,
+    /// The session went, but a new one should do (the desktop closed it,
+    /// its input stream went).
+    Again(String),
+    /// Something a new session wouldn't fix.
+    Failed(String),
+}
+
 async fn run(
     shared: &Shared,
     mut commands: mpsc::UnboundedReceiver<Command>,
@@ -142,16 +185,35 @@ async fn run(
         "this desktop can't share its keyboard and mouse (it needs the input-capture portal: GNOME 45 or KDE Plasma 6.1 or newer, on Wayland)"
             .to_string()
     })?;
-    // Never set: the session is only ever ended by the process going away.
+    tracing::info!("InputCapture portal v{version}");
+    // Never set: a session is only ever ended by the process going away.
     let (_stop_tx, stop) = watch::channel(false);
-    let session = if version >= 2 {
-        start_session(&connection, token_path.as_ref(), &stop).await?
-    } else {
-        create_session_v1(&connection, &stop).await?
-    };
-    let result = capture(shared, &connection, &session, &mut commands, edges, screen, &stop).await;
-    close_object(&connection, session.as_str(), SESSION_IFACE).await;
-    result
+    let mut quick_ends = 0;
+    loop {
+        let session = if version >= 2 {
+            start_session(&connection, token_path.as_ref(), &stop).await?
+        } else {
+            create_session_v1(&connection, &stop).await?
+        };
+        let started = Instant::now();
+        let ended = capture(shared, &connection, &session, &mut commands, &edges, &screen, &stop).await;
+        close_object(&connection, session.as_str(), SESSION_IFACE).await;
+        // The mouse can't be over there without a session.
+        shared.lost();
+        match ended {
+            Ended::Stopped => return Ok(()),
+            Ended::Failed(why) => return Err(why),
+            Ended::Again(why) => {
+                quick_ends = if started.elapsed() < QUICK_END { quick_ends + 1 } else { 0 };
+                if quick_ends >= MAX_QUICK_ENDS {
+                    return Err(format!("the desktop's input capture keeps stopping ({why})"));
+                }
+                let pause = Duration::from_secs(1 << quick_ends);
+                tracing::info!("input-capture session ended ({why}); starting a new one in {}s", pause.as_secs());
+                tokio::time::sleep(pause).await;
+            }
+        }
+    }
 }
 
 /// v2: `CreateSession2`, then `Start`, which shows the desktop's own dialog
@@ -211,6 +273,29 @@ async fn create_session_v1(connection: &Connection, stop: &watch::Receiver<bool>
     session_handle(&results).ok_or_else(|| "CreateSession gave no session".to_string())
 }
 
+/// A stream of the signals that matter to `session`: the portal's
+/// InputCapture ones (all on the portal object, telling sessions apart by
+/// their first argument), and the session itself being closed.
+async fn watch_signals(connection: &Connection, session: &OwnedObjectPath) -> Result<futures_util::stream::SelectAll<MessageStream>, String> {
+    let failed = |e: zbus::Error| format!("couldn't watch the input-capture portal: {e}");
+    let capture = MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .interface(INPUT_CAPTURE_IFACE)
+        .and_then(|rule| rule.path(PORTAL_PATH))
+        .map(|rule| rule.build())
+        .map_err(failed)?;
+    let closed = MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .interface(SESSION_IFACE)
+        .and_then(|rule| rule.member("Closed"))
+        .and_then(|rule| rule.path(session.as_str()))
+        .map(|rule| rule.build())
+        .map_err(failed)?;
+    let capture = MessageStream::for_match_rule(capture, connection, Some(64)).await.map_err(failed)?;
+    let closed = MessageStream::for_match_rule(closed, connection, Some(1)).await.map_err(failed)?;
+    Ok(futures_util::stream::select_all([capture, closed]))
+}
+
 /// The session's life: the EIS connection, the barriers, then the
 /// portal's signals, the core's commands and the captured input, until one
 /// of them ends it.
@@ -219,43 +304,60 @@ async fn capture(
     connection: &Connection,
     session: &OwnedObjectPath,
     commands: &mut mpsc::UnboundedReceiver<Command>,
-    edges: Arc<Mutex<Vec<ScreenEdge>>>,
-    screen: Arc<Mutex<Option<Bounds>>>,
+    edges: &Mutex<Vec<ScreenEdge>>,
+    screen: &Mutex<Option<Bounds>>,
     stop: &watch::Receiver<bool>,
-) -> Result<(), String> {
+) -> Ended {
     // Subscribed before anything can be activated.
-    let rule = MatchRule::builder()
-        .msg_type(zbus::message::Type::Signal)
-        .interface(INPUT_CAPTURE_IFACE)
-        .and_then(|rule| rule.path(PORTAL_PATH))
-        .map(|rule| rule.build())
-        .map_err(|e| format!("couldn't watch the input-capture portal: {e}"))?;
-    let mut signals =
-        MessageStream::for_match_rule(rule, connection, Some(64)).await.map_err(|e| format!("couldn't watch the input-capture portal: {e}"))?;
+    let mut signals = match watch_signals(connection, session).await {
+        Ok(signals) => signals,
+        Err(why) => return Ended::Failed(why),
+    };
 
     let options: HashMap<&str, Value> = HashMap::new();
-    let reply = connection
-        .call_method(Some(PORTAL_DEST), PORTAL_PATH, Some(INPUT_CAPTURE_IFACE), "ConnectToEIS", &(session, options))
-        .await
-        .map_err(|e| format!("couldn't connect to the desktop's input stream: {e}"))?;
-    let fd: zvariant::OwnedFd = reply.body().deserialize().map_err(|e| format!("ConnectToEIS answered oddly: {e}"))?;
-    let context = ei::Context::new(UnixStream::from(std::os::fd::OwnedFd::from(fd))).map_err(|e| format!("couldn't open the input stream: {e}"))?;
-    let (_ei_connection, mut events) = context
-        .handshake_tokio("continuity", ei::handshake::ContextType::Receiver)
-        .await
-        .map_err(|e| format!("the input stream's handshake failed: {e}"))?;
+    let reply = match connection.call_method(Some(PORTAL_DEST), PORTAL_PATH, Some(INPUT_CAPTURE_IFACE), "ConnectToEIS", &(session, options)).await {
+        Ok(reply) => reply,
+        Err(e) => return Ended::Again(format!("couldn't connect to the desktop's input stream: {e}")),
+    };
+    let fd: zvariant::OwnedFd = match reply.body().deserialize() {
+        Ok(fd) => fd,
+        Err(e) => return Ended::Failed(format!("ConnectToEIS answered oddly: {e}")),
+    };
+    let context = match ei::Context::new(UnixStream::from(std::os::fd::OwnedFd::from(fd))) {
+        Ok(context) => context,
+        Err(e) => return Ended::Again(format!("couldn't open the input stream: {e}")),
+    };
+    let (_ei_connection, mut events) = match context.handshake_tokio("continuity", ei::handshake::ContextType::Receiver).await {
+        Ok(handshake) => handshake,
+        Err(e) => return Ended::Again(format!("the input stream's handshake failed: {e}")),
+    };
 
-    let mut current_edges = edges.lock().unwrap().clone();
-    let mut barriers = set_up_barriers(connection, session, &current_edges, &screen, stop).await?;
+    // What's armed now, and what to arm once the mouse is back here.
+    let mut armed = edges.lock().unwrap().clone();
+    let mut barriers = match arm(connection, session, &armed, screen, stop, false).await {
+        Ok(barriers) => barriers,
+        Err(why) => return Ended::Again(why),
+    };
+    let mut waiting: Option<Vec<ScreenEdge>> = None;
     let mut activation: Option<u32> = None;
+    let mut scroll = FrameScroll::default();
     loop {
+        // Arms what changed while the mouse was over there, now it's back.
+        if activation.is_none() {
+            if let Some(next) = waiting.take() {
+                if next != armed {
+                    armed = next;
+                    barriers = match arm(connection, session, &armed, screen, stop, true).await {
+                        Ok(barriers) => barriers,
+                        Err(why) => return Ended::Again(why),
+                    };
+                }
+            }
+        }
         tokio::select! {
             command = commands.recv() => match command {
-                None => return Ok(()),
-                Some(Command::Edges(new)) => {
-                    current_edges = new;
-                    barriers = set_up_barriers(connection, session, &current_edges, &screen, stop).await?;
-                }
+                None => return Ended::Stopped,
+                Some(Command::Edges(next)) => waiting = Some(next),
                 Some(Command::Release(at)) => {
                     if let Some(id) = activation.take() {
                         release(connection, session, id, at).await;
@@ -263,8 +365,13 @@ async fn capture(
                 }
             },
             message = signals.next() => {
-                let Some(Ok(message)) = message else { return Err("the input-capture portal went away".to_string()) };
-                let member = message.header().member().map(|member| member.as_str().to_string()).unwrap_or_default();
+                let Some(Ok(message)) = message else { return Ended::Again("the input-capture portal went away".to_string()) };
+                let header = message.header();
+                let member = header.member().map(|member| member.as_str().to_string()).unwrap_or_default();
+                if header.interface().is_some_and(|interface| interface.as_str() == SESSION_IFACE) {
+                    // Only this session's `Closed` is subscribed to.
+                    return Ended::Again("the desktop closed the input-capture session".to_string());
+                }
                 let body = message.body();
                 let Ok((path, _)) = body.deserialize::<(OwnedObjectPath, HashMap<String, OwnedValue>)>() else { continue };
                 if path != *session {
@@ -276,18 +383,24 @@ async fn capture(
                         let Some(id) = activated.activation_id else { continue };
                         activation = Some(id);
                         let bounds = *screen.lock().unwrap();
-                        let (cx, cy) = activated.cursor_position.unwrap_or_default();
-                        let at = Point { x: cx, y: cy };
-                        let edge = activated.barrier_id.and_then(|barrier| barriers.get(&barrier).copied());
+                        let at = activated.cursor_position.map(|(x, y)| Point { x, y });
+                        let edge = activated_edge(activated.barrier_id, &barriers, at, bounds, &armed);
+                        tracing::debug!("input capture activated ({id}) at {at:?}, barrier {:?} = {edge:?}", activated.barrier_id);
                         let taken = match (edge, bounds) {
-                            (Some(edge), Some(bounds)) => shared.crossed(edge, position_along(bounds, edge, at), at),
+                            (Some(edge), Some(bounds)) => {
+                                let at = at.unwrap_or_else(|| super::point_on_edge(bounds, edge, 0.5));
+                                shared.crossed(edge, position_along(bounds, edge, at), at)
+                            }
                             _ => false,
                         };
                         if !taken {
-                            // Nothing (any more) to take the mouse to: back at once.
-                            let back = match (edge, bounds) {
-                                (Some(edge), Some(bounds)) => super::point_on_edge(bounds, edge, position_along(bounds, edge, at)),
-                                _ => at,
+                            // Nothing (any more) to take the mouse to, or the
+                            // pointer was being driven from over there: back
+                            // at once, a few pixels in.
+                            let back = match (edge, bounds, at) {
+                                (Some(edge), Some(bounds), Some(at)) => super::point_on_edge(bounds, edge, position_along(bounds, edge, at)),
+                                (Some(edge), Some(bounds), None) => super::point_on_edge(bounds, edge, 0.5),
+                                _ => at.unwrap_or(Point { x: 0.0, y: 0.0 }),
                             };
                             activation = None;
                             release(connection, session, id, back).await;
@@ -297,35 +410,51 @@ async fn capture(
                         activation = None;
                         shared.lost();
                     }
-                    "Disabled" => {
+                    // The desktop switched capture off (GNOME, for one,
+                    // does when the monitors change, and says
+                    // `ZonesChanged`): armed again from the start.
+                    "Disabled" | "ZonesChanged" => {
+                        tracing::debug!("input capture: {member}; arming the barriers again");
                         activation = None;
                         shared.lost();
-                        enable(connection, session).await?;
-                    }
-                    "ZonesChanged" => {
-                        barriers = set_up_barriers(connection, session, &current_edges, &screen, stop).await?;
+                        barriers = match arm(connection, session, &armed, screen, stop, true).await {
+                            Ok(barriers) => barriers,
+                            Err(why) => return Ended::Again(why),
+                        };
                     }
                     _ => {}
                 }
             }
             event = events.next() => match event {
-                None => return Err("the desktop closed the input stream".to_string()),
-                Some(Err(e)) => return Err(format!("the input stream failed: {e}")),
-                Some(Ok(event)) => handle_event(shared, &context, event),
+                None => return Ended::Again("the desktop closed the input stream".to_string()),
+                Some(Err(e)) => return Ended::Again(format!("the input stream failed: {e}")),
+                Some(Ok(EiEvent::Disconnected(_))) => return Ended::Again("the desktop disconnected the input stream".to_string()),
+                Some(Ok(event)) => handle_event(shared, &context, &mut scroll, event),
             },
         }
     }
 }
 
-/// Reads the zones, puts barriers on the placed edges and enables capture.
-/// Returns which edge each barrier id stands for.
-async fn set_up_barriers(
+/// Arms the barriers: reads the zones, puts barriers on `edges` and enables
+/// capture — `Disable` first when the session may be enabled already,
+/// since barriers can only be set on one that isn't (GNOME refuses them
+/// otherwise; the portal's own documentation says setting them suspends
+/// it). Returns which edge each barrier id stands for.
+async fn arm(
     connection: &Connection,
     session: &OwnedObjectPath,
     edges: &[ScreenEdge],
     screen: &Mutex<Option<Bounds>>,
     stop: &watch::Receiver<bool>,
+    was_enabled: bool,
 ) -> Result<HashMap<u32, ScreenEdge>, String> {
+    if was_enabled {
+        // Not enabled any more (GNOME disables it itself when the zones
+        // change) is fine.
+        if let Err(e) = call(connection, "Disable", session).await {
+            tracing::debug!("input capture: Disable: {e}");
+        }
+    }
     let token = new_token("capture_zones");
     let mut options: HashMap<&str, Value> = HashMap::new();
     options.insert("handle_token", Value::from(token.as_str()));
@@ -359,20 +488,17 @@ async fn set_up_barriers(
     .map_err(reason)?;
     let failed = set.failed_barriers.unwrap_or_default();
     if !failed.is_empty() {
-        tracing::warn!("the desktop refused input-capture barriers {failed:?}; those edges won't cross");
+        tracing::warn!("the desktop refused input-capture barriers {failed:?} of {barriers:?}; those edges won't cross");
     }
-    enable(connection, session).await?;
-    tracing::debug!("input capture armed: {} barrier(s) on {edges:?}", barriers.len().saturating_sub(failed.len()));
+    call(connection, "Enable", session).await.map_err(|e| format!("couldn't enable input capture: {e}"))?;
+    tracing::info!("input capture armed: {} barrier(s) on {edges:?}, zones {list:?}", barriers.len().saturating_sub(failed.len()));
     Ok(barriers.into_iter().filter(|(id, _, _)| !failed.contains(id)).map(|(id, edge, _)| (id, edge)).collect())
 }
 
-async fn enable(connection: &Connection, session: &OwnedObjectPath) -> Result<(), String> {
+/// One of the session methods that take only options (`Enable`, `Disable`).
+async fn call(connection: &Connection, method: &str, session: &OwnedObjectPath) -> zbus::Result<()> {
     let options: HashMap<&str, Value> = HashMap::new();
-    connection
-        .call_method(Some(PORTAL_DEST), PORTAL_PATH, Some(INPUT_CAPTURE_IFACE), "Enable", &(session, options))
-        .await
-        .map(drop)
-        .map_err(|e| format!("couldn't enable input capture: {e}"))
+    connection.call_method(Some(PORTAL_DEST), PORTAL_PATH, Some(INPUT_CAPTURE_IFACE), method, &(session, options)).await.map(drop)
 }
 
 async fn release(connection: &Connection, session: &OwnedObjectPath, activation_id: u32, at: Point) {
@@ -384,14 +510,68 @@ async fn release(connection: &Connection, session: &OwnedObjectPath, activation_
     }
 }
 
+/// Which placed edge an activation is at: its barrier's, or — a desktop
+/// that doesn't say which barrier (KDE Plasma), or names none — the armed
+/// edge the cursor is pressed against.
+fn activated_edge(barrier_id: Option<u32>, barriers: &HashMap<u32, ScreenEdge>, at: Option<Point>, bounds: Option<Bounds>, armed: &[ScreenEdge]) -> Option<ScreenEdge> {
+    if let Some(edge) = barrier_id.filter(|id| *id != 0).and_then(|id| barriers.get(&id).copied()) {
+        return Some(edge);
+    }
+    let (at, bounds) = (at?, bounds?);
+    super::edge_of(at, bounds).map(|(edge, _)| edge).filter(|edge| armed.contains(edge))
+}
+
+/// Scrolling within one libei frame. A wheel can come as both a discrete
+/// and a smooth scroll for the same turn; the discrete one wins, so a notch
+/// scrolls the same as from any other computer and isn't counted twice.
+#[derive(Default, Debug, PartialEq)]
+struct FrameScroll {
+    smooth: (f64, f64),
+    discrete: (i32, i32),
+}
+
+impl FrameScroll {
+    /// What the frame's scrolling forwards as, in the viewer's convention
+    /// (pixels, positive up and left — libinput's is down and right).
+    fn take(&mut self) -> Option<LocalInput> {
+        let scroll = std::mem::take(self);
+        if scroll.discrete != (0, 0) {
+            let notches = |value: i32| -f64::from(value) / 120.0 * WHEEL_NOTCH;
+            Some(LocalInput::Scroll { dx: notches(scroll.discrete.0), dy: notches(scroll.discrete.1) })
+        } else if scroll.smooth != (0.0, 0.0) {
+            Some(LocalInput::Scroll { dx: -scroll.smooth.0, dy: -scroll.smooth.1 })
+        } else {
+            None
+        }
+    }
+}
+
 /// One libei event while capturing.
-fn handle_event(shared: &Shared, context: &ei::Context, event: EiEvent) {
+fn handle_event(shared: &Shared, context: &ei::Context, scroll: &mut FrameScroll, event: EiEvent) {
     let input = match event {
         EiEvent::SeatAdded(added) => {
             added.seat.bind_capabilities(DeviceCapability::Pointer | DeviceCapability::Keyboard | DeviceCapability::Button | DeviceCapability::Scroll);
             let _ = context.flush();
             return;
         }
+        EiEvent::DeviceAdded(_) | EiEvent::DeviceRemoved(_) | EiEvent::DeviceResumed(_) | EiEvent::DevicePaused(_) => {
+            tracing::debug!("input capture: {event:?}");
+            return;
+        }
+        EiEvent::ScrollDelta(delta) => {
+            scroll.smooth.0 += f64::from(delta.dx);
+            scroll.smooth.1 += f64::from(delta.dy);
+            return;
+        }
+        EiEvent::ScrollDiscrete(discrete) => {
+            scroll.discrete.0 += discrete.discrete_dx;
+            scroll.discrete.1 += discrete.discrete_dy;
+            return;
+        }
+        EiEvent::Frame(_) => match scroll.take() {
+            Some(input) => input,
+            None => return,
+        },
         EiEvent::PointerMotion(motion) => LocalInput::Moved { at: Point { x: 0.0, y: 0.0 }, delta: (f64::from(motion.dx), f64::from(motion.dy)) },
         EiEvent::Button(button) => {
             let button_kind = match button.button {
@@ -402,13 +582,6 @@ fn handle_event(shared: &Shared, context: &ei::Context, event: EiEvent) {
             };
             LocalInput::Button { button: button_kind, down: button.state == ei::button::ButtonState::Press }
         }
-        // libei's convention is libinput's, positive scrolling down and
-        // right; the viewer's is the other way round.
-        EiEvent::ScrollDelta(scroll) => LocalInput::Scroll { dx: -f64::from(scroll.dx), dy: -f64::from(scroll.dy) },
-        EiEvent::ScrollDiscrete(scroll) => LocalInput::Scroll {
-            dx: -f64::from(scroll.discrete_dx) / 120.0 * WHEEL_NOTCH,
-            dy: -f64::from(scroll.discrete_dy) / 120.0 * WHEEL_NOTCH,
-        },
         EiEvent::KeyboardKey(key) => LocalInput::Key {
             key: u16::try_from(key.key).ok().and_then(|code| key_from_native_code(code, Platform::Linux)),
             down: key.state == ei::keyboard::KeyState::Press,
@@ -441,7 +614,8 @@ fn union(zones: &[(u32, u32, i32, i32)]) -> Option<Bounds> {
 /// zones' bounding box, as `(id, edge, (x1, y1, x2, y2))`. Positions follow
 /// the portal's convention: a barrier sits on the top or left edge of its
 /// pixels and its ends are inclusive, so a right-edge barrier is at `x +
-/// width` and runs from `y` to `y + height - 1`.
+/// width` and runs from `y` to `y + height - 1` (mutter checks exactly
+/// that: `x == layout.x + layout.width`).
 fn barriers_for(zones: &[(u32, u32, i32, i32)], edges: &[ScreenEdge]) -> Vec<(u32, ScreenEdge, (i32, i32, i32, i32))> {
     let Some(outer) = union(zones) else { return Vec::new() };
     let (left, top) = (outer.x as i32, outer.y as i32);
@@ -523,5 +697,27 @@ mod tests {
         assert_eq!(position_along(bounds, ScreenEdge::Right, Point { x: 3870.0, y: 540.0 }), 0.5, "past the edge, as Activated reports it");
         assert_eq!(position_along(bounds, ScreenEdge::Top, Point { x: 960.0, y: -12.0 }), 0.25);
         assert_eq!(position_along(bounds, ScreenEdge::Left, Point { x: -5.0, y: 2000.0 }), 1.0, "clamped");
+    }
+
+    #[test]
+    fn an_activation_without_a_barrier_id_is_placed_by_the_cursor() {
+        let bounds = Some(Bounds { x: 0.0, y: 0.0, width: 1920.0, height: 1080.0 });
+        let barriers = HashMap::from([(1, ScreenEdge::Right)]);
+        let past_right = Some(Point { x: 1921.0, y: 300.0 });
+        assert_eq!(activated_edge(Some(1), &barriers, past_right, bounds, &[ScreenEdge::Right]), Some(ScreenEdge::Right));
+        assert_eq!(activated_edge(None, &barriers, past_right, bounds, &[ScreenEdge::Right]), Some(ScreenEdge::Right), "KDE Plasma names no barrier");
+        assert_eq!(activated_edge(Some(0), &barriers, past_right, bounds, &[ScreenEdge::Right]), Some(ScreenEdge::Right), "0: couldn't tell");
+        assert_eq!(activated_edge(None, &barriers, Some(Point { x: -1.0, y: 300.0 }), bounds, &[ScreenEdge::Right]), None, "not an armed edge");
+        assert_eq!(activated_edge(None, &barriers, None, bounds, &[ScreenEdge::Right]), None);
+    }
+
+    #[test]
+    fn a_frames_wheel_turn_counts_once() {
+        let mut scroll = FrameScroll { smooth: (0.0, 15.0), discrete: (0, 120) };
+        assert_eq!(scroll.take(), Some(LocalInput::Scroll { dx: 0.0, dy: -WHEEL_NOTCH }), "the notch, not the notch and its smooth copy");
+        assert_eq!(scroll, FrameScroll::default(), "taken");
+        let mut scroll = FrameScroll { smooth: (-3.5, 2.0), discrete: (0, 0) };
+        assert_eq!(scroll.take(), Some(LocalInput::Scroll { dx: 3.5, dy: -2.0 }), "a touchpad's smooth scroll");
+        assert_eq!(FrameScroll::default().take(), None);
     }
 }

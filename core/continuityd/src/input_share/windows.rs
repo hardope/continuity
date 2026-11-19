@@ -4,17 +4,30 @@
 //! (`Shared::on_input`); returning 1 from the hook swallows it while the
 //! mouse is over there.
 //!
-//! **The cursor while over there** waits in the middle of the primary
-//! screen: a swallowed move leaves the cursor where it is, and the hook
-//! reports where it *would* have gone, so each move reads as a delta from
-//! that point — and, being far from every edge, none is lost to the screen
-//! edge clipping it. Windows has no supported way for an app to hide the
-//! cursor everywhere, so it stays visible there until it comes back.
+//! **Measuring the mouse.** A low-level hook is told where each move would
+//! take the cursor (`MSLLHOOKSTRUCT::pt`, not clipped to the screen), before
+//! the cursor goes there. A move is measured from where the cursor really
+//! is: here, where the last move let through left it; over there, where it
+//! stopped when it left — every move is swallowed meanwhile, so it stays
+//! put, and a thread timer re-reads it every so often outside the hook in
+//! case something else moved it. Nothing here moves the cursor except to
+//! put it back when the mouse returns, and that from a thread holding no
+//! lock the hooks need. **Real bug fixed here**: the cursor used to be
+//! parked in the middle of the screen from inside the hook, while the move
+//! that crossed was let through after it — so the cursor really sat at the
+//! edge while every move was measured from the middle, each one arriving
+//! over there as half a screen's jump. The pointer there flew to the far
+//! side whatever the mouse did, and couldn't be brought back.
+//!
+//! Windows has no supported way for an app to hide the cursor everywhere,
+//! so it stays visible, at the edge it left through, until it comes back.
 //!
 //! Events another program injected (`LLMHF_INJECTED`, `LLKHF_INJECTED`) —
 //! including Continuity's own, when another computer is controlling this
 //! one — pass through untouched, so a remote controller can't push the
-//! cursor across an edge. Only the primary screen's edges are watched.
+//! cursor across an edge. The edges watched are those of the whole desktop
+//! (the bounding box of every monitor), so a second monitor beside the
+//! first stays reachable.
 
 use super::{Bounds, LocalInput, Point, Shared, WHEEL_NOTCH};
 use crate::remote_viewer::key_from_native_code;
@@ -22,26 +35,34 @@ use continuity_proto::{MouseButton as ProtoMouseButton, Platform, ScreenEdge};
 use std::sync::{Arc, Mutex, OnceLock};
 use tao::keyboard::KeyCode;
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetMessageW, GetSystemMetrics, SetCursorPos, SetWindowsHookExW, TranslateMessage, HHOOK,
-    KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT, SM_CXSCREEN, SM_CYSCREEN, WH_KEYBOARD_LL,
-    WH_MOUSE_LL, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
+    CallNextHookEx, DispatchMessageW, GetMessageW, GetPhysicalCursorPos, GetSystemMetrics, SetCursorPos, SetTimer, SetWindowsHookExW,
+    TranslateMessage, HHOOK, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT, SM_CXVIRTUALSCREEN,
+    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_TIMER,
 };
 
 /// What the hooks call into — set once, when the hooks start.
 static SHARED: OnceLock<Arc<Shared>> = OnceLock::new();
 
-/// Where moves are measured from: the last position while the mouse is
-/// here, the parking point while it's over there.
+/// Where the cursor really is, for measuring moves (see the module docs).
+/// Never held while calling into the core: the core calls `released` with
+/// its own lock held, and that takes this one.
 struct Cursor {
-    last: Option<Point>,
-    park: Option<Point>,
+    /// Where the last move let through left the cursor, kept on the desktop
+    /// the way Windows keeps the cursor on it.
+    here: Option<Point>,
+    /// While the mouse is over there: where the cursor stopped.
+    frozen: Option<Point>,
 }
 
-static CURSOR: Mutex<Cursor> = Mutex::new(Cursor { last: None, park: None });
+static CURSOR: Mutex<Cursor> = Mutex::new(Cursor { here: None, frozen: None });
+
+/// How often, while the mouse is over there, the cursor's real position is
+/// read again — outside the hook, where nothing about it is in flux.
+const RECHECK_MS: u32 = 50;
 
 const VK_RETURN: u32 = 0x0D;
 
@@ -73,8 +94,14 @@ impl Backend {
                 if !ok {
                     return;
                 }
+                // A thread timer: its WM_TIMER comes through this loop.
+                SetTimer(HWND::default(), 0, RECHECK_MS, None);
                 let mut message = MSG::default();
                 while GetMessageW(&mut message, HWND::default(), 0, 0).0 > 0 {
+                    if message.message == WM_TIMER {
+                        recheck_frozen();
+                        continue;
+                    }
                     let _ = TranslateMessage(&message);
                     DispatchMessageW(&message);
                 }
@@ -85,33 +112,60 @@ impl Backend {
 
     pub(crate) fn placements_changed(&self, _edges: &[ScreenEdge]) {}
 
-    /// The primary screen, in the physical pixels this per-monitor-DPI-aware
-    /// process sees.
+    /// The whole desktop — every monitor's bounding box — in the physical
+    /// pixels this per-monitor-DPI-aware process (tao makes it one) sees.
     pub(crate) fn screen(&self) -> Option<Bounds> {
-        let (width, height) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
-        (width > 0 && height > 0).then(|| Bounds { x: 0.0, y: 0.0, width: f64::from(width), height: f64::from(height) })
+        let (x, y, width, height) = unsafe {
+            (
+                GetSystemMetrics(SM_XVIRTUALSCREEN),
+                GetSystemMetrics(SM_YVIRTUALSCREEN),
+                GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                GetSystemMetrics(SM_CYVIRTUALSCREEN),
+            )
+        };
+        (width > 0 && height > 0).then(|| Bounds { x: f64::from(x), y: f64::from(y), width: f64::from(width), height: f64::from(height) })
     }
 
-    /// Parks the cursor in the middle of the screen (see the module docs).
-    pub(crate) fn grabbed(&self, _left_at: Point) {
-        let Some(screen) = self.screen() else { return };
-        let park = Point { x: (screen.width / 2.0).round(), y: (screen.height / 2.0).round() };
-        CURSOR.lock().unwrap().park = Some(park);
-        if let Err(e) = unsafe { SetCursorPos(park.x as i32, park.y as i32) } {
-            tracing::debug!("couldn't park the cursor: {e}");
-        }
-    }
+    /// Nothing to do: the hook swallowing every move keeps the cursor where
+    /// it stopped (see the module docs).
+    pub(crate) fn grabbed(&self, _left_at: Point) {}
 
+    /// Puts the cursor back at `at`. From a thread of its own, holding
+    /// nothing: the core calls this with its lock held, and `SetCursorPos`
+    /// can wait on the hook thread, which may itself be waiting on that lock.
     pub(crate) fn released(&self, at: Point) {
         {
             let mut cursor = CURSOR.lock().unwrap();
-            cursor.park = None;
-            cursor.last = Some(at);
+            cursor.frozen = None;
+            cursor.here = Some(at);
         }
-        if let Err(e) = unsafe { SetCursorPos(at.x.round() as i32, at.y.round() as i32) } {
+        let (x, y) = (at.x.round() as i32, at.y.round() as i32);
+        let spawned = std::thread::Builder::new().name("input-share-cursor".to_string()).spawn(move || {
+            if let Err(e) = unsafe { SetCursorPos(x, y) } {
+                tracing::debug!("couldn't put the cursor back: {e}");
+            }
+        });
+        if let Err(e) = spawned {
             tracing::debug!("couldn't put the cursor back: {e}");
         }
     }
+}
+
+/// While the mouse is over there: reads where the cursor really is again,
+/// on the hook thread between hook calls — nothing is moving it then.
+fn recheck_frozen() {
+    let mut cursor = CURSOR.lock().unwrap();
+    if cursor.frozen.is_some() {
+        if let Some(now) = physical_cursor_pos() {
+            cursor.frozen = Some(now);
+        }
+    }
+}
+
+fn physical_cursor_pos() -> Option<Point> {
+    let mut point = POINT::default();
+    unsafe { GetPhysicalCursorPos(&mut point) }.ok()?;
+    Some(Point { x: f64::from(point.x), y: f64::from(point.y) })
 }
 
 unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -119,20 +173,52 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
         if let Some(shared) = SHARED.get() {
             // SAFETY: for `WH_MOUSE_LL`, `lparam` is an `MSLLHOOKSTRUCT`.
             let info = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
-            if info.flags & LLMHF_INJECTED == 0 {
-                let swallow = match mouse_input(wparam.0 as u32, info) {
-                    Some(input) => shared.on_input(input),
-                    // Side buttons and the rest: nothing to forward, but not
-                    // for this computer either while the mouse is over there.
-                    None => shared.is_grabbed(),
-                };
-                if swallow {
-                    return LRESULT(1);
-                }
+            if info.flags & LLMHF_INJECTED == 0 && on_mouse(shared, wparam.0 as u32, info) {
+                return LRESULT(1);
             }
         }
     }
     unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) }
+}
+
+/// One hooked mouse event: whether to swallow it.
+fn on_mouse(shared: &Shared, message: u32, info: &MSLLHOOKSTRUCT) -> bool {
+    let at = Point { x: f64::from(info.pt.x), y: f64::from(info.pt.y) };
+    if message != WM_MOUSEMOVE {
+        return match mouse_input(message, info) {
+            Some(input) => shared.on_input(input),
+            // Side buttons and the rest: nothing to forward, but not for
+            // this computer either while the mouse is over there.
+            None => shared.is_grabbed(),
+        };
+    }
+    let from = {
+        let cursor = CURSOR.lock().unwrap();
+        // Here, where the cursor is before this move: read back, which
+        // inside the hook is where it was; failing that (a reading equal
+        // to where it's going would say it already moved), where the last
+        // move left it.
+        cursor.frozen.or_else(|| physical_cursor_pos().filter(|now| *now != at)).or(cursor.here).unwrap_or(at)
+    };
+    let swallowed = shared.on_input(LocalInput::Moved { at, delta: (at.x - from.x, at.y - from.y) });
+    let mut cursor = CURSOR.lock().unwrap();
+    if swallowed {
+        // Over there (this move may have been the one that crossed): the
+        // cursor stays where it was before it.
+        cursor.frozen.get_or_insert(from);
+    } else {
+        cursor.frozen = None;
+        cursor.here = Some(shared.backend.screen().map_or(at, |screen| on_desktop(at, screen)));
+    }
+    swallowed
+}
+
+/// `point` kept on `screen`, as Windows keeps the cursor on the desktop.
+fn on_desktop(point: Point, screen: Bounds) -> Point {
+    Point {
+        x: point.x.clamp(screen.x, screen.x + screen.width - 1.0),
+        y: point.y.clamp(screen.y, screen.y + screen.height - 1.0),
+    }
 }
 
 unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -153,18 +239,9 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
     unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) }
 }
 
-/// What a low-level mouse message is to the shared core.
+/// What a low-level mouse button or wheel message is to the shared core.
 fn mouse_input(message: u32, info: &MSLLHOOKSTRUCT) -> Option<LocalInput> {
-    let at = Point { x: f64::from(info.pt.x), y: f64::from(info.pt.y) };
     Some(match message {
-        WM_MOUSEMOVE => {
-            let mut cursor = CURSOR.lock().unwrap();
-            let from = cursor.park.or(cursor.last).unwrap_or(at);
-            if cursor.park.is_none() {
-                cursor.last = Some(at);
-            }
-            LocalInput::Moved { at, delta: (at.x - from.x, at.y - from.y) }
-        }
         WM_LBUTTONDOWN => LocalInput::Button { button: ProtoMouseButton::Left, down: true },
         WM_LBUTTONUP => LocalInput::Button { button: ProtoMouseButton::Left, down: false },
         WM_RBUTTONDOWN => LocalInput::Button { button: ProtoMouseButton::Right, down: true },
@@ -212,5 +289,14 @@ mod tests {
         assert_eq!(key_for(0xA2, false), Some(KeyCode::ControlLeft));
         assert_eq!(key_for(0x41, false), Some(KeyCode::KeyA));
         assert_eq!(key_for(0x1_0000, false), None);
+    }
+
+    #[test]
+    fn the_cursor_is_kept_on_the_desktop() {
+        // A monitor left of the primary: the desktop starts at -1280.
+        let desktop = Bounds { x: -1280.0, y: 0.0, width: 3200.0, height: 1080.0 };
+        assert_eq!(on_desktop(Point { x: 1925.0, y: 500.0 }, desktop), Point { x: 1919.0, y: 500.0 });
+        assert_eq!(on_desktop(Point { x: -1300.0, y: -4.0 }, desktop), Point { x: -1280.0, y: 0.0 });
+        assert_eq!(on_desktop(Point { x: 10.0, y: 20.0 }, desktop), Point { x: 10.0, y: 20.0 });
     }
 }

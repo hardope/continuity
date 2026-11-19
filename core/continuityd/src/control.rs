@@ -665,6 +665,10 @@ impl ControlState {
                     live.finish_transfer(transfer_id, fail);
                 }
             }
+            // Keyboard-and-mouse sharing's idle sessions aren't "controlling"
+            // anything: counted as that, the windows stopped offering
+            // Control for every computer while sharing was set up.
+            SyncEvent::RemoteControlSessionStarted { screen: false, .. } => {}
             SyncEvent::RemoteControlSessionStarted { peer_id, session_id, role, .. } => {
                 live.activity.remote_control_sessions += 1;
                 if *role == RemoteControlRole::Controlling {
