@@ -2,6 +2,19 @@
 
 All notable user-facing changes to Continuity are documented here.
 
+## [0.1.10] - 2026-11-20
+
+### Fixed
+
+- **Keyboard and mouse sharing from a Windows PC works smoothly.** Crossing from Windows onto another computer sent the pointer over there racing to the far side of its screen whatever the mouse did, and with both computers placed at each other's edges they could pass the cursor back and forth until it vanished. Windows now measures each move from where its cursor really is, and a computer that's being driven from another one never sends the cursor across by itself.
+- **Two computers can share their keyboard and mouse with each other, both ways.** With each placed at the other's edge, only one of them could ever take the other over, and when both connected at the same moment neither could. Both directions work now, and one computer can be shared with by several others at once.
+- **Keyboard and mouse sharing works on Linux.** On GNOME, sharing a Linux computer's own mouse and keyboard stopped working as soon as it was set up; crossing onto a Linux computer from its left opened the Activities overview; and coming back from Linux could take as long as you had pushed the pointer past its far edge. A Linux computer now places and follows the pointer exactly, sends your cursor straight back while its "allow remote interaction" question is unanswered, and says so if the desktop refuses.
+- On a Windows PC with more than one monitor, every monitor is reachable while sharing: the cursor crosses over at the outer edges of the whole desktop rather than at the main monitor's.
+- A key or mouse button held down while the cursor crosses over is let go on the computer it was pressed on, instead of staying stuck down there.
+- Opening the screen of a computer you share your keyboard and mouse with now works; sharing resumes when you close it.
+- Idle keyboard-and-mouse sharing no longer announces that a computer "is now controlling this device" every time it connects, keeps the tray's red dot on, or stops the Continuity window offering Control.
+- **Windows: if Windows Security removes Continuity**, mistaking an unsigned app that watches the keyboard for a keylogger, the README now says how to allow it. Continuity also carries its name, publisher and version for Windows to show, and installing again no longer asks about the folder that's already there.
+
 ## [0.1.10-beta.1] - 2026-11-19
 
 ### Fixed

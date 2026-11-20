@@ -11,8 +11,8 @@ android {
         applicationId = "app.continuity.android"
         minSdk = 26
         targetSdk = 34
-        versionCode = 44
-        versionName = "0.1.10-beta.1"
+        versionCode = 45
+        versionName = "0.1.10"
     }
 
     buildTypes {
